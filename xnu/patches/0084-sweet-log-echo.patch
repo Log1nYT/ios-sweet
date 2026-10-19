@@ -1,0 +1,90 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -49,6 +49,7 @@
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
++static void sweet_log_echo(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+@@ -654,6 +655,7 @@
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	sweet_log_echo();
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+@@ -735,8 +737,71 @@
+ 	uint32_t version, size;
+ 	uint64_t total, seq;
+ };
++
++/*
++ * Echo the tail of the previous boot's log into the console at start-up.
++ * After a hang or a panic the ring still holds the text of the previous
++ * boot (the flusher thread copies it to the partition every ufslogsecs
++ * seconds); printing its last stretch here puts it back on the screen (a
++ * photo is enough - no recovery boot, no USB) and into the new log.
++ * Boot-arg sweetlogecho=<KiB> (0 disables, default 64).
++ */
++#define SWEET_LOG_ECHO_KB       64
+ 
+ static void
++sweet_log_echo(void)
++{
++	uint32_t kb = SWEET_LOG_ECHO_KB;
++	struct sweet_log_header h;
++	uint64_t base;
++	char line[1025];
++
++	if (su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++		return;
++	}
++	PE_parse_boot_argn("sweetlogecho", &kb, sizeof(kb));
++	if (!kb) {
++		return;
++	}
++	base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++	if (ufs_read_blocks(base, 1) != 0) {
++		return;
++	}
++	memcpy(&h, (const void *)(su.dma + DMA_BOUNCE), sizeof(h));
++	if (memcmp(h.magic, "SWEETLOG", 8) != 0 || h.version != 1 ||
++	    h.size != SWEET_LOG_SIZE || h.total == 0) {
++		printf("SWEET LOG: no previous boot log found\n");
++		return;
++	}
++	uint64_t want = MIN((uint64_t)kb << 10, MIN(h.total, (uint64_t)SWEET_LOG_SIZE));
++	uint64_t pos = h.total - want;
++	printf("SWEET LOG: previous boot tail: %llu bytes (of %llu, flush #%llu)\n",
++	    want, h.total, h.seq);
++	while (pos < h.total) {
++		uint64_t off = pos % SWEET_LOG_SIZE;
++		uint32_t take = (uint32_t)MIN(h.total - pos,
++		    UFS_BLOCK - (uint32_t)(off % UFS_BLOCK));
++		if (ufs_read_blocks(base + 1 + off / UFS_BLOCK, 1) != 0) {
++			printf("SWEET LOG: echo read failed\n");
++			return;
++		}
++		const uint8_t *src = (const uint8_t *)(su.dma + DMA_BOUNCE) + off % UFS_BLOCK;
++		while (take > 0) {
++			uint32_t piece = MIN(take, (uint32_t)sizeof(line) - 1);
++			for (uint32_t i = 0; i < piece; i++) {
++				line[i] = src[i] ? (char)src[i] : ' ';
++			}
++			line[piece] = 0;
++			printf("%s", line);
++			src += piece;
++			take -= piece;
++			pos += piece;
++		}
++	}
++	printf("\nSWEET LOG: (end of previous boot log)\n");
++}
++
++static void
+ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
