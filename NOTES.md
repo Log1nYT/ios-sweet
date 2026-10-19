@@ -2,7 +2,15 @@
 
 ## >>> VENUS BRING-UP HANDOFF 2026-10-19 (Xiaomi Mi 11, SM8350 fork) <<<
 
-**STATE: venus kernel boots ON THE PHONE with screen diagnostics (fbcon works, panics are readable on screen); patch 0082 in CI.**
+**STATE (2026-10-19 evening ~19:00): decmpfs blocker removed; fixed image re-flashing; kernel 0083+0084 in CI (run 39281460743).** The v3-v6 block below is the same day's earlier history.
+- `tools/strip-decmpfs.py` materialised all 124,343 compressed files (verify pass: 0 left) - the v6 `decmpfs_get_func ... type 4 -> launchd errno 45` failure cannot happen anymore. Volume 225 GiB / 217 GiB free, fsck-clean; `.fseventsd`/`.Spotlight-V100`/`.Trashes` removed, volume detached before the flash. Re-flash: `/tmp/platform-tools/fastboot flash userdata /tmp/iphone-root.img` (r32, ~4 min, approved).
+- **0083** (`sweet-usb-venus`): boot-arg `venus=1` selects the lahaira (SM8350) GCC CBCR table - master 0x0f010, sleep 0x0f018, utmi 0x0f01c, cfg-noc 0x0f07c, aggre 0x0f080, phy-aux 0x0f054, clkref 0x8c010 (Linux gcc-sm8350.c). The sdmmagpie offsets 0x502c/0x8201c/0x6a004 are unmapped holes on venus (0x502c caused the `_sweet_usb_probe+0x12c` external abort). The venus HS PHY 0x088e3000 (`qcom,usb-hsphy-snps-femto`, ABL-configured) is not read.
+- **0084** (`sweet-log-echo`): `sweet_ufs_init` prints the tail of the previous boot's SWEETLOG ring (boot-arg `sweetlogecho=<KiB>`, default 64) before starting the writer - a panicked boot becomes readable on the NEXT boot's screen without recovery or USB. Add `ufslogsecs=2` so a panic loses at most ~2 s.
+- Verification: reconstructed sources are byte-identical to the CI buildtree (artifact of run 39260981128); both patches apply to it and compile locally with the exact CI clang command (exit 0). Commit `ef647ad`, CI run **39281460743** (started 15:54 UTC) -> download to `xnu/out-venus-v2`.
+- **v7 build** (when the CI kernel is down): `python3 tools/mkpayload.py xnu/out-venus-v2/kernel.development.sweet shim/out/venus-v3.adt shim/out/payload-venus-v7.bin --cmdline "<v6 cmdline, line below> venus=1 sweetusb=2 ufslogsecs=2"` then `(cd shim && ./build.sh ../shim/out/payload-venus-v7.bin && cp out/shim-boot-venus.img out/shim-boot-venus-v7.img)`. Boot order: **v6 first** (logo test on the fixed image), then v7 (USB live log + echo). macOS listener: `tools/venus-usbnet-mac.sh logs/venus-v7.txt` (waits for host MAC 02:00:5e:77:ee:01, sets 192.168.7.1/24, `nc -ukl 5140`; phone = 192.168.7.2).
+- **Telegram relay**: `~/.venus-tg/` (bot `@opcoderemote1_bot`, chat 8750853154 = killsng; `watch.py` running, `send.sh "text"` sends; user messages land in `in.log`).
+
+**Earlier (same day): venus kernel boots ON THE PHONE with screen diagnostics (fbcon works, panics are readable on screen); patch 0082 in CI.**
 - Repo `venus-sweet` (fork of dipa-studio/ios-sweet). Commits: `622822a` venus shim (pushed), `d8ad400` phys_base fix + qemu-venus harness, `5f9afd1` patch 0082. CI run **39260981128** building the venus kernel with 0082 (started 13:32 UTC, ~8 min).
 
 **2026-10-19 (venus, later): kernel 0082 boots clean on the phone; UFS works; iOS root image built and being flashed.**
