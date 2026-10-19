@@ -34,10 +34,28 @@ _start:
 	b.hs	2f
 	str	xzr, [x1], #8
 	b	1b
-2:	mov	x0, x19
+2:	/* FIRST-LIGHT: paint the entire splash region white before any logic.
+	 * Mode-independent proof that (a) ABL jumped here and (b) the panel
+	 * still scans out of 0xe2a00000. Then hold ~2 s so it is visible.
+	 * (First version painted 0x8c000 words = 2.3 MB = top strip only.) */
+	mov	x2, #0xe2a00000
+	mov	w3, #-1
+	mov	w5, #0x8c
+	lsl	x5, x5, #16		/* 0x8c0000 words = 0x2300000 bytes = region */
+1:	str	w3, [x2], #4
+	subs	x5, x5, #1
+	b.ne	1b
+	mrs	x6, cntfrq_el0		/* 19.2 MHz */
+	mrs	x4, cntvct_el0
+	add	x6, x4, x6, lsl #1	/* frq*2 ≈ 2 s hold */
+1:	mrs	x4, cntvct_el0
+	cmp	x4, x6
+	b.lo	1b
+
+	mov	x0, x19
 	bl	shim_main
-3:	wfe
-	b	3b
+5:	wfe
+	b	5b
 
 /* PSCI CPU_ON target. x0 = context id = cpu index (1..7). */
 	.globl secondary_entry
