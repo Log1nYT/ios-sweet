@@ -6,7 +6,7 @@ VENUS variant: Xiaomi Mi 11 (venus, Qualcomm SM8350), iPhone 8 identity
 (venus.dtb):
   - all QCom reserved-memory carve-outs lie in 0x80000000..0xE4E00000
   - /memory = <0x80000000 +0x39700000>, <0xC0000000 +0x1C0000000> (7.9GB)
-  - free window above the carve-outs: 0xE5000000 .. 0x2C0000000
+  - free window above the carve-outs: 0xE6000000 .. 0x2C0000000
   - splash_region (ABL framebuffer) 0xE2A00000 +0x2300000, 1440x3200
   - GICD 0x17a00000, GICR 0x17a60000 (same as sweet!), vtimer PPI 11 -> 27
 Usage:  mkadt_venus.py OUT.adt [--dump] [--qemu] [--highmem]
@@ -18,8 +18,13 @@ import adt  # noqa: E402
 
 # Kernel-managed RAM: single carve-out-free window (venus bank2 above the
 # splash); every XPU carve-out lies BELOW 0xe4e00000.
-PHYS_BASE = 0xe5000000
-MEM_SIZE = 0x1db000000          # up to the end of /memory bank 2 (0x2c0000000)
+# phys_base MUST be 32MB-aligned: the kernel's own early MMU tables block-map
+# from the mach-header physical block 0xe6000000, and the payload header's
+# virt_base sits 32MB below the mach header. A misaligned phys_base (as
+# 0xe5000000 was) skews every VA->PA translation by the sub-block offset
+# (observed +0x1000000) -> first fetch after MMU-on hits zeros -> UDEF panic.
+PHYS_BASE = 0xe6000000
+MEM_SIZE = 0x1da000000          # up to the end of /memory bank 2 (0x2c0000000)
 # --highmem: same window; kept as an alias so the flag stays harmless.
 HIGH_PHYS_BASE = PHYS_BASE
 HIGH_MEM_SIZE = MEM_SIZE
@@ -136,7 +141,9 @@ def build(seed=None, qemu=False, highmem=False):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo585') + cstr('ARM,v8')),
+            # 'qcom,kryo470' matches the kernel's SweetCPU driver IONameMatch
+            # (patch 0018); kryo585 kept as the venus-specific identity.
+            ('compatible', cstr('qcom,kryo585') + cstr('qcom,kryo470') + cstr('ARM,v8')),
             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
@@ -222,10 +229,13 @@ def build(seed=None, qemu=False, highmem=False):
 
     # Identity of the iPhone 8 whose userland runs here: compatible[0] is
     # hw.model/hw.target (D21AP), model is hw.machine/hw.product
-    # (iPhone10,1). 'xiaomi,venus' stays for SweetPlatformExpert matching.
+    # (iPhone10,1). 'xiaomi,sweet' is required for the kernel's built-in
+    # SweetPlatformExpert (patch 0016 IONameMatch); 'xiaomi,venus' /
+    # 'qcom,sm8350' keep the board's own identity for SweetPlatformExpert
+    # matching port-specific code.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D21AP') + cstr('iPhone10,1') + cstr('xiaomi,venus') + cstr('qcom,sm8350') + cstr('AppleARM')),
+        ('compatible', cstr('D21AP') + cstr('iPhone10,1') + cstr('xiaomi,sweet') + cstr('xiaomi,venus') + cstr('qcom,sm8350') + cstr('AppleARM')),
         ('model', cstr('iPhone10,1')),
         ('target-type', cstr('D21')),
         ('target-sub-type', cstr('D21AP')),
