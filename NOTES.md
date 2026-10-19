@@ -1,8 +1,20 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> VENUS BRING-UP HANDOFF 2026-10-19 (Xiaomi Mi 11, SM8350 fork) <<<
+
+**STATE: venus kernel PASSES the whole bootstrap in QEMU; first phone boot test with the fixed image is next.**
+- Repo `venus-sweet` (fork of dipa-studio/ios-sweet), commits `622822a` (venus shim, pushed) and `d8ad400` (phys_base fix + qemu-venus harness).
+- v0 phone boot (`shim-boot-venus.img`, physBase 0xE5000000) crashed at `_arm_init` entry with a silent +16MB VA->PA skew: 0xE5000000 is not 32MB-aligned and `_start_first_cpu` PTEs start at the mach-header PA block 0xE6000000. Verified by live MMU inspection via QEMU gdbstub.
+- **Fix (d8ad400): mkadt_venus PHYS_BASE=0xE6000000, MEM_SIZE=0x1DA000000** + root compatible `xiaomi,sweet` needed by the kernel's SweetPlatformExpert (patch 0016 IONameMatch) + cpu compatible `qcom,kryo470` (SweetCPU, patch 0018). Kernel binary unchanged (xnu fdad0de CI, `xnu/out-venus-v0/kernel.development.sweet`).
+- **QEMU proof (payload-venus-v2q, `tools/qemu-venus.py`):** arm_init completes — SweetCPU initCPU 1/1 (SGI verified), pmap/zones/IOKit/HFS/netstack init, SweetPlatformExpert registered, AKS/IOWatchdog/IOCoreSurfaceRoot/HID/BATTERY register, `SWEET FB: AppleCLCD 1440x3200 stride 5760 at 0xe2a00000`, cpu_start() cpu 0, then healthy machine_idle on timer IRQs (waiting for root media — expected without a ramdisk in this config). Kernel-side boot is DONE until ufs/root work.
+- **Next phone test:** `fastboot boot shim/out/shim-boot-venus-v2.img` (venus ADT, boot-args `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1`). Expect the same early boot lines ON THE SCREEN (fbcon works venus side) and, if the phone matches QEMU, the kernel reaching idle/ufs probe instead of the v0 silent reboot.
+- QEMU note: always use ADT built with `mkadt_venus.py --qemu` (QEMU virt GICD 0x08000000/GICR 0x080a0000, 62.5 MHz timer, 1 CPU); venus ADT in QEMU panics in find_gicr_pe_base. Phone ADT = plain run.
+- Later work: UFS root bring-up on venus (sweet_ufs node exists in ADT; upstream's `qcom,ufshc` path), real venus platform expert (there is none yet; we match 'xiaomi,sweet'), SMP via PSCI (8 CPU nodes already in ADT, cpus=N limits).
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
+
 
 **STATE at end of 2026-10-18 (evening):**
 - On the phone: userdata = **image v15** (`/run/media/dipa/android/ios-sweet-ipsw/ios16-root-20H392-v15.img/.simg`; = v14 + `/private/var/preferences/SystemConfiguration/preferences.plist` with one network service "USB Ethernet": Interface DeviceName ue0 Type Ethernet, IPv4 Manual 192.168.7.2/24 router 192.168.7.1, DNS 1.1.1.1 8.8.8.8, set "Automatic" as CurrentSet). Fallback image v14 (v12/v13 deleted).
