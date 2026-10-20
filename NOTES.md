@@ -1,5 +1,36 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> ACTIVATION ANALYSIS 2026-10-20 20:45 (mobileactivationd 20H392, pulled from the IPSW) <<<
+
+- IPSW root dmg downloaded in the Linux VM (`~/ipsw/087-86684-044.dmg`, 4388 MB, CRC ok). It is UDIF (LZFSE chunks) with GPT + one APFS partition (volume `SydneyUpdate20H392.D20D201OS`). `tools/udif.py` = random-access reader (file-like) that feeds `pyfsapfs` (`pip install libfsapfs-python lzfse capstone lief`), no full decompress needed (VM has only ~5 GB free).
+- Extracted `/usr/libexec/mobileactivationd` (2,383,376 B, arm64 PIE, saved as `logs/mobileactivationd-20H392.bin`).
+- **Fact:** the function around mh+0x50670 is `main` (its log call passes the string "main", line 0x141 = 321). `main` calls `0x1001bf35c`, a fatal reporter that ends in `brk` (trap at mh+0x1BF3BC). So the daemon crashes ON PURPOSE when "Failed to perform boot initialization tasks" (string at file 0x20c18c; "Failed to create data ark." at ~0x20c171). The userdata copy is patched to skip that call, which is why it now idles but never activates.
+- The daemon logs to **`/var/mobile/Library/Logs/mobileactivationd`** on the phone, data ark is `/var/mobile/Library/mad/data_ark.plist`, records in `/var/mobile/Library/mad/activation_records`. That log file states the exact failing step. Reading it needs access to the phone's userdata (recovery) OR a kernel patch that tees the daemon's file writes to the console like 0048 does for /dev/null.
+- Hactivation (`should_hactivate`, `ShouldHactivate`, `DisableHactivation`) are ObjC names (xrefs need chained-fixup decoding or Ghidra; not done).
+- Open decision: (A) read the daemon's own log (best: tells the exact failure), (B) full static RE with Ghidra, (C) client-side dsc patch of MAEGetActivationState + userdata reflash (needs the Cryptex SystemOS dmg, 2.7 GB, not downloaded).
+
+- **Patch 0091-sweet-write-tee.patch (2026-10-20 20:50, written, NOT built yet):** boot-arg `sweetteewrite=mobileactivation` copies text-looking write(2) data (first 200 B, >=90% printable) of the named processes to the console as `|name| text` (hook in `write_internal`, bsd/kern/sys_generic.c, `git apply --check` OK on xnu-8796.121.2 and .141.3). Purpose: show mobileactivationd's own log file (`/var/mobile/Library/Logs/mobileactivationd`) in the live log = the exact boot-init failure. Needs: git push -> CI (builds 0087+0091; 0088/0090 are left uncommitted on purpose, they were never compiled) -> payload with cmdline `... sweetteewrite=mobileactivation` -> fastboot boot -> read `|mobileactivation|` lines. mobileactivationd must actually run its boot init: the userdata copy is patched to skip it, so the log may only show startup lines; if it shows nothing, the next step is to un-patch the call (reflash) or use Ghidra.
+
+## >>> LONG-TERM ROADMAP (user decision 2026-10-20 20:13: time is not a constraint; GPU, camera, battery must all be pursued to the end) <<<
+
+Agent reports (2026-10-20): `logs/agent-camera-report.md`, `logs/agent-battery-report.md`; patches 0088 (camera stub), 0090 (battery) are UNTESTED, uncompiled. GPU agent wrote nothing (no failure to fix with a stub; a fake AGXAccelerator would make Metal/GLES init and hang).
+- **Order:** (0) activation wall first (mobileactivationd, IPSW 20H392 downloading to ~/ipsw in the Linux VM) -> Setup skipped -> working home screen; (1) battery; (2) camera; (3) GPU.
+- **Battery (achievable):** need venus DTS/FDT for the gauge/charger. Run 0090 with `sweetbattery=1` (no sweetbatsid first) and read the `SWEET BATTERY: probe sid=` lines; if the gauge is an external I2C part (bq27z561 class, unverified), write an I2C driver (GENI I2C like the touch driver's GENI code) and publish real percent/voltage/current. No fake percentages: unknown stays unknown.
+- **Camera (stages, long):** (a) ADT `/arm-io/isp` + `/product/camera`, `venuscam=1`, boot with `sweetiolog=mediaserverd,cameracaptured,Camera` to log the IOKit selectors; (b) Camera.app opens with black preview; (c) CAMSS bring-up (clocks, GDSC, CSIPHY, CCI I2C, sensor tables) for raw frames; (d) feed frames into the iOS capture path. Real capture is months.
+- **GPU (outcome NOT guaranteed - research):** (a) measure the CPU renderer frame rate first (no number exists), optimise it (NEON, all 8 cores); (b) reverse the AGX user-client/command-stream interface that the iOS 16 userland speaks; (c) Adreno 660 needs a KGSL-class kernel driver + firmware and a Metal AIR -> Adreno ISA translator. (c) has no known precedent; do not pretend it is a stub away.
+
+## >>> VENUS: iOS PICTURE ON THE PANEL (2026-10-20 19:43) <<<
+
+**STATE 19:43 EEST: Setup.app is visible on the Mi 11 (boot `shim/out/shim-boot-venus-v18-8g-hid-canvas.img`, log `logs/venus-live-20261020l.txt`). It asks for Wi-Fi, else "connect to iTunes" = activation step.**
+- **Root cause of "no picture since v14":** the ADT `/arm-io/disp0` `canvas-width/height` was 750x1334 (tools/mkadt_venus.py) in every image from v14touch on; v13mode/v13home had 1440x3200 and swapped thousands of frames (logs d/e). With 750x1334 backboardd never swaps. Fixed in tools/mkadt_venus.py; the canvas image patches only those two u32 in the payload ADT.
+- Same image: v18 kernel, 8 GB ADT, cmdline + `sweethidtest=15` (Home every 15 s wakes the display; PON power key still dead until 0087 is built).
+- Boot helper: `bash tools/boot-hid.sh` (fresh listener + fastboot boot).
+- **Next wall:** Setup/activation. Wi-Fi does not exist on venus. Needs the sweet-root-tweaks Setup prefs (purplebuddy SetupDone...) in the iOS root on userdata. The v7 image file was lost from /tmp.
+
+- **19:49 log m (Setup/mobileactivationd traced):** mobileactivationd stays alive only because its binary on userdata is patched (`cs_invalid_page ... p=117[mobileactivation]`, page mh+0x50000 = the old boot-init call site 0x50670). Main thread idles in the run loop; boot-init is skipped, so the device stays unactivated and Setup shows the Wi-Fi/"connect to computer" activation step. purplebuddy SetupDone is already in the image (tweaks since v4), so prefs are not the issue.
+- **19:55 log n, D20AP test (`shim-boot-venus-v18-8g-d20.img`):** ADT said model iPhone10,1 but target-type D21/D21AP (= iPhone 8 Plus; iPhone10,1 is D20AP). Swapping to D20 did NOT remove Setup and added driverkitd/locationd/gpsd crashes. Reverted boot-hid.sh to the canvas image.
+- **Next:** real activation work: get mobileactivationd + dsc from the 20H392 IPSW, find why boot-init fails on venus (sweet's iPhone10,3 image activated natively via the ADT Hactivation flags), then fix it (kernel VFS patcher or client dsc patch "Activated").
+
 ## >>> VENUS BLACK SCREEN = DISPLAY LEFT OFF + DEAD POWER KEY (2026-10-20 19:25) <<<
 
 **STATE 19:25 EEST: patch 0087 written, not committed, no CI yet.**

@@ -1,0 +1,94 @@
+diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
+index 4ca22ee..3591f92 100644
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -113,6 +113,9 @@
+ #include <kern/sched_prim.h>
+ #include <kern/mpsc_queue.h>
+ #include <kern/debug.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/pexpert.h>
++#endif
+ 
+ #include <sys/mbuf.h>
+ #include <sys/domain.h>
+@@ -674,6 +677,68 @@ writev_internal(struct proc *p, int fd, uio_t uio, int flags,
+ 	return error;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: boot-arg sweetteewrite=name,name (comma separated, default off)
++ * copies what the named processes write(2) to ANY fd (log files, pipes,
++ * ttys) onto the console as "|name| text", so a daemon's own log file
++ * (mobileactivationd -> /var/mobile/Library/Logs/mobileactivationd) shows
++ * up in the live USB log. Only text-looking writes (>= 90% printable) are
++ * copied, which skips XPC/binary traffic. First 200 bytes of each write.
++ */
++static char sweet_tw_names[128];
++static int sweet_tw_parsed;
++
++static void
++sweet_write_tee(user_addr_t buf, user_size_t nbyte)
++{
++	char name[32];
++	char tmp[200];
++
++	if (!sweet_tw_parsed) {
++		sweet_tw_names[0] = '\0';
++		(void)PE_parse_boot_argn("sweetteewrite", sweet_tw_names, sizeof(sweet_tw_names));
++		sweet_tw_parsed = 1;
++	}
++	if (sweet_tw_names[0] == '\0' || nbyte == 0) {
++		return;
++	}
++	proc_selfname(name, (int)sizeof(name));
++	size_t nl = strlen(name);
++	bool match = false;
++	for (const char *t = sweet_tw_names; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == nl && nl > 0 && strncmp(t, name, nl) == 0) {
++			match = true;
++			break;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	if (!match) {
++		return;
++	}
++	size_t n = nbyte < sizeof(tmp) ? (size_t)nbyte : sizeof(tmp);
++	if (copyin(buf, tmp, n) != 0) {
++		return;
++	}
++	size_t printable = 0;
++	for (size_t i = 0; i < n; i++) {
++		unsigned char c = (unsigned char)tmp[i];
++		if ((c >= 0x20 && c < 0x7f) || c == '\n' || c == '\t' || c == '\r') {
++			printable++;
++		}
++	}
++	if (printable * 10 < n * 9) {
++		return;
++	}
++	printf("|%s| %.*s%s", name, (int)n, tmp, tmp[n - 1] == '\n' ? "" : "\n");
++}
++#endif
++
+ int
+ write_internal(struct proc *p, int fd, user_addr_t buf, user_size_t nbyte,
+     off_t offset, int flags, guardid_t *puguard, user_ssize_t *retval)
+@@ -682,6 +747,10 @@ write_internal(struct proc *p, int fd, user_addr_t buf, user_size_t nbyte,
+ 	uio_t uio;
+ 	int spacetype = IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_write_tee(buf, nbyte);
++#endif
++
+ 	if (nbyte > INT_MAX) {
+ 		*retval = 0;
+ 		return EINVAL;
