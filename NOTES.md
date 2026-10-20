@@ -1,5 +1,15 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> VENUS TOUCH v18 — SENSE-ON (2026-10-20 17:45) <<<
+
+**STATE 17:45 EEST: v18 edited + local compile OK; CI next.**
+- **v17 boot 17:40:27 confirmed the ST protocol works.** Log `logs/venus-live-20261020i.txt` (fresh listener with early nc + IP re-apply):
+  - `TLMM=0x798000 reset=0x2c2/0x3 irq=0xc3/0 avdd=0x2c2/0x3` — TLMM base and rail switch correct.
+  - map 0 `49/48/50/51` → chip-id `00:00`; map 1 `48/49/50/51` → `fifo 03 00...`, `controller ready`, mapping selected. **Correct wiring: MISO=48, MOSI=49, CLK=50, CS=51.**
+  - Polling FIFO started, but **no touch events** arrived.
+- **Missing command: active scan / sense-on.** ST `setScanMode()` is `0xA0 mode settings`; vendor sends `A0 00 01` (`SCAN_MODE_ACTIVE`, active bitmask 1) from the backlight notifier. Our iOS port has backlight on but no notifier, so the FW stayed in sense-off. v18 restores `A0 00 01` after controller-ready (boot arg `venusftsscan=0` disables), plus a 5-second `poll idle irq=` line to prove FIFO polling.
+- CI run for v18 next; `venusftsdelay=10`, same boot image flow. Phone was still alive at 17:43 with homed crash loop; panic expected around 2-3 min.
+
 ## >>> VENUS TOUCH v17 — ST FTS PROTOCOL FIX (2026-10-20 17:35) <<<
 
 **STATE 17:35 EEST: v17 driver edited + local compile OK; commit/CI next.**

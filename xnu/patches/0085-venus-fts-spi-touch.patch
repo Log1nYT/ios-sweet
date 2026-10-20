@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/sweet_venus_touch.c
-@@ -0,0 +1,557 @@
+@@ -0,0 +1,587 @@
 +/*
 + * Venus (Xiaomi Mi 11, SM8350) ST FTS SPI touch bring-up.
 + *
@@ -17,6 +17,11 @@
 + *   chip id at 0x20000000 must return 0x36 0x39
 + *   events: 0x03 controller ready, 0x13 enter, 0x23 motion, 0x33 leave
 + *   event[1] bits 7:4 = finger id, bits 3:0 = touch type
++ *   scan mode: 0xA0 0x00 0x01 = active sensing on (vendor setScanMode)
++ *
++ * The FW can stay in sense-off after boot until the host sends the active
++ * scan command (Android does this from its backlight notifier), so the
++ * driver sends 0xA0 0x00 0x01 after the controller-ready event.
 + *
 + * The chip runs its firmware in 4-wire SPI mode.  A blank/boot-ROM part
 + * starts in 3-wire SPI; the vendor driver switches it to 4-wire by writing
@@ -56,6 +61,7 @@
 +#define FTS_CMD_HW_REG_R     0xfbu
 +#define FTS_CMD_HW_REG_W     0xfau
 +#define FTS_CMD_FIFO         0x87u
++#define FTS_CMD_SCAN_MODE    0xa0u
 +
 +#define FTS_ADDR_CHIP_ID     0x20000000u
 +#define FTS_ADDR_ICR         0x2000002du
@@ -87,6 +93,8 @@
 +	int last_y[VENUS_FINGERS];
 +	unsigned event_count;
 +	unsigned error_count;
++	unsigned rx_count;
++	unsigned idle_count;
 +};
 +
 +static struct venus_touch_state vt;
@@ -291,6 +299,18 @@
 +	delay(10000);
 +}
 +
++/* ST setScanMode(SCAN_MODE_ACTIVE, 0x01): start active sensing. */
++static void
++vt_sense_on(void)
++{
++	uint8_t cmd[3] = { FTS_CMD_SCAN_MODE, 0x00, 0x01 };
++
++	vt_spi_select(true);
++	vt_spi_send(cmd, sizeof(cmd));
++	vt_spi_select(false);
++	delay(10000);
++}
++
 +static bool
 +vt_chip_id(void)
 +{
@@ -420,6 +440,7 @@
 +{
 +	unsigned id = ev[0];
 +
++	vt.rx_count++;
 +	if (vt.dump && vt.event_count < 60) {
 +		printf("SWEET VENUS TOUCH: ev %02x %02x %02x %02x %02x %02x %02x %02x\n",
 +		    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
@@ -456,13 +477,14 @@
 +venus_touch_thread(void *arg, wait_result_t result)
 +{
 +	unsigned delay_s = 45;
-+	int enabled = 1, dump = 1;
++	int enabled = 1, dump = 1, scan = 1;
 +	uint8_t ev[8];
 +
 +	(void)arg;
 +	(void)result;
 +	(void)PE_parse_boot_argn("venusftsdelay", &delay_s, sizeof(delay_s));
 +	(void)PE_parse_boot_argn("venusftsdump", &dump, sizeof(dump));
++	(void)PE_parse_boot_argn("venusftsscan", &scan, sizeof(scan));
 +	(void)PE_parse_boot_argn("venusfts", &enabled, sizeof(enabled));
 +	vt.dump = dump != 0;
 +	if (!enabled) {
@@ -520,6 +542,10 @@
 +	if (!vt.fw_alive) {
 +		printf("SWEET VENUS TOUCH: no fw event yet; will keep polling\n");
 +	}
++	if (scan && vt.fw_alive) {
++		vt_sense_on();
++		printf("SWEET VENUS TOUCH: sense-on sent\n");
++	}
 +
 +	printf("SWEET VENUS TOUCH: polling FIFO\n");
 +	while (!vt.dead) {
@@ -528,6 +554,10 @@
 +				break;
 +			}
 +			vt_handle_event(ev);
++		}
++		if (vt.rx_count == 0 && (vt.idle_count++ % 500u) == 0u) {
++			printf("SWEET VENUS TOUCH: poll idle irq=%d\n",
++			    vt_get(VENUS_GPIO_IRQ) ? 1 : 0);
 +		}
 +		vt_wait_ms(10);
 +	}
