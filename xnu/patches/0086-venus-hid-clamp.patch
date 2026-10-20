@@ -1,0 +1,9 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -460,4 +460,4 @@
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > 1439 ? 1439 : x);
++	y = y < 0 ? 0 : (y > 3199 ? 3199 : y);
+ 

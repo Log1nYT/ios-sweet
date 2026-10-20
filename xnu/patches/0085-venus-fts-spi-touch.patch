@@ -315,7 +315,7 @@
 +		vt.event_count++;
 +	}
 +	if (id == FTS_EVT_ENTER || id == FTS_EVT_MOTION) {
-+		int tid = (ev[1] >> 4) & 0x0f;
++		int tid = ev[1] & 0x0f;
 +		int x = ((ev[3] & 0x0f) << 8) | ev[2];
 +		int y = (ev[4] << 4) | ((ev[3] & 0xf0) >> 4);
 +		if (tid >= VENUS_FINGERS || x >= VENUS_PANEL_W || y >= VENUS_PANEL_H) {
@@ -329,7 +329,7 @@
 +		vt.down[tid] = true;
 +		sweet_hid_touch(tid, 1, x, y);
 +	} else if (id == FTS_EVT_LEAVE) {
-+		int tid = (ev[1] >> 4) & 0x0f;
++		int tid = ev[1] & 0x0f;
 +		if (tid >= VENUS_FINGERS) {
 +			return;
 +		}
@@ -456,11 +456,10 @@
 
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -108,6 +108,7 @@
- bsd/dev/sweet_sample.c			standard
- bsd/dev/sweet_keys.c			standard
+@@ -110,6 +110,7 @@
  bsd/dev/sweet_touch.c			standard
 +bsd/dev/sweet_venus_touch.c		standard
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
  bsd/dev/mem.c				standard
