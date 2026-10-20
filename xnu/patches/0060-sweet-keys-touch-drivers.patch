@@ -244,8 +244,8 @@
 +#define TOUCH_SE_PA      0x00a84000u
 +#define TOUCH_GCC_PA     0x00100000u
 +#define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000) */
-+#define TOUCH_GCC_VOTE   0x5200cu
-+#define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
++#define TOUCH_GCC_VOTE   0x52008u
++#define TOUCH_RCG       0x18140u    /* wrapper1 LOCAL S1 = global SE7 */
 +#define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
 +#define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
 +#define TOUCH_MAX        10u
