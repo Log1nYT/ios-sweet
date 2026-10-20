@@ -109,7 +109,7 @@
      "     'IOClass'         = IOPanicPlatform;"
 --- /dev/null
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -0,0 +1,358 @@
+@@ -0,0 +1,359 @@
 +/*
 + * SWEET PM6150L L11C bring-up; see report.md for DT and source evidence.
 + * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
@@ -248,8 +248,9 @@
 +		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
 +		    size < RH_DB_HEADER || size > RH_DB_MAX ||
 +		    (uint64_t)pa + size > 0x100000000ULL) {
-+			printf("SWEET RPMH: invalid cmd-db locator\n");
-+			return EINVAL;
++			printf("SWEET RPMH: invalid locator; venus cmd-db fallback\n");
++			pa = 0x80860000u;
++			size = 0x20000u;
 +		}
 +		rh_db = ml_io_map(pa, size);
 +		if (!rh_db) {
@@ -440,8 +441,8 @@
 +sweet_rpmh_vreg_enable(const char *res, unsigned mv)
 +{
 +	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
-+	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
-+		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	if (!res || (strcmp(res, "ldoc11") && strcmp(res, "ldoc2")) || mv < 1800 || mv > 3400) {
++		printf("SWEET RPMH: expected ldoc11 or ldoc2, 1800..3400 mV\n");
 +		return EINVAL;
 +	}
 +	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {

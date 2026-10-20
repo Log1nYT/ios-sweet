@@ -17645,7 +17645,7 @@
 +};
 +
 +/* KeyboardOrKeypad Page (0x07) */
-+/* This section is the Usage Page for key codes to be used in implementing a USB keyboard. A Boot Keyboard (84-, 101- or 104-key) should at a minimum support all associated usage codes as indicated in the ÒBootÓ */
++/* This section is the Usage Page for key codes to be used in implementing a USB keyboard. A Boot Keyboard (84-, 101- or 104-key) should at a minimum support all associated usage codes as indicated in the ï¿½Bootï¿½ */
 +/* column below. */
 +/* The usage type of all key codes is Selectors (Sel), except for the modifier keys Keyboard Left Control (0x224) to Keyboard Right GUI (0x231) which are Dynamic Flags (DV). */
 +/* Note: A general note on Usages and languages: Due to the variation of keyboards from language to language, it is not feasible to specify exact key mappings for every language. Where this list is not specific for a key function in a language, the closest equivalent key position should be used, so that a keyboard may be modified for a different language by simply printing different keycaps. One example is the Y key on a North American keyboard. In Germany this is typically Z. Rather than changing the keyboard firmware to put the Z Usage into that place in the descriptor list, the vendor should use the Y Usage on both the North American and German keyboards. This continues to be the existing practice in the industry, in order to minimize the number of changes to the electronics to accommodate otherlanguages. */
@@ -17829,7 +17829,7 @@
 +};
 +
 +/* LEDs Page (0x08) */
-+/* An LED or indicator is implemented as an On/Off Control (OOF) using the ÒSingle button toggleÓ mode, where a value of 1 will turn on the indicator, and a value of 0 will turn it off. The exceptions are described below. */
++/* An LED or indicator is implemented as an On/Off Control (OOF) using the ï¿½Single button toggleï¿½ mode, where a value of 1 will turn on the indicator, and a value of 0 will turn it off. The exceptions are described below. */
 +enum
 +{
 +    kHIDUsage_LED_NumLock    = 0x01,    /* On/Off Control */
@@ -17924,12 +17924,12 @@
 +
 +/* Button Page (0x09) */
 +/* The Button page is the first place an application should look for user selection controls. System graphical user interfaces typically employ a pointer and a set of hierarchical selectors to select, move and otherwise manipulate their environment. For these purposes the following assignment of significance can be applied to the Button usages: */
-+/* ¥ Button 1, Primary Button. Used for object selecting, dragging, and double click activation. On MacOS, this is the only button. Microsoft operating systems call this a logical left button, because it */
++/* ï¿½ Button 1, Primary Button. Used for object selecting, dragging, and double click activation. On MacOS, this is the only button. Microsoft operating systems call this a logical left button, because it */
 +/* is not necessarily physically located on the left of the pointing device. */
-+/* ¥ Button 2, Secondary Button. Used by newer graphical user interfaces to browse object properties. Exposed by systems to applications that typically assign application-specific functionality. */
-+/* ¥ Button 3, Tertiary Button. Optional control. Exposed to applications, but seldom assigned functionality due to prevalence of two- and one-button devices. */
-+/* ¥ Buttons 4 -55. As the button number increases, its significance as a selector decreases. */
-+/* In many ways the assignment of button numbers is similar to the assignment of Effort in Physical descriptors. Button 1 would be used to define the button a finger rests on when the hand is in the Òat restÓ position, that is, virtually no effort is required by the user to activate the button. Button values increment as the finger has to stretch to reach a control. See Section 6.2.3, ÒPhysical Descriptors,Ó in the HID Specification for methods of further qualifying buttons. */
++/* ï¿½ Button 2, Secondary Button. Used by newer graphical user interfaces to browse object properties. Exposed by systems to applications that typically assign application-specific functionality. */
++/* ï¿½ Button 3, Tertiary Button. Optional control. Exposed to applications, but seldom assigned functionality due to prevalence of two- and one-button devices. */
++/* ï¿½ Buttons 4 -55. As the button number increases, its significance as a selector decreases. */
++/* In many ways the assignment of button numbers is similar to the assignment of Effort in Physical descriptors. Button 1 would be used to define the button a finger rests on when the hand is in the ï¿½at restï¿½ position, that is, virtually no effort is required by the user to activate the button. Button values increment as the finger has to stretch to reach a control. See Section 6.2.3, ï¿½Physical Descriptors,ï¿½ in the HID Specification for methods of further qualifying buttons. */
 +enum
 +{
 +    kHIDUsage_Button_1    = 0x01,    /* (primary/trigger) */
@@ -18193,7 +18193,7 @@
 +
 +/* Ordinal Page (0x0A) */
 +/* The Ordinal page allows multiple instances of a control or sets of controls to be declared without requiring individual enumeration in the native usage page. For example, it is not necessary to declare usages of Pointer 1, Pointer 2, and so forth on the Generic Desktop page. When parsed, the ordinal instance number is, in essence, concatenated to the usages attached to the encompassing collection to create Pointer 1, Pointer 2, and so forth. */
-+/* For an example, see Section A.5, ÒMultiple Instances of a Control,Ó in Appendix A, ÒUsage Examples.Ó By convention, an Ordinal collection is placed inside the collection for which it is declaring multiple instances. */
++/* For an example, see Section A.5, ï¿½Multiple Instances of a Control,ï¿½ in Appendix A, ï¿½Usage Examples.ï¿½ By convention, an Ordinal collection is placed inside the collection for which it is declaring multiple instances. */
 +/* Instances do not have to be identical. */
 +enum
 +{
@@ -18208,7 +18208,7 @@
 +/* Telephony Page (0x0B) */
 +/* This usage page defines the keytop and control usages for telephony devices. */
 +/* Indicators on a phone are handled by wrapping them in LED: Usage In Use Indicator and LED: Usage Selected Indicator usages. For example, a message-indicator LED would be identified by a Telephony: Message usage declared as a Feature or Output in a LED: Usage In Use Indicator collection. */
-+/* See Section 14, ÒConsumer Page (0x0C),Ó for audio volume and tone controls. */
++/* See Section 14, ï¿½Consumer Page (0x0C),ï¿½ for audio volume and tone controls. */
 +enum
 +{
 +    kHIDUsage_Tfon_Phone    = 0x01,    /* Application Collection */
@@ -21038,13 +21038,13 @@
 +	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
 +		return;
 +	}
-+	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
-+	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > 1439 ? 1439 : x);
++	y = y < 0 ? 0 : (y > 3199 ? 3199 : y);
 +
 +	IOLockLock(fLock);
 +	bool was = fDown[finger];
-+	IOFixed nx = (IOFixed)(((int64_t)x << 16) / 1080);
-+	IOFixed ny = (IOFixed)(((int64_t)y << 16) / 2400);
++	IOFixed nx = (IOFixed)(((int64_t)x << 16) / 1440);
++	IOFixed ny = (IOFixed)(((int64_t)y << 16) / 3200);
 +	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
 +	if (was == down && !moved) {
 +		IOLockUnlock(fLock);

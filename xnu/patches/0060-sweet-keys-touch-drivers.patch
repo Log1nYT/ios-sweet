@@ -217,7 +217,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,568 @@
+@@ -0,0 +1,574 @@
 +/*
 + * SWEET SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -766,7 +766,7 @@
 +void
 +sweet_touch_init(void)
 +{
-+	int enabled = 1;
++	int enabled = 1, venus = 0;
 +	thread_t thread;
 +	if (st.started) {
 +		return;
@@ -776,6 +776,12 @@
 +	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
 +	if (!enabled) {
 +		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
++		return;
++	}
++	(void)PE_parse_boot_argn("venus", &venus, sizeof(venus));
++	if (venus) {
++		extern void sweet_venus_touch_init(void);
++		sweet_venus_touch_init();
 +		return;
 +	}
 +	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
