@@ -1,5 +1,26 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> VENUS BLACK SCREEN = DISPLAY LEFT OFF + DEAD POWER KEY (2026-10-20 19:25) <<<
+
+**STATE 19:25 EEST: patch 0087 written, not committed, no CI yet.**
+- **Observation:** boots g/h log `SWEET FB: display on` -> `display off` (backboardd sel 12, 0079 fade) -> `display on` again right after `exec Setup`. Boot i never gets the second `display on`; SpringBoard keeps creating surfaces but 0079 drops all swaps while off -> black screen with SpringBoard alive. Likely the same on v18-8g (j lost its early lines).
+- **Observation:** user pressed Power several times at 19:23 on the running v18-8g; log j shows no `SWEET KEYS: key=` at all. `pon-ok=1` only means the read succeeds.
+- **Guess (strong):** 0060 reads sweet's PM6150 PON (PPID 0x008, RT 0x0810). On SM8350 the power key is PMK8350 PON_HLOS @0x1300 (mainline `qcom,pmk8350-pon`, reg hlos 0x1300 / pbs 0x800), RT_STS 0x1310, bit0 KPDPWR, bit1 RESIN. PPID 0x008 is PON_PBS on venus, so presses are invisible and nothing can wake the display.
+- **Patch 0087-venus-pon-hlos.patch:** with `venus=1` uses PPID 0x013 / RT 0x1310 (applies cleanly after 0060/0062/0085). Next: commit, CI, boot, press Power, look for `SWEET KEYS: key=0 down=1` then `SWEET FB: display on`.
+- Fallback if the display still stays off: boot-arg to ignore `RequestPowerChange(0)` in SweetFramebuffer (not written).
+- RAM `dram-size=0x19a000000` test is deprioritised; nothing points at 8 GB breaking display.
+
+## >>> VENUS PANIC + 8G BOOT (2026-10-20 19:15) <<<
+
+**STATE 19:15 EEST: likely panic root cause found; v18-8g booted with no panic for ~20 min, but screen is black.**
+- **Panic root cause (strong evidence, not yet 100% proven):** `shim/out/venus-v3.adt` declares `dram-base=0xe6000000`, `dram-size=0x1da000000` (end `0x2c0000000`). Venus DTB `/memory` bank 2 ends at `0x280000000` (`0xc0000000 + 0x1c0000000`), so the ADT exposes ~1 GB of nonexistent RAM above the real end. The allocator returned page `0x2800c0000` (just past `0x280000000`), and `bzero(page, 0x4000)` wrote through a physmap PT that has no backing -> external abort. Registers: `x0=far=0xfffffd1ac0c0000`, `x1=0`, `x2=0x4000`, `x19=0x2800c0000`, pc `_bzero+0x1c`, lr `vm_map_copy_footprint_ledgers+0xcc`, ESR `0x96000010`. The lr is misleading/stale; the 16 KB zeroing and the PA are the real clues.
+- **Workaround tested:** rebuild the same v18 kernel against `shim/out/venus-v3-8g.adt` (`dram-size=0x11a000000`, end `0x200000000`). Image:
+  `shim/out/shim-boot-venus-v18-8g.img`, SHA256 `ecfd0e8464f03e2340a5ec08197c4235d33a7b950737a467224a73604fb3d308`.
+  Kernel is v18, SHA256 `8a9e4ec5b1760f87a0065cbceea666a1e4b02970891b37774aea6074956253bc`, CI run `39441961329`.
+- **Boot 18:50–19:12: no panic.** ECM is up (`ping 192.168.7.2`), `lsd`, `backboardd`, `SpringBoard` are alive (SMP samples), but the user reports a black screen with no logo/Hello/update screen. Early log lines were lost because the old `nc -ukl 5140` was still connected to v17's source port; restarted listener now writes `logs/venus-live-20261020j.txt`.
+- **Listener lesson:** `nc -ukl 5140` stays connected to the first sender. Kill/restart it before every reboot, or a fresh boot's UDP log is silently dropped.
+- **Next:** fresh listener + reboot v18-8g, capture from line 1; check `SWEET VENUS TOUCH`, `SWEET FB: display on`, `SWEET SURF`, `exec SpringBoard`, panic. If black screen persists, test `dram-size=0x19a000000` (end `0x280000000`, max safe RAM) and/or investigate display init. If UI appears, test touch (`venusftspins=1`, sense-on `A0 00 01`).
+
 ## >>> VENUS TOUCH v18 — SENSE-ON (2026-10-20 17:45) <<<
 
 **STATE 17:45 EEST: v18 edited + local compile OK; CI next.**
