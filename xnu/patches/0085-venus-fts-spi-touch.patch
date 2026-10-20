@@ -1,8 +1,8 @@
 --- /dev/null
 +++ b/bsd/dev/sweet_venus_touch.c
-@@ -0,0 +1,519 @@
+@@ -0,0 +1,557 @@
 +/*
-+ * Venus (Xiaomi Mi 11, SM8350) FocalTech/ST FTS SPI touch bring-up.
++ * Venus (Xiaomi Mi 11, SM8350) ST FTS SPI touch bring-up.
 + *
 + * The touch IC hangs off QUP11 (SE11) on TLMM GPIO 48-51.  The bootloader
 + * does not leave GENI SPI firmware for this SE, so this driver bit-bangs
@@ -10,15 +10,23 @@
 + * and the AVDD load switch is GPIO 132.  VDD (PM8350C L2, 1.8 V) is expected
 + * to be on with the display rails; the load switch is driven here.
 + *
-+ * FTS register protocol: 0xB6 + 32-bit big-endian address, then one dummy
-+ * byte and the data.  Event FIFO: 0x85, one dummy byte, then 8-byte events.
-+ * Event 0x13 = enter, 0x23 = motion, 0x33 = leave, 0x03 = controller ready.
++ * ST FTS SPI protocol (not FocalTech FT):
++ *   read HW register: 0xFB + 32-bit big-endian address, dummy byte, data
++ *   write HW register: 0xFA + 32-bit big-endian address, data
++ *   read event FIFO: 0x87, dummy byte, 8-byte events
++ *   chip id at 0x20000000 must return 0x36 0x39
++ *   events: 0x03 controller ready, 0x13 enter, 0x23 motion, 0x33 leave
++ *   event[1] bits 7:4 = finger id, bits 3:0 = touch type
++ *
++ * The chip runs its firmware in 4-wire SPI mode.  A blank/boot-ROM part
++ * starts in 3-wire SPI; the vendor driver switches it to 4-wire by writing
++ * ADDR_GPIO_* and ADDR_ICR before reading the chip id.  The same sequence
++ * is issued here if the first chip-id probe fails.
 + *
 + * Boot args:
 + *   venusfts=0        disable this driver
-+ *   venusftspins=N    force mapping N (0..3), default autodetect
++ *   venusftspins=N    force one of the 24 pin permutations (0..23)
 + *   venusftsdelay=S   start after S seconds, default 45
-+ *   venusftsscan=0    do not send the active-scan command
 + *   venusftsdump=0    do not print raw events
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -45,13 +53,19 @@
 +#define VENUS_GPIO_RESET     22u
 +#define VENUS_GPIO_IRQ       23u
 +
-+#define FTS_CMD_HW_REG       0xb6u
-+#define FTS_CMD_FIFO         0x85u
-+#define FTS_CMD_SCAN_MODE    0xa0u
++#define FTS_CMD_HW_REG_R     0xfbu
++#define FTS_CMD_HW_REG_W     0xfau
++#define FTS_CMD_FIFO         0x87u
 +
-+#define FTS_ADDR_CHIP_ID     0x00000004u
-+#define FTS_ADDR_CHIP_ID_ALT 0x00000007u
-+#define FTS_ADDR_FW_VER      0x00000008u
++#define FTS_ADDR_CHIP_ID     0x20000000u
++#define FTS_ADDR_ICR         0x2000002du
++#define FTS_ADDR_GPIO_DIR    0x20000032u
++#define FTS_ADDR_GPIO_PULL   0x20000034u
++#define FTS_ADDR_GPIO_CFG0   0x2000003du
++#define FTS_ADDR_GPIO_CFG2   0x2000003fu
++
++#define FTS_CHIP_ID0         0x36u
++#define FTS_CHIP_ID1         0x39u
 +
 +#define FTS_EVT_READY        0x03u
 +#define FTS_EVT_ENTER        0x13u
@@ -65,7 +79,9 @@
 +struct venus_touch_state {
 +	vm_offset_t tlmm;
 +	int miso, mosi, clk, cs;
++	int map_index;
 +	bool started, dead, dump;
++	bool fw_alive;
 +	bool down[VENUS_FINGERS];
 +	int last_x[VENUS_FINGERS];
 +	int last_y[VENUS_FINGERS];
@@ -171,10 +187,10 @@
 +}
 +
 +static void
-+vt_read_reg(uint32_t addr, uint8_t *buf, unsigned len)
++vt_read_hw(uint32_t addr, uint8_t *buf, unsigned len)
 +{
 +	uint8_t cmd[5] = {
-+		FTS_CMD_HW_REG,
++		FTS_CMD_HW_REG_R,
 +		(uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
 +		(uint8_t)(addr >> 8), (uint8_t)addr
 +	};
@@ -188,25 +204,18 @@
 +	vt_spi_select(false);
 +}
 +
-+/* Some FTS parts latch the address on CS rising and return data on the next
-+ * CS-low cycle. Try this only as a diagnostic; the main path keeps CS low. */
 +static void
-+vt_read_reg_split(uint32_t addr, uint8_t *buf, unsigned len)
++vt_write_hw(uint32_t addr, uint8_t val)
 +{
-+	uint8_t cmd[5] = {
-+		FTS_CMD_HW_REG,
++	uint8_t cmd[6] = {
++		FTS_CMD_HW_REG_W,
 +		(uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
-+		(uint8_t)(addr >> 8), (uint8_t)addr
++		(uint8_t)(addr >> 8), (uint8_t)addr,
++		val
 +	};
 +
 +	vt_spi_select(true);
 +	vt_spi_send(cmd, sizeof(cmd));
-+	vt_spi_select(false);
-+	vt_spi_select(true);
-+	(void)vt_spi_xfer(0);	/* dummy byte */
-+	for (unsigned i = 0; i < len; ++i) {
-+		buf[i] = vt_spi_xfer(0);
-+	}
 +	vt_spi_select(false);
 +}
 +
@@ -241,9 +250,9 @@
 +	vt.clk = clk;
 +	vt.cs = cs;
 +	vt_pins_idle();
-+	vt_gpio_cfg((unsigned)cs, 0, 3, 3, true, true);
-+	vt_gpio_cfg((unsigned)clk, 0, 3, 3, true, false);
-+	vt_gpio_cfg((unsigned)mosi, 0, 3, 3, true, false);
++	vt_gpio_cfg((unsigned)cs, 0, 3, 6, true, true);
++	vt_gpio_cfg((unsigned)clk, 0, 3, 6, true, false);
++	vt_gpio_cfg((unsigned)mosi, 0, 3, 6, true, false);
 +	vt_gpio_cfg((unsigned)miso, 0, 0, 0, false, false);
 +	delay(10);
 +}
@@ -269,69 +278,95 @@
 +	delay(300000);
 +}
 +
++/* Blank parts (boot ROM) come up in 3-wire SPI.  This is the vendor
++ * fts_spi4_mode_set() sequence; writes work in both 3-wire and 4-wire. */
++static void
++vt_spi4_mode(void)
++{
++	vt_write_hw(FTS_ADDR_GPIO_DIR, 0x10);
++	vt_write_hw(FTS_ADDR_GPIO_PULL, 0x02);
++	vt_write_hw(FTS_ADDR_GPIO_CFG2, 0x07);
++	vt_write_hw(FTS_ADDR_GPIO_CFG0, 0x30);
++	vt_write_hw(FTS_ADDR_ICR, 0x02);
++	delay(10000);
++}
++
 +static bool
 +vt_chip_id(void)
 +{
 +	uint8_t id[2] = {0, 0};
 +
-+	for (unsigned t = 0; t < 3; ++t) {
-+		vt_read_reg(FTS_ADDR_CHIP_ID, id, 2);
++	for (unsigned t = 0; t < 2; ++t) {
++		vt_read_hw(FTS_ADDR_CHIP_ID, id, 2);
 +		printf("SWEET VENUS TOUCH: chip-id %02x:%02x\n", id[0], id[1]);
-+		if ((id[0] == 0x36 && id[1] == 0x70) ||
-+		    (id[0] == 0x39 && id[1] == 0x6c)) {
++		if (id[0] == FTS_CHIP_ID0 && id[1] == FTS_CHIP_ID1) {
 +			return true;
 +		}
 +		delay(10000);
 +	}
-+	vt_read_reg(FTS_ADDR_CHIP_ID_ALT, id, 2);
-+	printf("SWEET VENUS TOUCH: chip-id alt %02x:%02x\n", id[0], id[1]);
-+	if ((id[0] == 0x36 && id[1] == 0x70) ||
-+	    (id[0] == 0x39 && id[1] == 0x6c)) {
-+		return true;
-+	}
-+	vt_read_reg_split(FTS_ADDR_CHIP_ID, id, 2);
-+	printf("SWEET VENUS TOUCH: chip-id split %02x:%02x\n", id[0], id[1]);
-+	if ((id[0] == 0x36 && id[1] == 0x70) ||
-+	    (id[0] == 0x39 && id[1] == 0x6c)) {
-+		return true;
-+	}
-+	uint8_t one = 0;
-+	vt_read_reg(0x000000a3u, &one, 1);
-+	printf("SWEET VENUS TOUCH: chip-id a3 %02x\n", one);
-+	vt_read_reg(0x000000a8u, &one, 1);
-+	printf("SWEET VENUS TOUCH: vendor a8 %02x\n", one);
 +	return false;
 +}
 +
 +/*
-+ * When firmware is running the boot-ROM chip-id register may not be mapped.
-+ * The FW announces itself with a controller-ready (0x03) FIFO event instead.
++ * After a hardware reset the running firmware posts a controller-ready
++ * event.  Accept any real touch event too, so a touch during probe is not
++ * lost.  Raw non-empty events are logged to show partial communication.
 + */
 +static bool
 +vt_fifo_alive(void)
 +{
 +	uint8_t ev[8];
++	unsigned logged = 0;
 +
-+	for (unsigned i = 0; i < 12; ++i) {
++	for (unsigned i = 0; i < 16; ++i) {
 +		if (vt_read_event(ev)) {
-+			printf("SWEET VENUS TOUCH: fifo %02x %02x %02x %02x %02x %02x %02x %02x\n",
-+			    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
-+			if (ev[0] == FTS_EVT_READY || ev[0] == FTS_EVT_ENTER ||
-+			    ev[0] == FTS_EVT_MOTION || ev[0] == FTS_EVT_LEAVE) {
++			if (logged < 2) {
++				printf("SWEET VENUS TOUCH: fifo %02x %02x %02x %02x %02x %02x %02x %02x\n",
++				    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
++				logged++;
++			}
++			if (ev[0] == FTS_EVT_READY) {
++				printf("SWEET VENUS TOUCH: controller ready\n");
++				return true;
++			}
++			if (ev[0] == FTS_EVT_ENTER || ev[0] == FTS_EVT_MOTION ||
++			    ev[0] == FTS_EVT_LEAVE) {
 +				return true;
 +			}
 +		}
-+		delay(20000);
++		vt_wait_ms(25);
 +	}
 +	return false;
 +}
 +
-+static const int vt_maps[4][4] = {
++/* All 24 role permutations of GPIO 48-51; the two most likely first:
++ * QUP SPI data0=MOSI on 48, data1=MISO on 49, clk=50, cs=51. */
++static const int vt_maps[24][4] = {
 +	/* miso, mosi, clk, cs */
-+	{48, 49, 50, 51},
 +	{49, 48, 50, 51},
-+	{50, 51, 48, 49},
++	{48, 49, 50, 51},
++	{49, 48, 51, 50},
++	{48, 49, 51, 50},
++	{49, 50, 48, 51},
++	{50, 49, 48, 51},
++	{49, 51, 48, 50},
++	{51, 49, 48, 50},
++	{49, 50, 51, 48},
++	{50, 49, 51, 48},
++	{49, 51, 50, 48},
++	{51, 49, 50, 48},
++	{50, 48, 49, 51},
++	{48, 50, 49, 51},
++	{50, 51, 49, 48},
 +	{51, 50, 49, 48},
++	{48, 51, 49, 50},
++	{51, 48, 49, 50},
++	{48, 50, 51, 49},
++	{50, 48, 51, 49},
++	{48, 51, 50, 49},
++	{51, 48, 50, 49},
++	{50, 51, 48, 49},
++	{51, 50, 48, 49},
 +};
 +
 +static bool
@@ -340,17 +375,40 @@
 +	int forced = -1;
 +
 +	(void)PE_parse_boot_argn("venusftspins", &forced, sizeof(forced));
-+	for (int i = 0; i < 4; ++i) {
++	for (int i = 0; i < 24; ++i) {
 +		if (forced >= 0 && i != forced) {
 +			continue;
 +		}
-+		printf("SWEET VENUS TOUCH: probing pins %d/%d/%d/%d\n",
-+		    vt_maps[i][0], vt_maps[i][1], vt_maps[i][2], vt_maps[i][3]);
++		printf("SWEET VENUS TOUCH: probing map %d pins %d/%d/%d/%d\n",
++		    i, vt_maps[i][0], vt_maps[i][1], vt_maps[i][2], vt_maps[i][3]);
 +		vt_pins_setup(vt_maps[i][0], vt_maps[i][1], vt_maps[i][2], vt_maps[i][3]);
 +		vt_dump_pins();
 +		vt_reset();
-+		if (vt_chip_id() || vt_fifo_alive()) {
-+			printf("SWEET VENUS TOUCH: mapping %d selected\n", i);
++
++		if (vt_fifo_alive()) {
++			vt.map_index = i;
++			vt.fw_alive = true;
++			printf("SWEET VENUS TOUCH: mapping %d selected (fw)\n", i);
++			return true;
++		}
++
++		if (vt_chip_id()) {
++			vt.map_index = i;
++			printf("SWEET VENUS TOUCH: mapping %d selected (chip id)\n", i);
++			return true;
++		}
++
++		/* Boot ROM in 3-wire mode: switch to 4-wire and retry. */
++		vt_spi4_mode();
++		if (vt_chip_id()) {
++			vt.map_index = i;
++			printf("SWEET VENUS TOUCH: mapping %d selected (spi4 + chip id)\n", i);
++			return true;
++		}
++		if (vt_fifo_alive()) {
++			vt.map_index = i;
++			vt.fw_alive = true;
++			printf("SWEET VENUS TOUCH: mapping %d selected (spi4 + fw)\n", i);
 +			return true;
 +		}
 +	}
@@ -368,7 +426,8 @@
 +		vt.event_count++;
 +	}
 +	if (id == FTS_EVT_ENTER || id == FTS_EVT_MOTION) {
-+		int tid = ev[1] & 0x0f;
++		/* ST event[1]: bits 7:4 finger id, bits 3:0 touch type. */
++		int tid = (ev[1] & 0xf0) >> 4;
 +		int x = ((ev[3] & 0x0f) << 8) | ev[2];
 +		int y = (ev[4] << 4) | ((ev[3] & 0xf0) >> 4);
 +		if (tid >= VENUS_FINGERS || x >= VENUS_PANEL_W || y >= VENUS_PANEL_H) {
@@ -382,7 +441,7 @@
 +		vt.down[tid] = true;
 +		sweet_hid_touch(tid, 1, x, y);
 +	} else if (id == FTS_EVT_LEAVE) {
-+		int tid = ev[1] & 0x0f;
++		int tid = (ev[1] & 0xf0) >> 4;
 +		if (tid >= VENUS_FINGERS) {
 +			return;
 +		}
@@ -397,13 +456,12 @@
 +venus_touch_thread(void *arg, wait_result_t result)
 +{
 +	unsigned delay_s = 45;
-+	int enabled = 1, scan = 1, dump = 1;
++	int enabled = 1, dump = 1;
 +	uint8_t ev[8];
 +
 +	(void)arg;
 +	(void)result;
 +	(void)PE_parse_boot_argn("venusftsdelay", &delay_s, sizeof(delay_s));
-+	(void)PE_parse_boot_argn("venusftsscan", &scan, sizeof(scan));
 +	(void)PE_parse_boot_argn("venusftsdump", &dump, sizeof(dump));
 +	(void)PE_parse_boot_argn("venusfts", &enabled, sizeof(enabled));
 +	vt.dump = dump != 0;
@@ -411,8 +469,8 @@
 +		printf("SWEET VENUS TOUCH: disabled (venusfts=0)\n");
 +		goto out;
 +	}
++	printf("SWEET VENUS TOUCH: thread start (delay %u s)\n", delay_s);
 +	if (delay_s) {
-+		printf("SWEET VENUS TOUCH: starting in %u s\n", delay_s);
 +		vt_wait_ms(delay_s * 1000u);
 +	}
 +	if (vt.dead) {
@@ -435,7 +493,7 @@
 +	int vdd_err = sweet_rpmh_vreg_enable("ldoc2", 1800);
 +	printf("SWEET VENUS TOUCH: VDD L2C vote=%d\n", vdd_err);
 +
-+	/* Power sequence from the FTS driver: avddold, avdd switch, vdd,
++	/* Power sequence from the ST driver: avddold, avdd switch, vdd,
 +	 * reset low, then release reset. */
 +	vt_gpio_cfg(VENUS_GPIO_AVDD, 0, 2, 3, true, true);
 +	vt_gpio_cfg(VENUS_GPIO_RESET, 0, 2, 3, true, false);
@@ -454,33 +512,13 @@
 +	    vt_rd(vt.tlmm, VENUS_GPIO_AVDD * 0x1000u + 4u));
 +
 +	if (!vt_probe()) {
-+		printf("SWEET VENUS TOUCH: no FTS chip (irq=%#x); giving up\n",
++		printf("SWEET VENUS TOUCH: no FTS chip found (irq=%#x); polling map 0\n",
 +		    vt_rd(vt.tlmm, VENUS_GPIO_IRQ * 0x1000u + 4u));
-+		goto out;
++		vt_pins_setup(vt_maps[0][0], vt_maps[0][1], vt_maps[0][2], vt_maps[0][3]);
 +	}
 +
-+	/* Clean reset, then wait for the controller-ready FIFO event. */
-+	vt_reset();
-+	bool ready = false;
-+	for (unsigned i = 0; i < 50; ++i) {
-+		if (!vt_read_event(ev)) {
-+			vt_wait_ms(10);
-+			continue;
-+		}
-+		if (ev[0] == FTS_EVT_READY) {
-+			ready = true;
-+			break;
-+		}
-+	}
-+	printf("SWEET VENUS TOUCH: controller-ready=%d\n", ready);
-+
-+	if (scan) {
-+		uint8_t cmd[3] = { FTS_CMD_SCAN_MODE, 0x00, 0x01 }; /* active, multi-touch */
-+		vt_spi_select(true);
-+		vt_spi_send(cmd, sizeof(cmd));
-+		vt_spi_select(false);
-+		printf("SWEET VENUS TOUCH: active scan requested\n");
-+		delay(10000);
++	if (!vt.fw_alive) {
++		printf("SWEET VENUS TOUCH: no fw event yet; will keep polling\n");
 +	}
 +
 +	printf("SWEET VENUS TOUCH: polling FIFO\n");
@@ -511,7 +549,7 @@
 +		return;
 +	}
 +	vt.started = true;
-+	printf("SWEET VENUS TOUCH: init (FTS SPI on TLMM 48-51)\n");
++	printf("SWEET VENUS TOUCH: init (ST FTS SPI on TLMM 48-51)\n");
 +	kern_return_t kr = kernel_thread_start(venus_touch_thread, NULL, &thread);
 +	if (kr == KERN_SUCCESS) {
 +		thread_deallocate(thread);

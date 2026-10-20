@@ -1,5 +1,15 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> VENUS TOUCH v17 — ST FTS PROTOCOL FIX (2026-10-20 17:35) <<<
+
+**STATE 17:35 EEST: v17 driver edited + local compile OK; commit/CI next.**
+- **The v16 driver used the wrong protocol.** Venus is an **ST FTS** part (`compatible = "st,spi"`, `st_fts_k2.ftb`), and the exact Xiaomi kernel driver is `drivers/input/touchscreen/fts_spi/` on `MiCode/Xiaomi_Kernel_OpenSource` branch `venus-r-oss` (not `focaltech_touch`). FocalTech `0xB6`/`0x85` reads cannot work.
+- **Correct SPI constants** (from `fts_lib/ftsHardware.h`, SPI branch): HW reg read `0xFB`, write `0xFA`, framebuffer read `0xA7`, FIFO read `0x87`, dummy byte 1 for all. Chip ID at **`0x20000000`**, must be `0x36 0x39` (`DCHIP_ID_0/1`). Events are 8 bytes: `0x03` controller-ready, `0x13` enter, `0x23` motion, `0x33` leave. **`event[1]` bits 7:4 = finger id, bits 3:0 = touch type** (old driver used the low nibble — fixed).
+- **SPI4 switch:** vendor `fts_spi4_mode_set()` runs when no FW is running (chip boots in 3-wire SPI): writes `0x20000032=0x10`, `0x20000034=0x02`, `0x2000003F=0x07`, `0x2000003D=0x30`, `0x2000002D=0x02` (`ADDR_ICR`, bit 1). v17 tries FIFO/chip-id first, then this sequence, then retries.
+- **Pin roles unknown**, so v17 probes all 24 permutations of GPIO 48-51 (two most likely first: MISO/MOSI 49/48 and 48/49, CLK 50, CS 51). `venusftspins=N` forces map 0..23. Full search worst case ~20 s after `venusftsdelay`.
+- Removed the FocalTech `A0 00 01` scan command (ST FW senses automatically); no second reset after probe. Raw FIFO bytes and chip-id are logged per map.
+- **v16 boot 17:22–17:24:** system reached SpringBoard; user photo at 17:25 shows the same panic (`_bzero` ← `vm_map_copy_footprint_ledgers`, far `0xfffffd1ac0c0000`). This is the pre-existing XNU ledger bug, **not touch**; early touch lines were lost because the host IP was applied late.
+
 ## >>> VENUS TOUCH v16 — TLMM BASE FIX (2026-10-20 17:20) <<<
 
 **STATE 17:20 EEST: v16 built; waiting for phone in fastboot.**
