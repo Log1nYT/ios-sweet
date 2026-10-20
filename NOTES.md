@@ -1,5 +1,28 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> VENUS TOUCH v16 — TLMM BASE FIX (2026-10-20 17:20) <<<
+
+**STATE 17:20 EEST: v16 built; waiting for phone in fastboot.**
+- **Root cause found:** SM8350 TLMM GPIO config registers start at **0x0F100000**, not 0x0F000000. The vendor DTB `pinctrl@f000000` is the wide aperture (0x0F000000+0x1000000); mainline `sm8350.dtsi` has `pinctrl@f100000` `reg = <0x0f100000 0x300000>`. `pinctrl-sm8350.c` confirms `ctl_reg = 0x1000*id`, `io_reg = +0x4`, `mux_bit=2`, `pull_bit=0`, `drv_bit=6`, `oe_bit=9`, `in_bit=0`, `out_bit=1`. v15 wrote to reserved space → every cfg/io read was 0, chip-id 00.
+- **v15 evidence:** `TLMM=0x3d340000`, `cfg 0/0/0/0 io 0/0/0/0`, `pwr rst=0/0 irq=0/0 avdd=0/0`, chip-id `00:00`.
+- **v16:** commit `8ea307d` (base 0x0f100000, size 0x300000; comment in driver). CI run **39436849782** success. Kernel SHA256 `cfaa80953d618b7a9dd8e94df4b4d828c6ff059391610ae264694e7e7b22281b`; image `shim/out/shim-boot-venus-v16.img` 17,430,528 B SHA256 `a3b9fca0a9944ebc4400e70dfaebae3c3250ba9be17f33431c486d619030a906`; cmdline has `venusftsdelay=10`.
+- **Next:** phone → fastboot, `fastboot boot shim/out/shim-boot-venus-v16.img`, capture `logs/venus-live-20261020h.txt` (listener already up). Check `TLMM=` + nonzero `cfg`/`pwr`, then `chip-id`, `mapping selected`, `controller-ready=1`, `ev 13/23/33`, `SWEET HID: touch`.
+- **Panic status:** user reports kernel panic again with v15 (~3 min after boot). v15 parks the touch thread, so it is not the touch teardown; it is the XNU `vm_map_copy_footprint_ledgers`/`_bzero` bug triggered by the iOS daemon crash-loop (`homed`/`xpcproxy`/bluetoothd). Test touch within the first minutes; fix the panic separately afterwards.
+- The older block below says "TLMM base 0x0f000000" — **superseded by this block**.
+
+## >>> VENUS TOUCH HANDOFF 2026-10-20 (ST FTS over bit-banged SPI) <<<
+
+**STATE 2026-10-20 11:45 UTC: venus touch driver implemented; CI run 39417123903 building.**
+- Hardware confirmed from the vendor DTS: ST/FocalTech FTS on `qupv3_se11_spi` (SE11 @ `0xa8c000`), SPI pins GPIO 48-51, reset GPIO 22, IRQ GPIO 23, AVDD switch GPIO 132, VDD = PM8350C L2 (`ldoc2`, 1.8 V), panel 1440x3200.
+- **TLMM base on venus is `0x0f000000`** (mainline DTB `pinctrl@f000000`, phandle 0x90); the old sweet driver's `0x03900000` is wrong for venus. GPIO layout is the usual `pin*0x1000` CFG +4 IO.
+- New `bsd/dev/sweet_venus_touch.c` (patch **0085**) bit-bangs mode-0 SPI on GPIO 48-51, probes chip-id (0x0004/0x0007, dummy byte) and the controller-ready FIFO event, sends scan mode `A0 00 01`, polls `0x85` every 10 ms and decodes `0x13/0x23/0x33` events to `sweet_hid_touch`.
+- Pin mapping is autodetected over 4 candidates (48/49/50/51 first); force with `venusftspins=N`. Boot args: `venusfts=0/1`, `venusftsdelay=S` (default 45), `venusftsscan=0`, `venusftsdump=0`.
+- **Power**: patch 0062 now also accepts `ldoc2` at 1800 mV and falls back to the venus cmd-db reserved RAM (`0x80860000`, 0x20000) if the sweet locator `0x0c3f000c` is invalid. The touch thread votes L2C best-effort before reset; the display rails may already have it on.
+- **HID**: 0058 normalization and 0071 edge bounds changed from 1080x2400 to 1440x3200.
+- **Commits**: `198fce2` (patches 0058/0060/0062/0071/0085). CI **39417123903** dispatched on `Log1nYT/ios-sweet`; artifact `xnu-kernel`.
+- **Next**: download artifact to `xnu/out-venus-v3/`, build payload with the v13home cmdline **minus `sweethidtest=10`, plus `venusftsdelay=10`**, then `fastboot boot` `shim-boot-venus-v14touch.img`. Watch for `SWEET VENUS TOUCH: probing pins`, `chip-id`, `fifo 03`, `controller-ready=1`, `ev 13/23/33`, and `SWEET HID: touch`.
+- If no chip: check `VDD L2C vote=` and the `irq=` value; try `venusftspins=1` (MISO/MOSI swapped), then check the L2C RPMh log (`rh_map` geometry, cmd-db locator/fallback).
+
 ## >>> VENUS BRING-UP HANDOFF 2026-10-19 (Xiaomi Mi 11, SM8350 fork) <<<
 
 **STATE (2026-10-20 ~08:45): v7 НЕ ЗНЯВ АКТИВАЦІЮ — mobileactivationd досі падає на boot-init; переходимо до аналізу бінарника й патчу клієнтів.**
