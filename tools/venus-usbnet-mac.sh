@@ -17,6 +17,16 @@ find_ifname() {
 	'
 }
 
+# Start the capture before the ECM interface appears so no early kernel
+# output is lost while we wait for enumeration.
+if [ $# -ge 1 ]; then
+	nc -ukl 5140 | tee -a "$1" &
+	capture=$!
+else
+	nc -ukl 5140 &
+	capture=$!
+fi
+
 ifname=""
 while [ -z "$ifname" ]; do
 	ifname=$(find_ifname)
@@ -38,8 +48,4 @@ echo "$ifname up: 192.168.7.1 <-> phone 192.168.7.2; live log on udp/5140 (ping 
 		sleep 2
 	done
 ) &
-if [ $# -ge 1 ]; then
-	nc -ukl 5140 | tee -a "$1"
-else
-	nc -ukl 5140
-fi
+wait "$capture"

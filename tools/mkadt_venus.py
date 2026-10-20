@@ -191,8 +191,8 @@ def build(seed=None, qemu=False, highmem=False):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(750)),
-            ('canvas-height', u32(1334)),
+            ('canvas-width', u32(1440)),  # 750x1334 -> no swaps on the 1440x3200 panel
+            ('canvas-height', u32(3200)),
         ])])
 
     fbcon = node('sweet-fbcon', [

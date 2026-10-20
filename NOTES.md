@@ -1,5 +1,19 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> VENUS: v18b-act BUILT, READY TO BOOT (2026-10-20 ~18:00) <<<
+
+- CI run #11 (commit ae8e8dd, main) built the kernel with patches 0087 (venus PON_HLOS power key) + 0091 (sweetteewrite console tee), SHA256 `acfd874...e45d04` verified against the artifact's own SHA256SUMS, kernel pulled to the Mac as `xnu/out-ae8e8dd/kernel.development.sweet`.
+- ADT reused unchanged (`shim/out/venus-v18-8g-1440.adt`, extracted from the known-good `-act.img`, 8 GB RAM, 1440x3200 canvas).
+- New payload `shim/out/payload-venus-v18b-act.bin` (16,613,792 B) built via `tools/mkpayload.py`, cmdline = the existing `-act` cmdline plus nothing new removed; `sweethidtest=15` (display-wake workaround) and `sweetteewrite=mobileactivation` (new diagnostic) both present.
+- Wrapped into `shim/out/shim-boot-venus-v18b-act.img` (16,625,664 B) via `tools/mkbootimg.py`, reusing the existing shim/DTB gzip blob (`shim/out/Image.gz`) unchanged — the ARM shim itself has no code changes this round.
+- `tools/boot-hid.sh` now points at `shim-boot-venus-v18b-act.img`, log `logs/venus-live-20261020o.txt`.
+- **Next: boot it.** `Vol-` + `Power` -> fastboot -> `bash tools/boot-hid.sh` on the Mac. Then in the log look for:
+  1. `SWEET KEYS: key=0 down=1` after pressing the physical Power button -> confirms patch 0087 fixed the dead power key (PM6150 PON_PBS -> PMK8350 PON_HLOS register fix).
+  2. `|mobileactivation| ...` lines -> mobileactivationd's own log file content, tee'd to console by patch 0091 via `sweetteewrite=mobileactivation` -> should reveal the real boot-init failure reason inside the daemon, the open question blocking Setup/activation.
+- If `|mobileactivation|` shows nothing: the userdata copy of mobileactivationd has its boot-init call patched out (cs_invalid_page at mh+0x50000, see activation-analysis block below), so the daemon may only log pre-boot-init startup lines, not the failure itself. In that case next step is either un-patching that call in userdata (riskier, needs a reflash) or full static RE with Ghidra of the real 20H392 binary already pulled (`logs/mobileactivationd-20H392.bin`).
+
+# iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
+
 ## >>> ACTIVATION ANALYSIS 2026-10-20 20:45 (mobileactivationd 20H392, pulled from the IPSW) <<<
 
 - IPSW root dmg downloaded in the Linux VM (`~/ipsw/087-86684-044.dmg`, 4388 MB, CRC ok). It is UDIF (LZFSE chunks) with GPT + one APFS partition (volume `SydneyUpdate20H392.D20D201OS`). `tools/udif.py` = random-access reader (file-like) that feeds `pyfsapfs` (`pip install libfsapfs-python lzfse capstone lief`), no full decompress needed (VM has only ~5 GB free).
