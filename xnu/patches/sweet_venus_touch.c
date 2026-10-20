@@ -32,8 +32,11 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
 extern void sweet_hid_touch(int finger, int down, int x, int y);
 
-#define VENUS_TLMM_PA        0x0f000000u
-#define VENUS_TLMM_SIZE      0x00100000u
+/* SM8350 GPIO config registers live at 0x0f100000 (the vendor DTB's
+ * pinctrl@f000000 aperture starts 0x100000 earlier). Using 0x0f000000
+ * reads/writes reserved space: every cfg/io read comes back zero. */
+#define VENUS_TLMM_PA        0x0f100000u
+#define VENUS_TLMM_SIZE      0x00300000u
 
 #define VENUS_GPIO_AVDD      132u
 #define VENUS_GPIO_RESET     22u
