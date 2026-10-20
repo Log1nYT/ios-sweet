@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/sweet_venus_touch.c
-@@ -0,0 +1,452 @@
+@@ -0,0 +1,516 @@
 +/*
 + * Venus (Xiaomi Mi 11, SM8350) FocalTech/ST FTS SPI touch bring-up.
 + *
@@ -185,6 +185,28 @@
 +	vt_spi_select(false);
 +}
 +
++/* Some FTS parts latch the address on CS rising and return data on the next
++ * CS-low cycle. Try this only as a diagnostic; the main path keeps CS low. */
++static void
++vt_read_reg_split(uint32_t addr, uint8_t *buf, unsigned len)
++{
++	uint8_t cmd[5] = {
++		FTS_CMD_HW_REG,
++		(uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
++		(uint8_t)(addr >> 8), (uint8_t)addr
++	};
++
++	vt_spi_select(true);
++	vt_spi_send(cmd, sizeof(cmd));
++	vt_spi_select(false);
++	vt_spi_select(true);
++	(void)vt_spi_xfer(0);	/* dummy byte */
++	for (unsigned i = 0; i < len; ++i) {
++		buf[i] = vt_spi_xfer(0);
++	}
++	vt_spi_select(false);
++}
++
 +static bool
 +vt_read_event(uint8_t *ev)
 +{
@@ -224,6 +246,18 @@
 +}
 +
 +static void
++vt_dump_pins(void)
++{
++	uint32_t m = (uint32_t)vt.miso * 0x1000u, o = (uint32_t)vt.mosi * 0x1000u;
++	uint32_t c = (uint32_t)vt.clk * 0x1000u, s = (uint32_t)vt.cs * 0x1000u;
++
++	printf("SWEET VENUS TOUCH: cfg %#x/%#x/%#x/%#x io %#x/%#x/%#x/%#x\n",
++	    vt_rd(vt.tlmm, m), vt_rd(vt.tlmm, o), vt_rd(vt.tlmm, c), vt_rd(vt.tlmm, s),
++	    vt_rd(vt.tlmm, m + 4u), vt_rd(vt.tlmm, o + 4u),
++	    vt_rd(vt.tlmm, c + 4u), vt_rd(vt.tlmm, s + 4u));
++}
++
++static void
 +vt_reset(void)
 +{
 +	vt_set(VENUS_GPIO_RESET, false);
@@ -248,7 +282,22 @@
 +	}
 +	vt_read_reg(FTS_ADDR_CHIP_ID_ALT, id, 2);
 +	printf("SWEET VENUS TOUCH: chip-id alt %02x:%02x\n", id[0], id[1]);
-+	return (id[0] == 0x36 && id[1] == 0x70) || (id[0] == 0x39 && id[1] == 0x6c);
++	if ((id[0] == 0x36 && id[1] == 0x70) ||
++	    (id[0] == 0x39 && id[1] == 0x6c)) {
++		return true;
++	}
++	vt_read_reg_split(FTS_ADDR_CHIP_ID, id, 2);
++	printf("SWEET VENUS TOUCH: chip-id split %02x:%02x\n", id[0], id[1]);
++	if ((id[0] == 0x36 && id[1] == 0x70) ||
++	    (id[0] == 0x39 && id[1] == 0x6c)) {
++		return true;
++	}
++	uint8_t one = 0;
++	vt_read_reg(0x000000a3u, &one, 1);
++	printf("SWEET VENUS TOUCH: chip-id a3 %02x\n", one);
++	vt_read_reg(0x000000a8u, &one, 1);
++	printf("SWEET VENUS TOUCH: vendor a8 %02x\n", one);
++	return false;
 +}
 +
 +/*
@@ -295,6 +344,7 @@
 +		printf("SWEET VENUS TOUCH: probing pins %d/%d/%d/%d\n",
 +		    vt_maps[i][0], vt_maps[i][1], vt_maps[i][2], vt_maps[i][3]);
 +		vt_pins_setup(vt_maps[i][0], vt_maps[i][1], vt_maps[i][2], vt_maps[i][3]);
++		vt_dump_pins();
 +		vt_reset();
 +		if (vt_chip_id() || vt_fifo_alive()) {
 +			printf("SWEET VENUS TOUCH: mapping %d selected\n", i);
@@ -374,13 +424,16 @@
 +	    (unsigned)vt.tlmm, vt_rd(vt.tlmm, VENUS_GPIO_RESET * 0x1000u + 4u),
 +	    vt_rd(vt.tlmm, VENUS_GPIO_AVDD * 0x1000u + 4u));
 +
-+	/* Best-effort PM8350C L2 (VDD) vote; the display may already have it on. */
++	/* avddold (L3C 3.3 V) feeds the avdd switch; vdd (L2C 1.8 V) is the
++	 * I/O rail. Both are best-effort votes. */
 +	extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++	int avdd_err = sweet_rpmh_vreg_enable("ldoc3", 3300);
++	printf("SWEET VENUS TOUCH: AVDD L3C vote=%d\n", avdd_err);
 +	int vdd_err = sweet_rpmh_vreg_enable("ldoc2", 1800);
 +	printf("SWEET VENUS TOUCH: VDD L2C vote=%d\n", vdd_err);
 +
-+	/* Power sequence from the FTS driver: reset low, VDD (already on),
-+	 * AVDD on, then release reset. */
++	/* Power sequence from the FTS driver: avddold, avdd switch, vdd,
++	 * reset low, then release reset. */
 +	vt_gpio_cfg(VENUS_GPIO_AVDD, 0, 2, 3, true, true);
 +	vt_gpio_cfg(VENUS_GPIO_RESET, 0, 2, 3, true, false);
 +	vt_gpio_cfg(VENUS_GPIO_IRQ, 0, 3, 3, false, false);
@@ -389,6 +442,13 @@
 +	delay(10000);
 +	vt_set(VENUS_GPIO_RESET, true);
 +	delay(300000);
++	printf("SWEET VENUS TOUCH: pwr rst=%#x/%#x irq=%#x/%#x avdd=%#x/%#x\n",
++	    vt_rd(vt.tlmm, VENUS_GPIO_RESET * 0x1000u),
++	    vt_rd(vt.tlmm, VENUS_GPIO_RESET * 0x1000u + 4u),
++	    vt_rd(vt.tlmm, VENUS_GPIO_IRQ * 0x1000u),
++	    vt_rd(vt.tlmm, VENUS_GPIO_IRQ * 0x1000u + 4u),
++	    vt_rd(vt.tlmm, VENUS_GPIO_AVDD * 0x1000u),
++	    vt_rd(vt.tlmm, VENUS_GPIO_AVDD * 0x1000u + 4u));
 +
 +	if (!vt_probe()) {
 +		printf("SWEET VENUS TOUCH: no FTS chip (irq=%#x); giving up\n",
@@ -431,8 +491,12 @@
 +		vt_wait_ms(10);
 +	}
 +out:
-+	(void)thread_terminate(current_thread());
-+	thread_block(THREAD_CONTINUE_NULL);
++	/* Do not tear down the kernel thread on a failed probe; keep it parked
++	 * so a bad exit path cannot corrupt scheduler/vm state. */
++	printf("SWEET VENUS TOUCH: thread parked\n");
++	for (;;) {
++		vt_wait_ms(60000);
++	}
 +}
 +
 +void
