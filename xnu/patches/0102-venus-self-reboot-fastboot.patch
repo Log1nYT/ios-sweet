@@ -10,7 +10,7 @@
  bsd/dev/sweet_usb.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_reboot.c
-@@ -0,0 +1,578 @@
+@@ -0,0 +1,607 @@
 +/*
 + * sweet: the phone reboots itself into the Qualcomm fastboot.
 + *
@@ -53,7 +53,7 @@
 + *                                  (default 2 = bootloader/fastboot)
 + *  boot arg  sweetrebootcmd=<0..3>  which SPMI command encoding to use
 + *  boot arg  sweetrebootpanic=0     do not reset the phone on a panic
-+ *  boot arg  sweetrebootudp=0       do not listen for the magic UDP packet
++ *  boot arg  sweetrebootudp=1       listen for the magic UDP packet (OFF by default)
 + *  sysctl    kern.sweet_reboot      write 1 = reboot into fastboot now,
 + *                                  write 2 = plain reboot, read = state
 + *  UDP       port 5141               a datagram with the text "reboot"
@@ -128,7 +128,7 @@
 +static int sr_watchdog_period;    /* seconds; 0 = off */
 +static int sr_mode = SR_REQ_FASTBOOT; /* what the automatic resets do */
 +static bool sr_panic_enabled = true;
-+static bool sr_udp_enabled = true;
++static bool sr_udp_enabled = false;   /* AUDIT D4: opt-in, see sweetrebootudp=1 */
 +static int sr_sleep_chan;
 +
 +static uint32_t
@@ -311,7 +311,13 @@
 +{
 +	uint8_t before = 0, after = 0, want;
 +
-+	sr_spmi_init();
++	/* AUDIT D3: sr_spmi_init() calls ml_io_map() (a vm_map allocation),
++	 * which must never happen in a panic context.  Only use the mapping
++	 * that sweet_reboot_init() already made at rootdev attach. */
++	if (!sr_spmi_ready) {
++		printf("SWEET REBOOT: SPMI not ready; no fastboot cookie\n");
++		return false;
++	}
 +	if (sr_apid == SR_NO_APID) {
 +		printf("SWEET REBOOT: no SDAM APID; no fastboot cookie\n");
 +		return false;
@@ -361,7 +367,15 @@
 +	printf("SWEET REBOOT: %s -> %s\n", why,
 +	    request == SR_REQ_FASTBOOT ? "fastboot" : "plain reset");
 +	if (request == SR_REQ_FASTBOOT) {
-+		(void)sr_set_fastboot_cookie();
++		/* AUDIT D1: without the cookie the ABL would boot the "boot"
++		 * partition = Android.  In that case keep the panic screen: a
++		 * human can still power-cycle the phone into fastboot. */
++		if (!sr_set_fastboot_cookie()) {
++			printf("SWEET REBOOT: no fastboot cookie - NOT resetting\n");
++			for (;;) {
++				delay(1000);
++			}
++		}
 +	}
 +	/* Let the console log (USB) flush before the SoC goes down. */
 +	for (i = 0; i < 300; ++i) {
@@ -542,8 +556,22 @@
 +	char mode[16];
 +	thread_t thread;
 +
-+	if (PE_parse_boot_argn("sweetreboot", &value, sizeof(value)) && value > 0) {
-+		sr_watchdog_period = value;
++	{
++		/* AUDIT D2: a bare "sweetreboot" parses as 1 in XNU -> a 1 s
++		 * watchdog = a permanent reboot loop.  Parse it as a string and
++		 * accept only a sane decimal value (>= 10 s). */
++		char wbuf[16];
++		if (PE_parse_boot_arg_str("sweetreboot", wbuf, sizeof(wbuf))) {
++			char *end = NULL;
++			long v = strtol(wbuf, &end, 10);
++			if (wbuf[0] == '\0' || end == NULL || *end != '\0' ||
++			    v < 10 || v > 3600) {
++				printf("SWEET REBOOT: bad sweetreboot=\"%s\" ignored\n",
++				    wbuf);
++			} else {
++				sr_watchdog_period = (int)v;
++			}
++		}
 +	}
 +	if (PE_parse_boot_argn("sweetrebootreason", &value, sizeof(value)) &&
 +	    value >= 0 && value <= 0xff) {
@@ -557,9 +585,10 @@
 +	    value == 0) {
 +		sr_panic_enabled = false;
 +	}
++	/* AUDIT D4: the UDP listener is opt-in (sweetrebootudp=1). */
 +	if (PE_parse_boot_argn("sweetrebootudp", &value, sizeof(value)) &&
-+	    value == 0) {
-+		sr_udp_enabled = false;
++	    value != 0) {
++		sr_udp_enabled = true;
 +	}
 +	if (PE_parse_boot_argn("sweetrebootmode", mode, sizeof(mode))) {
 +		sr_mode = (strcmp(mode, "plain") == 0) ? SR_REQ_PLAIN :
