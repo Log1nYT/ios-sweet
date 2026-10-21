@@ -346,7 +346,7 @@
 +	if (err != 0) {
 +		return err;
 +	}
-+	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)buf, (int)len, 0, UIO_SYSSPACE,
++	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)buf, (int)len, 0, UIO_SYSSPACE,
 +	    IO_NODELOCKED | IO_NOAUTH, kauth_cred_get(), &resid, NULL);
 +	if (err == 0 && resid != 0) {
 +		err = EIO;
@@ -355,11 +355,11 @@
 +		struct vnode_attr va;
 +
 +		VATTR_INIT(&va);
-+		VATTR_SET(&va, va_mode, mode);
++		VATTR_SET(&va, va_mode, (mode_t)mode);
 +		VATTR_SET(&va, va_uid, uid);
 +		VATTR_SET(&va, va_gid, gid);
 +		/* truncate: the old file may have been longer */
-+		VATTR_SET(&va, va_size, len);
++		VATTR_SET(&va, va_data_size, (uint64_t)len);
 +		(void)vnode_setattr(vp, &va, ctx);
 +	}
 +	vnode_close(vp, 0, ctx);
