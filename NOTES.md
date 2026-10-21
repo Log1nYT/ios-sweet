@@ -1,3 +1,38 @@
+## 2026-10-21: USB-Ethernet as a real network path (Wi-Fi chip is dead)
+
+Wi-Fi hardware on this unit is burned out, so official Setup activation over
+Wi-Fi is impossible. Pivoted away from reverse-engineering/bypassing
+mobileactivationd entirely, toward giving the phone REAL internet access
+over the USB-ECM link that already exists for live logs (ue0, 192.168.7.2,
+patches 0075-0077/0081/0083), so activation can happen the normal,
+unmodified way against Apple's real servers.
+
+- Patch 0097 (xnu/patches/0097-venus-usb-default-route.patch): after
+  ud_if_create() assigns ue0's static address, add a default route via
+  192.168.7.1 using the in-tree rtrequest(RTM_ADD, ...) kernel API
+  (declared in bsd/net/route_private.h, which is fine to use since this is
+  an in-tree kernel build, not a kext on the stable KPI). Logs
+  "SWEET USB: default route via 192.168.7.1 added/FAILED (err N)".
+- tools/venus-usbnet-nat.sh: Mac-side helper. Turns on
+  net.inet.ip.forwarding and loads a pf NAT rule so 192.168.7.0/24 goes out
+  through the Mac's own uplink (Wi-Fi/Ethernet). Run alongside
+  venus-usbnet-mac.sh: `sudo bash tools/venus-usbnet-nat.sh <ecm-ifname>
+  <uplink-ifname>` (ecm-ifname is the one venus-usbnet-mac.sh prints as "up").
+
+Still open / next to check once 0097 is built and booted:
+- Does configd/networkd on-device even notice ue0, or does it stay a
+  kernel-only interface? (So far logs only show configd touching lo0.) If
+  userland network frameworks (CFNetwork/SCNetworkReachability) require
+  configd's blessing before Setup/mobileactivationd will try a request,
+  the route alone may not be enough and configd may need to be made aware
+  of ue0 too.
+- DNS: no resolver config pushed to the device yet. Plan: rely on NAT to
+  pass through whatever DNS IP the device's resolver already tries (or
+  patch one in) rather than running a DNS server on the Mac.
+- Once routing works, check the live log for any outbound attempt from
+  Setup/mobileactivationd/configd over ue0 to Apple's real servers
+  (albert.apple.com et al.), and whether it actually completes.
+
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 ## >>> 2026-10-21 10:40 NEW HYPOTHESIS: boot-init fails on kern.bootsessionuuid (patch 0096) <<<
