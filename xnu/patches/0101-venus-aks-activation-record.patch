@@ -1,0 +1,46 @@
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -227,6 +227,43 @@
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	case 43:
++		/*
++		 * mobileactivationd reads the activation record from the key
++		 * store (libaks selector 43) and copies it into the reply it
++		 * sends to the client (MobileActivation.framework in the dyld
++		 * cache).  Without a record the client treats the device as
++		 * not activated even when the state says "Activated", and the
++		 * user gets the activation screen instead of the home screen.
++		 *
++		 * The record is a property list; the state is the only part
++		 * the client looks at.  The FairPlay blobs stay empty: the
++		 * daemon's own validation of them is skipped by the matching
++		 * daemon patch (the daemon reads the state, not the blobs).
++		 */
++	{
++		static const char rec[] =
++		    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++		    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\""
++		    " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++		    "<plist version=\"1.0\"><dict>"
++		    "<key>ActivationState</key><string>Activated</string>"
++		    "<key>-ActivationState</key><string>Activated</string>"
++		    "<key>BrickState</key><false/>"
++		    "<key>-BrickState</key><false/>"
++		    "<key>BuildVersion</key><string>20H392</string>"
++		    "<key>ProductVersion</key><string>16.7.16</string>"
++		    "<key>DataMigrationCompleted</key><true/>"
++		    "<key>PreSydroDataMigrationCompleted</key><true/>"
++		    "<key>ActivationInfoComplete</key><true/>"
++		    "<key>ActivationRandomness</key><data></data>"
++		    "<key>FairPlayCertChain</key><data></data>"
++		    "<key>FairPlaySignature</key><data></data>"
++		    "</dict></plist>\n";
++		args->scalarOutputCount = 0;
++		ret = sweet_aks_struct_out(args, rec, (uint32_t)(sizeof(rec) - 1));
++		break;
++	}
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;
