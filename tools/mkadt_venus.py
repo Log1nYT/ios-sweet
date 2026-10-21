@@ -64,11 +64,12 @@ FB, FB_SIZE = 0xe2a00000, 1440 * 3200 * 4
 VENUS_ECID = 0x56454e5553000001  # 'VENUS' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1440, 3200, 1440 * 4
 # The canvas (the size the iOS userland renders at, /arm-io/disp0
-# canvas-width/canvas-height) is NOT the panel size: it is the iPhone X
-# screen, 1125x2436 = 375x812 points at display-scale 3.  The kernel reports
-# the same size in GetDisplaySize and scales the canvas up to the panel
-# (xnu/patches/0111-venus-canvas-scale.patch).
-CANVAS_W, CANVAS_H = 1125, 2436
+# canvas-width/canvas-height) is the panel size of THIS phone: the Mi 11 is
+# 1440x3200.  At display-scale 3 that is 480x1067 points - a real phone
+# point size with the native pixel density (no upscaling, no blur).  The
+# kernel reports the same size in GetDisplaySize and scales the canvas to
+# the panel (xnu/patches/0111-venus-canvas-scale.patch).
+CANVAS_W, CANVAS_H = 1440, 3200
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); probe-verified on venus
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -252,7 +253,7 @@ def node(name, props=(), children=()):
 def build(seed=None, qemu=False, highmem=False, features=()):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
 
-    features: subset of ('camera', 'sep', 'haptics', 'audio', 'backlight').
+    features: subset of ('camera', 'sep', 'haptics', 'audio', 'backlight', 'options').
     Each switch turns the REAL iPhone-8 values of the matching device-tree
     nodes on; without them the nodes exist (so the iOS path lookups
     resolve) but every "hardware present" flag reads 0.  See
@@ -565,7 +566,23 @@ def build(seed=None, qemu=False, highmem=False, features=()):
     # NOTE: this node is in SweetPlatformExpert::excludeList(), so no nub
     # is created for it and IODTPlatformExpert::publishNVRAM() (which would
     # assert on a non-IOPlatformExpertDevice provider) is never called.
-    options = node('options', [ph()])
+    # NOTE (2026-10-21 20:05): the /options node makes the kernel PANIC:
+    #   panic(cpu 0 ...): IONVRAMCHRPHandler creation failed @IONVRAM.cpp:1380
+    #   handshake structure not initialized
+    # It is excluded from the published tree by SweetPlatformExpert's exclude
+    # list, but the node is still in the ADT and pe_init/publishNVRAM walks
+    # it -> the panic (proved in logs/research/impl/05-panic-log-carveout.md,
+    # a copy of this script without the node boots clean in QEMU).  The
+    # 108x "-> none" lookups are a cosmetic problem; the panic is fatal.
+    # So the node is OFF by default and only added with --options.
+    # NOTE (2026-10-21 20:20): the /options node makes the kernel PANIC:
+    #   panic(cpu 0 ...): IONVRAMCHRPHandler creation failed @IONVRAM.cpp:1380
+    #   handshake structure not initialized
+    # (proved in logs/research/impl/05-panic-log-carveout.md - a copy of this
+    # script with the node removed boots clean in QEMU).  The 108x "-> none"
+    # lookups are cosmetic; the panic is fatal, so the node is OFF unless
+    # --options is given.
+    options = [node('options', [ph()])] if 'options' in features else []
 
     # /backlight - the display backlight node (17x "-> none" per boot).
     # venus is an AMOLED panel: there is NO backlight PWM on the board
@@ -609,14 +626,15 @@ def build(seed=None, qemu=False, highmem=False, features=()):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram, options,
-         backlight] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram]
+        + options
+        + [backlight] + product + ([] if qemu else [ufs]))
 
 
 # The feature switches: each one turns the REAL iPhone-8 values of one
 # device-tree node on.  Default = "the node exists, the hardware-present
 # flags read 0" (the truth on venus).
-FEATURES = ('camera', 'sep', 'haptics', 'audio', 'backlight')
+FEATURES = ('camera', 'sep', 'haptics', 'audio', 'backlight', 'options')
 
 if __name__ == '__main__':
     argv = sys.argv[1:]
