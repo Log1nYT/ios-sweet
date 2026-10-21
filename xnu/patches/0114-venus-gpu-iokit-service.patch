@@ -93,9 +93,9 @@ FILES
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
 @@ -21,3 +21,4 @@
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
  iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
  iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
- iokit/Kernel/arm/SweetCamera.cpp                                 optional iokitcpp
 +iokit/Kernel/arm/SweetGPU.cpp                                   optional iokitcpp
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
