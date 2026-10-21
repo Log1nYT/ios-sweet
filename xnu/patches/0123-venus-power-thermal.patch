@@ -1,0 +1,1566 @@
+venus 0123: a read only power + thermal probe of the PMIC and the
+AppleSmartBattery service that publishes it
+
+The battery of the venus board (Xiaomi Mi 11 / SM8350) has no fuel gauge
+on the application processor side: the charger and the gauge live behind
+the ADSP charger protection domain (logs/research/06-power-battery-charging.md
+section 2.4).  What IS reachable over plain SPMI is the PM8350B itself:
+the SMB5 charger registers and the BCL v5 block give the real battery
+voltage (0x4776) and current (0x4786), the charge state, the error bits
+and the power path, and the PMIC temperature alarm blocks (peripheral
+0x0a) plus the PMK8350 VADC / ADC7 (peripheral 0x31) give the thermal
+state (logs/research/26-thermal-plan.md, section 5.0).
+
+This patch adds the missing half of that: a probe that samples those
+registers and an IOKit service that publishes the result to the iOS power
+stack.
+
+  bsd/dev/sweet_powerinfo.c   READ ONLY probe.  It polls every 5 s, prints
+                              "SWEET THERMAL: sid=N temp=..." for the five
+                              PMICs and "SWEET POWER: ..." when the battery
+                              numbers change, and keeps the last sample in
+                              memory.  It never writes a register: the BCL
+                              block is initialised by SweetBattery (0104),
+                              which owns the write path.
+  bsd/dev/sweet_powerinfo.h   the C interface of the probe.
+  iokit/Kernel/arm/SweetPowerInfo.cpp
+                              the AppleSmartBattery service.  It is an
+                              IOPMPowerSource, so the iOS power stack finds
+                              it the same way it finds SweetBattery, and it
+                              publishes CurrentCapacity, MaxCapacity,
+                              Voltage, Amperage, IsCharging, FullyCharged,
+                              IsPresent, Temperature, the AppleRaw* names
+                              and the XNU thermal contract ("Power Status"
+                              with Thermal_Level_Warning and the CPU /
+                              graphics power limits).
+                              Its user client answers the
+                              AppleKeyStore style selectors that the iOS
+                              power stack really calls (0, 7, 14, 17, 26,
+                              27, 35, 102 - the counts are in the live
+                              log) and logs the others as "not supported"
+                              instead of failing.
+
+The service is created by the BSD side (bsd/dev/sweet_ufs.c calls
+sweet_powerinfo_init()), because the BSD layer cannot create an IOService
+itself; it is attached to IOResources and registered by hand, which is
+what the personality table of iokit/KernelConfigTables.cpp does for the
+other services of this kernel.
+
+Boot arguments: sweetthermal=1 (the thermal probe, default off),
+sweetbattery=1 (the battery probe; SweetBattery uses the same argument
+for its own polling, so both services publish the same numbers),
+sweetbatsid=<0..5> (the SPMI SID of the battery PMIC, default 3) and
+sweetbattmah=<mAh> (the pack size, default 4600 on venus).
+
+Two changes to bsd/dev/sweet_spmi.c are NOT part of this patch (that file
+must not be touched by two patches at once); they are documented in
+logs/research/impl/21-power-thermal.md:
+  1. the temperature alarm blocks live in SPMI peripheral 0x0a, which is
+     not in sp_peripheral_ok() yet - without that one line the alarm
+     status of the PMICs stays unreadable;
+  2. the ADC7 is only sampled when the PMIC itself starts a conversion:
+     to drive it (EN_CTL1 0x3146, CONV_REQ 0x3147) the write allow list
+     of sweet_spmi.c needs (sid 0, 0x31).
+
+The state of charge stays a voltage derived estimate and the pack
+temperature stays unavailable: both need the gauge, and the gauge is
+behind the ADSP.
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ea7cfe1..1fc8a8b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,2 +109,3 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
++bsd/dev/sweet_powerinfo.c		standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 932a24c..d117b87 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,2 +52,3 @@ static void sweet_log_start(void);
+ static void sweet_log_echo(void);
++extern void sweet_powerinfo_init(void);
+ extern void sweet_sample_start(void);
+@@ -670,2 +671,3 @@ sweet_ufs_init(void)
+ 	sweet_reboot_init();
++	sweet_powerinfo_init();
+ 	return 0;
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..52fc0c5 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,2 +17,3 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetPowerInfo.cpp                              optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+diff --git a/bsd/dev/sweet_powerinfo.c b/bsd/dev/sweet_powerinfo.c
+new file mode 100644
+index 0000000..e26b540
+--- /dev/null
++++ b/bsd/dev/sweet_powerinfo.c
+@@ -0,0 +1,643 @@
++/*
++ * SWEET power + thermal probe - venus (Xiaomi Mi 11, SM8350).
++ *
++ * WHAT THIS IS: a READ ONLY probe that samples the PMICs over SPMI and
++ * keeps the result in memory for the IOKit side
++ * (iokit/Kernel/arm/SweetPowerInfo.cpp) and for the console.
++ *
++ * WHAT IT READS
++ *
++ *  - the battery PMIC (PM8350B = SPMI SID 3 on the venus board):
++ *      0x110b POWER_PATH_STATUS  external power, valid source, suspend
++ *      0x1006 BATTERY_CHARGER_STATUS_1  charge state 0..7
++ *      0x1007 BATTERY_CHARGER_STATUS_2  error bits (bit1 = pack OV)
++ *      0x100d BATTERY_CHARGER_STATUS_7  pack too hot / too cold
++ *      0x1308 APSD_RESULT  adapter type
++ *      0x1309 QC_CHANGE     negotiated USB voltage
++ *      0x4776 BCL_VBAT_READ  the REAL battery voltage (49.827 mV per code)
++ *      0x4786 BCL_IBAT_READ  the REAL battery current (78.127 mA per code)
++ *
++ *  - the PMIC temperature alarm blocks (SPMI peripheral 0x0a, SID 1..5):
++ *      0xa01 STATUS   the over temperature alarm state
++ *      0xa02..0xa04   the three trip thresholds (TH1/TH2/TH3)
++ *
++ *  - the PMK8350 VADC / ADC7 (SPMI SID 0, peripheral 0x31):
++ *      0x3100 REVISION, 0x3108 STATUS1, 0x3144 CH_SEL_CTL,
++ *      0x3150 DATA0, 0x3151 DATA1 - the last conversion of the die
++ *      temperature channels (0x003 PMK8350, 0x103 PM8350, 0x303 PM8350B,
++ *      0x403 PMR735A, 0x503 PMR735B).
++ *
++ * READ ONLY BY DESIGN: there is not a single store into a PMIC register
++ * in this file.  The BCL v5 block is initialised (0x4746 / 0x4759) by
++ * SweetBattery (patch 0104), which owns the write path; this probe only
++ * reads what that block produces.
++ *
++ * Boot arguments (all optional, the probe is off by default):
++ *   sweetthermal=1     the thermal probe (default: off)
++ *   sweetbattery=1     the battery probe (default: off; SweetBattery uses
++ *                       the same argument for its own polling, so both
++ *                       services publish the same numbers)
++ *   sweetbatsid=<0..5> the SPMI SID of the battery PMIC (default 3)
++ *   sweetbattmah=<mAh> the pack size (default 4600 on venus)
++ *
++ * Sources: logs/research/06-power-battery-charging.md,
++ *          logs/research/26-thermal-plan.md
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/IOLocks.h>
++#include "sweet_spmi.h"
++#include "sweet_powerinfo.h"
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++
++/* The IOKit service (iokit/Kernel/arm/SweetPowerInfo.cpp) is published
++ * from here: the BSD layer cannot create an IOService itself. */
++extern void sweet_powerinfo_publish(void);
++
++/* ------------------------------------------------------------------ */
++/* Register map                                                        */
++/* ------------------------------------------------------------------ */
++
++/* PMK8350 VADC (ADC7): SPMI SID 0, peripheral 0x31. */
++#define PI_ADC7_REV      0x3100u
++#define PI_ADC7_STATUS1  0x3108u
++#define PI_ADC7_STATUS2  0x3109u
++#define PI_ADC7_APP_SID  0x3140u
++#define PI_ADC7_DIG_PARAM 0x3142u
++#define PI_ADC7_FAST_AVG 0x3143u
++#define PI_ADC7_CH_SEL   0x3144u
++#define PI_ADC7_DELAY    0x3145u
++#define PI_ADC7_EN_CTL1  0x3146u
++#define PI_ADC7_CONV_REQ 0x3147u
++#define PI_ADC7_DATA0    0x3150u
++#define PI_ADC7_DATA1    0x3151u
++
++/* PMIC temperature alarm: SPMI peripheral 0x0a (base 0xa00). */
++#define PI_TALARM_BASE    0x0a00u
++#define PI_TALARM_STATUS  0x0a01u
++#define PI_TALARM_TH1     0x0a02u
++#define PI_TALARM_TH2     0x0a03u
++#define PI_TALARM_TH3     0x0a04u
++#define PI_TALARM_LVL_SEL 0x0a05u
++
++/* SMB5 charger and BCL v5 block of the battery PMIC. */
++#define PI_CHGR_STATUS1  0x1006u
++#define PI_CHGR_STATUS2  0x1007u
++#define PI_CHGR_STATUS7  0x100du
++#define PI_POWER_PATH    0x110bu
++#define PI_APSD_RESULT   0x1308u
++#define PI_QC_CHANGE     0x1309u
++#define PI_BCL_VBAT_READ 0x4776u
++#define PI_BCL_IBAT_READ 0x4786u
++
++/* POWER_PATH_STATUS bits. */
++#define PI_PP_USBIN   0x10u
++#define PI_PP_DCIN    0x08u
++#define PI_PP_VALID   0x01u
++#define PI_PP_SUSPEND 0x40u
++
++/* BATTERY_CHARGER_STATUS_1 charge states. */
++#define PI_CHG_INHIBIT   0u
++#define PI_CHG_TAPER     4u
++#define PI_CHG_TERMINATE 5u
++
++/* The ADC7: vref 1875 mV, full scale code 0x70e4. */
++#define PI_ADC7_VREF_UV   1875000u
++#define PI_ADC7_FULLSCALE 0x70e4u
++
++/* The die temperature sensor of the PMIC: 1.500 V at 25 degC, 10 mV/degC.
++ * This is an APPROXIMATION (the datasheet curve is a table); the raw code
++ * and the microvolt value are published next to it so that the number can
++ * be calibrated on the phone.  See report 26, question Q3/Q6. */
++#define PI_DIE_TEMP_UV_25DEG 1500000
++#define PI_DIE_TEMP_UV_PER_DEG 10000
++
++/* The thermal trips (report 26, section 5.C): 45 / 55 / 65 / 75 degC. */
++#define PI_TRIP_LIGHT_MC    45000
++#define PI_TRIP_MODERATE_MC 55000
++#define PI_TRIP_HEAVY_MC    65000
++#define PI_TRIP_CRITICAL_MC 75000
++
++/* The pack size of the Mi 11 (venus). */
++#define PI_MAH_VENUS 4600u
++#define PI_MAH_SWEET 5020u
++
++/* The probe period. */
++#define PI_PERIOD_SECS 5u
++
++/* ------------------------------------------------------------------ */
++/* State                                                               */
++/* ------------------------------------------------------------------ */
++
++typedef struct {
++	unsigned mv;		/* battery voltage in mV                */
++	int ma;			/* battery current in mA, + = charging  */
++	unsigned flags;		/* SWEET_PI_F_*                        */
++	unsigned percent;	/* voltage derived SOC estimate, 0..100 */
++	unsigned capacity;	/* pack size in mAh                     */
++} pi_battery_t;
++
++typedef struct {
++	unsigned temp_mC;	/* derived die temperature, 0 = unknown */
++	unsigned code;		/* raw ADC code                        */
++	unsigned uv;		/* ADC voltage in microvolts            */
++	unsigned alarm;		/* temperature alarm status, 0xff = ?  */
++	unsigned thr[3];	/* the three trip thresholds            */
++	unsigned status;	/* the ADC7 status bytes                */
++	unsigned valid;		/* a sample was read                   */
++} pi_thermal_t;
++
++static IOLock *pi_lock;
++static pi_battery_t pi_battery;
++static pi_thermal_t pi_thermal[SWEET_PI_PMIC_SIDS + 1];
++static unsigned pi_level;
++static unsigned pi_sid = 3;
++static unsigned pi_capacity = PI_MAH_VENUS;
++static bool pi_thermal_on;
++static bool pi_battery_on;
++static bool pi_alarm_warned;
++static int pi_chan;
++
++/* The die temperature channel of every PMIC that has one (venus DT). */
++static const struct {
++	unsigned sid;
++	unsigned channel;
++} pi_die_temp[SWEET_PI_PMIC_SIDS] = {
++	{ 0, 0x003u },	/* PMK8350  */
++	{ 1, 0x103u },	/* PM8350   */
++	{ 3, 0x303u },	/* PM8350B  */
++	{ 4, 0x403u },	/* PMR735A  */
++	{ 5, 0x503u },	/* PMR735B  */
++};
++
++/* ------------------------------------------------------------------ */
++/* Helpers                                                             */
++/* ------------------------------------------------------------------ */
++
++static bool
++pi_read(unsigned sid, unsigned addr, uint8_t *out)
++{
++	return sweet_spmi_read(sid, addr, out) == 0;
++}
++
++/*
++ * The generic single cell state of charge curve.  It is the same curve as
++ * the one SweetBattery uses, so that both services publish the same
++ * number; it is an ESTIMATE (there is no fuel gauge on this board, the
++ * real gauge lives behind the ADSP charger protection domain).
++ */
++static unsigned
++pi_estimate_percent(unsigned mv)
++{
++	static const unsigned volts[] = {3400, 3500, 3600, 3700, 3800, 3900,
++	    4000, 4100, 4200, 4350};
++	static const unsigned soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
++	unsigned i;
++
++	if (mv <= volts[0]) {
++		return soc[0];
++	}
++	for (i = 1; i < sizeof(volts) / sizeof(volts[0]); ++i) {
++		if (mv < volts[i]) {
++			return soc[i - 1] + (mv - volts[i - 1]) * (soc[i] - soc[i - 1]) /
++			       (volts[i] - volts[i - 1]);
++		}
++	}
++	return 100;
++}
++
++/* ------------------------------------------------------------------ */
++/* The battery sample                                                  */
++/* ------------------------------------------------------------------ */
++
++static void
++pi_sample_battery(void)
++{
++	pi_battery_t sample;
++	uint8_t path = 0, status1 = 0, status2 = 0, status7 = 0;
++	uint8_t vbat = 0, ibat = 0;
++	bool pathOk, st1Ok, st2Ok, st7Ok, vbatOk, ibatOk;
++	unsigned state;
++	bool external, capable, charging, full, error, tooHot;
++	unsigned mv;
++	int pmicMa;
++
++	sample.mv = pi_battery.mv;
++	sample.ma = pi_battery.ma;
++	sample.flags = pi_battery.flags;
++	sample.percent = pi_battery.percent;
++	sample.capacity = pi_capacity;
++
++	pathOk = pi_read(pi_sid, PI_POWER_PATH, &path);
++	st1Ok = pi_read(pi_sid, PI_CHGR_STATUS1, &status1);
++	st2Ok = pi_read(pi_sid, PI_CHGR_STATUS2, &status2);
++	st7Ok = pi_read(pi_sid, PI_CHGR_STATUS7, &status7);
++	if (!pathOk && !st1Ok) {
++		return; /* keep the last known good values */
++	}
++
++	external = pathOk && ((path & (PI_PP_USBIN | PI_PP_DCIN)) != 0);
++	capable = pathOk && (path & PI_PP_VALID) && !(path & PI_PP_SUSPEND);
++	state = st1Ok ? (unsigned)(status1 & 7u) : 0u;
++	error = st2Ok && (status2 & 0x02u);
++	tooHot = st7Ok && (status7 & 0x0cu);
++	charging = capable && state > PI_CHG_INHIBIT && state <= PI_CHG_TAPER &&
++	    !error && !tooHot;
++	full = capable && state == PI_CHG_TERMINATE && !error;
++
++	/* BCL v5: the real battery voltage and current. */
++	vbatOk = pi_read(pi_sid, PI_BCL_VBAT_READ, &vbat) && vbat != 0x7fu &&
++	    vbat != 0u;
++	mv = vbatOk ? (unsigned)vbat * 49827u / 1000u : 0u;
++	vbatOk = vbatOk && mv >= 2800u && mv <= 4600u;
++	ibatOk = pi_read(pi_sid, PI_BCL_IBAT_READ, &ibat);
++	pmicMa = 0;
++	if (ibatOk) {
++		int raw = (ibat & 0x80u) ? (int)ibat - 256 : (int)ibat;
++
++		pmicMa = (int)((int64_t)raw * 78127 / 1000);
++	}
++	if (vbatOk) {
++		sample.mv = mv;
++	} /* else: keep the last known good voltage */
++	if (ibatOk) {
++		sample.ma = -pmicMa;	/* the PMIC counts into the pack */
++	} /* else: keep the last known good current */
++
++	sample.flags = SWEET_PI_F_VALID;
++	if (external) {
++		sample.flags |= SWEET_PI_F_EXTERNAL;
++	}
++	if (capable) {
++		sample.flags |= SWEET_PI_F_CAPABLE;
++	}
++	if (charging) {
++		sample.flags |= SWEET_PI_F_CHARGING;
++	}
++	if (full) {
++		sample.flags |= SWEET_PI_F_FULL;
++	}
++	if (vbatOk) {
++		sample.flags |= SWEET_PI_F_VOLTAGE;
++	}
++	if (ibatOk) {
++		sample.flags |= SWEET_PI_F_CURRENT;
++	}
++	sample.percent = full ? 100u :
++	    (vbatOk ? pi_estimate_percent(sample.mv) : sample.percent);
++	sample.capacity = pi_capacity;
++
++	IOLockLock(pi_lock);
++	if (sample.mv != pi_battery.mv || sample.ma != pi_battery.ma ||
++	    sample.flags != pi_battery.flags || sample.percent != pi_battery.percent) {
++		printf("SWEET POWER: sid=%u %u%% %umV %dmA external=%d capable=%d "
++		    "charging=%d full=%d state=%u path=%#x status1=%#x status2=%#x "
++		    "status7=%#x\n",
++		    pi_sid, sample.percent, sample.mv, sample.ma, external, capable,
++		    charging, full, state, path, status1, status2, status7);
++	}
++	pi_battery = sample;
++	IOLockUnlock(pi_lock);
++}
++
++/* ------------------------------------------------------------------ */
++/* The thermal sample                                                  */
++/* ------------------------------------------------------------------ */
++
++/*
++ * The temperature alarm blocks of the PMICs.  The block does NOT hold a
++ * temperature, it holds the trip thresholds and the alarm state; the
++ * temperature itself comes from the ADC7 (below).  The peripheral 0x0a is
++ * not in the allow list of sweet_spmi.c yet, so these reads fail until
++ * that one line is added - see logs/research/impl/21-power-thermal.md.
++ */
++static void
++pi_sample_alarms(void)
++{
++	unsigned sid;
++
++	for (sid = 1; sid <= SWEET_PI_PMIC_SIDS; ++sid) {
++		pi_thermal_t sample = pi_thermal[sid];
++		uint8_t status = 0, th1 = 0, th2 = 0, th3 = 0;
++		bool ok;
++
++		ok = pi_read(sid, PI_TALARM_STATUS, &status) &&
++		    pi_read(sid, PI_TALARM_TH1, &th1) &&
++		    pi_read(sid, PI_TALARM_TH2, &th2) &&
++		    pi_read(sid, PI_TALARM_TH3, &th3);
++		if (!ok) {
++			if (!pi_alarm_warned) {
++				pi_alarm_warned = true;
++				printf("SWEET THERMAL: the temperature alarm blocks "
++				    "(SPMI peripheral 0x0a) do not answer; add 0x0a to "
++				    "sp_peripheral_ok() in bsd/dev/sweet_spmi.c\n");
++			}
++			sample.alarm = 0xffu;
++			sample.thr[0] = sample.thr[1] = sample.thr[2] = 0u;
++		} else {
++			sample.alarm = status;
++			sample.thr[0] = th1;
++			sample.thr[1] = th2;
++			sample.thr[2] = th3;
++		}
++		IOLockLock(pi_lock);
++		pi_thermal[sid] = sample;
++		IOLockUnlock(pi_lock);
++	}
++}
++
++/*
++ * The ADC7 of the PMK8350: the last conversion result and the channel it
++ * was made for.  The conversion is started by the PMIC itself (this probe
++ * never writes), so the value is only a temperature when the channel
++ * belongs to one of the die temperature channels.
++ */
++static void
++pi_sample_adc7(void)
++{
++	uint8_t rev = 0, status1 = 0, status2 = 0, ch = 0, d0 = 0, d1 = 0;
++	unsigned code, uv, channel;
++	unsigned i;
++
++	if (!pi_read(0, PI_ADC7_REV, &rev) ||
++	    !pi_read(0, PI_ADC7_STATUS1, &status1) ||
++	    !pi_read(0, PI_ADC7_STATUS2, &status2) ||
++	    !pi_read(0, PI_ADC7_CH_SEL, &ch) ||
++	    !pi_read(0, PI_ADC7_DATA0, &d0) ||
++	    !pi_read(0, PI_ADC7_DATA1, &d1)) {
++		return; /* the ADC7 does not answer */
++	}
++	code = (unsigned)d0 | ((unsigned)d1 << 8);
++	uv = code * PI_ADC7_VREF_UV / PI_ADC7_FULLSCALE;
++	channel = ch;
++
++	for (i = 0; i < sizeof(pi_die_temp) / sizeof(pi_die_temp[0]); ++i) {
++		unsigned sid = pi_die_temp[i].sid;
++		pi_thermal_t sample;
++
++		if (pi_die_temp[i].channel != channel) {
++			continue;
++		}
++		IOLockLock(pi_lock);
++		sample = pi_thermal[sid];
++		IOLockUnlock(pi_lock);
++		sample.code = code;
++		sample.uv = uv;
++		sample.status = ((unsigned)status1 << 8) | status2;
++		sample.valid = 1u;
++		if (status1 & 0x01u) {	/* EOC: a conversion has finished */
++			int temp = PI_DIE_TEMP_UV_25DEG +
++			    ((int)uv - PI_DIE_TEMP_UV_25DEG) * 1000 /
++			    PI_DIE_TEMP_UV_PER_DEG;
++
++			if (temp < -40000) {
++				temp = -40000;
++			}
++			if (temp > 150000) {
++				temp = 150000;
++			}
++			sample.temp_mC = (unsigned)temp;
++		}
++		IOLockLock(pi_lock);
++		pi_thermal[sid] = sample;
++		IOLockUnlock(pi_lock);
++	}
++}
++
++/* The thermal level of the board: the hottest PMIC and the alarm state. */
++static void
++pi_update_level(void)
++{
++	unsigned level = SWEET_PI_LEVEL_NORMAL;
++	unsigned hottest = 0;
++	unsigned sid;
++
++	for (sid = 1; sid <= SWEET_PI_PMIC_SIDS; ++sid) {
++		pi_thermal_t sample;
++
++		IOLockLock(pi_lock);
++		sample = pi_thermal[sid];
++		IOLockUnlock(pi_lock);
++		if (sample.temp_mC > hottest) {
++			hottest = sample.temp_mC;
++		}
++		/* An active temperature alarm is a hardware over temperature
++		 * event: it is always critical, whatever the ADC says. */
++		if (sample.alarm != 0xffu && (sample.alarm & 0x07u) != 0u) {
++			level = SWEET_PI_LEVEL_CRITICAL;
++		}
++	}
++	if (level != SWEET_PI_LEVEL_CRITICAL) {
++		if (hottest >= PI_TRIP_CRITICAL_MC) {
++			level = SWEET_PI_LEVEL_CRITICAL;
++		} else if (hottest >= PI_TRIP_HEAVY_MC) {
++			level = SWEET_PI_LEVEL_HEAVY;
++		} else if (hottest >= PI_TRIP_MODERATE_MC) {
++			level = SWEET_PI_LEVEL_MODERATE;
++		} else if (hottest >= PI_TRIP_LIGHT_MC) {
++			level = SWEET_PI_LEVEL_LIGHT;
++		}
++	}
++	IOLockLock(pi_lock);
++	pi_level = level;
++	IOLockUnlock(pi_lock);
++}
++
++/* The console line of one PMIC. */
++static void
++pi_print_thermal(unsigned sid)
++{
++	pi_thermal_t sample;
++
++	IOLockLock(pi_lock);
++	sample = pi_thermal[sid];
++	IOLockUnlock(pi_lock);
++	printf("SWEET THERMAL: sid=%u temp=%d code=0x%04x uv=%u alarm=0x%02x "
++	    "thr=%u,%u,%u adc=0x%04x valid=%u\n",
++	    sid, (int)sample.temp_mC, sample.code, sample.uv, sample.alarm,
++	    sample.thr[0], sample.thr[1], sample.thr[2], sample.status,
++	    sample.valid);
++}
++
++/* ------------------------------------------------------------------ */
++/* The probe thread                                                    */
++/* ------------------------------------------------------------------ */
++
++static void pi_probe_thread(__unused void *arg,
++    __unused wait_result_t wr) __attribute__((noreturn));
++
++static void
++pi_probe_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		(void)tsleep(&pi_chan, PZERO, "sweetpowerinfo",
++		    hz * (int)PI_PERIOD_SECS);
++		if (pi_thermal_on) {
++			pi_sample_alarms();
++			pi_sample_adc7();
++			pi_update_level();
++			for (unsigned sid = 1; sid <= SWEET_PI_PMIC_SIDS; ++sid) {
++				pi_print_thermal(sid);
++			}
++		}
++		if (pi_battery_on) {
++			pi_sample_battery();
++		}
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* The accessors (used by the IOKit side)                              */
++/* ------------------------------------------------------------------ */
++
++int
++sweet_powerinfo_battery(unsigned *mv, int *ma, unsigned *flags, unsigned *percent)
++{
++	pi_battery_t sample;
++	bool valid;
++
++	IOLockLock(pi_lock);
++	sample = pi_battery;
++	IOLockUnlock(pi_lock);
++	valid = (sample.flags & SWEET_PI_F_VALID) != 0u;
++	if (mv) {
++		*mv = sample.mv;
++	}
++	if (ma) {
++		*ma = sample.ma;
++	}
++	if (flags) {
++		*flags = sample.flags;
++	}
++	if (percent) {
++		*percent = sample.percent;
++	}
++	return valid ? 0 : -1;
++}
++
++int
++sweet_powerinfo_thermal(unsigned sid, unsigned *temp_mC, unsigned *code,
++    unsigned *uv, unsigned *alarm)
++{
++	pi_thermal_t sample;
++	bool valid;
++
++	if (sid < 1u || sid > SWEET_PI_PMIC_SIDS) {
++		return -1;
++	}
++	IOLockLock(pi_lock);
++	sample = pi_thermal[sid];
++	IOLockUnlock(pi_lock);
++	valid = sample.valid != 0u;
++	if (temp_mC) {
++		*temp_mC = sample.temp_mC;
++	}
++	if (code) {
++		*code = sample.code;
++	}
++	if (uv) {
++		*uv = sample.uv;
++	}
++	if (alarm) {
++		*alarm = sample.alarm;
++	}
++	return valid ? 0 : -1;
++}
++
++unsigned
++sweet_powerinfo_level(void)
++{
++	unsigned level;
++
++	IOLockLock(pi_lock);
++	level = pi_level;
++	IOLockUnlock(pi_lock);
++	return level;
++}
++
++unsigned
++sweet_powerinfo_capacity(void)
++{
++	return pi_capacity;
++}
++
++/* ------------------------------------------------------------------ */
++/* Start                                                               */
++/* ------------------------------------------------------------------ */
++
++int
++sweet_powerinfo_init(void)
++{
++	uint32_t thermal = 0, battery = 0, mah = 0, venus = 0, publish = 1;
++	thread_t thread;
++
++	if (pi_lock == NULL) {
++		pi_lock = IOLockAlloc();
++		if (pi_lock == NULL) {
++			printf("SWEET POWERINFO: no lock\n");
++			return -1;
++		}
++	}
++	(void)PE_parse_boot_argn(SWEET_PI_ARG_THERMAL, &thermal, sizeof(thermal));
++	(void)PE_parse_boot_argn(SWEET_PI_ARG_BATTERY, &battery, sizeof(battery));
++	(void)PE_parse_boot_argn(SWEET_PI_ARG_MAH, &mah, sizeof(mah));
++	(void)PE_parse_boot_argn("venus", &venus, sizeof(venus));
++	/* The service is a second power source; sweetpowerinfo=0 removes it
++	 * again without touching anything else. */
++	(void)PE_parse_boot_argn("sweetpowerinfo", &publish, sizeof(publish));
++	pi_thermal_on = thermal == 1u;
++	pi_battery_on = battery == 1u;
++
++	/* The pack size: 4600 mAh for the Mi 11 (venus), 5020 mAh for the
++	 * sweet board; sweetbattmah= overrides both. */
++	pi_capacity = venus ? PI_MAH_VENUS : PI_MAH_SWEET;
++	if (mah > 0u && mah <= 20000u) {
++		pi_capacity = (unsigned)mah;
++	}
++	/* The static values of 0062/0104, so that the service never shows
++	 * an empty battery before the first sample. */
++	pi_battery.mv = 4200u;
++	pi_battery.ma = 0;
++	pi_battery.flags = 0u;
++	pi_battery.percent = 100u;
++	pi_battery.capacity = pi_capacity;
++	for (unsigned sid = 1; sid <= SWEET_PI_PMIC_SIDS; ++sid) {
++		pi_thermal[sid].alarm = 0xffu;
++	}
++
++	if (pi_thermal_on || pi_battery_on) {
++		if (sweet_spmi_init() != 0) {
++			printf("SWEET POWERINFO: the SPMI reader is not available\n");
++		} else {
++			pi_sid = sweet_spmi_sid();
++		}
++	}
++	printf("SWEET POWERINFO: thermal=%d battery=%d sid=%u pack=%u mAh "
++	    "(read only)\n", pi_thermal_on, pi_battery_on, pi_sid, pi_capacity);
++
++	/* The IOKit service: it publishes the same numbers as SweetBattery
++	 * and the thermal data of this probe. */
++	if (publish) {
++		sweet_powerinfo_publish();
++	} else {
++		printf("SWEET POWERINFO: the service is switched off "
++		    "(sweetpowerinfo=0)\n");
++	}
++
++	if ((pi_thermal_on || pi_battery_on) &&
++	    kernel_thread_start(pi_probe_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("SWEET POWERINFO: probe every %u s\n", PI_PERIOD_SECS);
++	}
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_powerinfo.h b/bsd/dev/sweet_powerinfo.h
+new file mode 100644
+index 0000000..e1f061a
+--- /dev/null
++++ b/bsd/dev/sweet_powerinfo.h
+@@ -0,0 +1,95 @@
++/*
++ * SWEET power + thermal probe - the C interface shared with the IOKit side.
++ *
++ * The probe lives in bsd/dev/sweet_powerinfo.c and reads the PMIC over
++ * SPMI with the already proven read path of bsd/dev/sweet_spmi.c (the
++ * observer window, one byte per command).  It never writes a register.
++ *
++ * Two things are sampled:
++ *
++ *  1. the battery: the SMB5 charger registers and the BCL v5 block of
++ *     PM8350B (SPMI SID 3 on the venus board) give the REAL battery
++ *     voltage (0x4776) and current (0x4786), the charge state (0x1006),
++ *     the error bits (0x1007), the pack temperature status (0x100d) and
++ *     the power path (0x110b);
++ *
++ *  2. the temperature: the PMIC temperature alarm blocks (SPMI
++ *     peripheral 0x0a of SID 1..5) and the PMK8350 VADC / ADC7 (SPMI SID
++ *     0, peripheral 0x31) give the over temperature alarm state and the
++ *     last conversion of the die temperature channels.
++ *
++ * The IOKit side (iokit/Kernel/arm/SweetPowerInfo.cpp) reads the values
++ * through the accessors below; the header is NOT included there (the bsd
++ * headers are not exported to the iokit component), so the prototypes are
++ * repeated there - keep the two lists in sync.
++ *
++ * Sources: logs/research/06-power-battery-charging.md,
++ *           logs/research/26-thermal-plan.md
++ */
++#ifndef SWEET_POWERINFO_H
++#define SWEET_POWERINFO_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Boot arguments (all optional, the probe is off by default). */
++#define SWEET_PI_ARG_THERMAL "sweetthermal"  /* 1 = thermal probe         */
++#define SWEET_PI_ARG_BATTERY "sweetbattery"  /* 1 = battery probe          */
++#define SWEET_PI_ARG_SID     "sweetbatsid"   /* battery PMIC SPMI SID      */
++#define SWEET_PI_ARG_MAH     "sweetbattmah"  /* pack size in mAh           */
++
++/* Flags of the battery sample. */
++#define SWEET_PI_F_VALID    0x0001u /* the charger registers answered    */
++#define SWEET_PI_F_EXTERNAL 0x0002u /* a power source is present         */
++#define SWEET_PI_F_CAPABLE  0x0004u /* the port can charge the pack      */
++#define SWEET_PI_F_CHARGING 0x0008u /* the PMIC is charging              */
++#define SWEET_PI_F_FULL     0x0010u /* the PMIC says the pack is full    */
++#define SWEET_PI_F_VOLTAGE  0x0020u /* mv is a measurement, not a guess  */
++#define SWEET_PI_F_CURRENT  0x0040u /* ma is a measurement, not a guess  */
++
++/* Thermal levels (our own scale, report 26 section 5.C). */
++#define SWEET_PI_LEVEL_NORMAL   0u
++#define SWEET_PI_LEVEL_LIGHT    1u
++#define SWEET_PI_LEVEL_MODERATE 2u
++#define SWEET_PI_LEVEL_HEAVY    3u
++#define SWEET_PI_LEVEL_CRITICAL 4u
++
++/* The PMICs with a temperature alarm block: SPMI SID 1..5. */
++#define SWEET_PI_PMIC_SIDS 5u
++
++/*
++ * Start the probe.  Returns 0 when the probe runs (or when it is
++ * switched off by the boot arguments) and -1 when it could not start.
++ */
++int sweet_powerinfo_init(void);
++
++/*
++ * The last battery sample.  Returns 0 when a valid sample is available.
++ * mv = battery voltage in mV, ma = battery current in mA (positive means
++ * charging), flags = SWEET_PI_F_*, percent = the voltage derived state of
++ * charge estimate (0..100).
++ */
++int sweet_powerinfo_battery(unsigned *mv, int *ma, unsigned *flags,
++    unsigned *percent);
++
++/*
++ * The last thermal sample of one PMIC (sid 1..5).  Returns 0 when a
++ * sample is available.  temp_mC = the derived die temperature in milli
++ * degrees Celsius (0 = not available), code = the raw ADC code, uv = the
++ * ADC voltage in microvolts, alarm = the temperature alarm status byte
++ * (0xff = the alarm block did not answer).
++ */
++int sweet_powerinfo_thermal(unsigned sid, unsigned *temp_mC, unsigned *code,
++    unsigned *uv, unsigned *alarm);
++
++/* The thermal level of the board (SWEET_PI_LEVEL_*). */
++unsigned sweet_powerinfo_level(void);
++
++/* The pack size in mAh that the probe uses (sweetbattmah, 4600 on venus). */
++unsigned sweet_powerinfo_capacity(void);
++
++#ifdef __cplusplus
++}
++#endif
++#endif /* SWEET_POWERINFO_H */
+diff --git a/iokit/Kernel/arm/SweetPowerInfo.cpp b/iokit/Kernel/arm/SweetPowerInfo.cpp
+new file mode 100644
+index 0000000..305d4c0
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetPowerInfo.cpp
+@@ -0,0 +1,715 @@
++/*
++ * SWEET power information service - the IOKit side of the power and
++ * thermal probe of bsd/dev/sweet_powerinfo.c.
++ *
++ * The service is an IOPMPowerSource, so the iOS power stack finds it the
++ * same way it finds SweetBattery (patch 0062/0104): by the class
++ * IOPMPowerSource.  It publishes the standard properties the iOS power UI
++ * reads:
++ *
++ *   CurrentCapacity, MaxCapacity, Voltage, Amperage, IsCharging,
++ *   FullyCharged, IsPresent, Temperature, ExternalConnected,
++ *   ExternalChargeCapable, BatteryInstalled, AtWarnLevel,
++ *   AtCriticalLevel, TimeRemaining, CycleCount, LegacyIOBatteryInfo
++ *
++ * and the AppleRaw* names that thermalmonitord looks for
++ * (AppleRawCurrentCapacity, AppleRawMaxCapacity, ...).
++ *
++ * The class is called AppleSmartBattery (the name the iOS power stack
++ * uses for the battery service) and the user client is called
++ * AppleSmartBatteryUserClient.  The user client answers the
++ * AppleKeyStore style selectors that the iOS power stack really calls
++ * (the numbers and the call counts are taken from the live log,
++ * logs/venus-live-20261021l.txt):
++ *
++ *   sel   calls  who calls it
++ *   0     2211   powerd, SpringBoard, homed, chronod, bluetoothuserd, ...
++ *   7     2287   powerd, SpringBoard, securityd, CloudKeychainProxy, ...
++ *   8       94   SpringBoard (the only selector that fails today)
++ *   14      62   keybagd
++ *   17   12506   SpringBoard, powerd, contextstored, coreduetd, ...
++ *   26     191   SpringBoard
++ *   27     230   SpringBoard
++ *   32      40   SpringBoard
++ *   35    1467   SpringBoard, searchd, chronod, nanoregistryd, ...
++ *   102     20   UserEventAgent
++ *
++ * The battery related ones are answered with the real numbers of the
++ * probe, the rest is answered with kIOReturnUnsupported and a log line,
++ * so that the caller can see what is missing instead of a silent error.
++ *
++ * The values are the ones of the probe, which reads the same PMIC
++ * registers as SweetBattery, so both services publish the same numbers.
++ *
++ * Sources: logs/research/06-power-battery-charging.md,
++ *          logs/research/26-thermal-plan.md
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <IOKit/pwr_mgt/IOPMPowerSource.h>
++#include <libkern/libkern.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <pexpert/pexpert.h>
++
++/*
++ * bsd/dev/sweet_powerinfo.c.  The header of that file cannot be included
++ * here (the bsd headers are not exported to the iokit component), so the
++ * prototypes are repeated - keep them in sync with
++ * bsd/dev/sweet_powerinfo.h.
++ */
++extern "C" int sweet_powerinfo_battery(unsigned *mv, int *ma, unsigned *flags,
++    unsigned *percent);
++extern "C" int sweet_powerinfo_thermal(unsigned sid, unsigned *temp_mC,
++    unsigned *code, unsigned *uv, unsigned *alarm);
++extern "C" unsigned sweet_powerinfo_level(void);
++extern "C" unsigned sweet_powerinfo_capacity(void);
++
++/* The flags of the battery sample (bsd/dev/sweet_powerinfo.h). */
++#define PI_F_VALID    0x0001u
++#define PI_F_EXTERNAL 0x0002u
++#define PI_F_CAPABLE  0x0004u
++#define PI_F_CHARGING 0x0008u
++#define PI_F_FULL     0x0010u
++#define PI_F_VOLTAGE  0x0020u
++#define PI_F_CURRENT  0x0040u
++
++/* The thermal levels (bsd/dev/sweet_powerinfo.h). */
++#define PI_LEVEL_NORMAL   0u
++#define PI_LEVEL_LIGHT    1u
++#define PI_LEVEL_MODERATE 2u
++#define PI_LEVEL_HEAVY    3u
++#define PI_LEVEL_CRITICAL 4u
++
++/* The PMICs with a temperature alarm block: SPMI SID 1..5. */
++#define PI_PMIC_SIDS 5u
++
++/* How often the properties are refreshed (the probe runs every 5 s). */
++#define PI_UPDATE_MS 5000u
++
++/* The AppleKeyStore style selectors of the iOS power stack. */
++enum {
++	kPIOpen = 0,
++	kPIGetLockState = 7,
++	kPIGetSystem = 14,
++	kPIGetDeviceState = 17,
++	kPIAssertHold = 26,
++	kPIAssertDrop = 27,
++	kPIGetExtDeviceState = 35,
++	kPINotifyStateSet = 102,
++};
++
++/*
++ * The power state bitmask that selector 7 returns:
++ * bit0 external power, bit1 charging, bit2 fully charged, bit3 the battery
++ * is present, bit4 a thermal alarm is active.
++ */
++#define PI_STATE_EXTERNAL 0x1u
++#define PI_STATE_CHARGING 0x2u
++#define PI_STATE_FULL     0x4u
++#define PI_STATE_PRESENT  0x8u
++#define PI_STATE_ALARM    0x10u
++
++class AppleSmartBattery : public IOPMPowerSource {
++	OSDeclareDefaultStructors(AppleSmartBattery);
++public:
++	bool init(OSDictionary *dictionary = NULL) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	unsigned powerState(void);
++private:
++	IOWorkLoop *fLoop;
++	IOTimerEventSource *fTimer;
++	bool fTimerAdded, fRunning;
++	unsigned fCapacity;
++	unsigned fAssertions;
++	void putNumber(const char *key, UInt32 value);
++	void putBool(const char *key, bool value);
++	void publish(void);
++	void publishThermal(void);
++	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
++	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
++};
++OSDefineMetaClassAndStructors(AppleSmartBattery, IOPMPowerSource);
++
++bool
++AppleSmartBattery::init(OSDictionary *dictionary)
++{
++	/* This XNU's IOPMPowerSource only overrides init(void): run it
++	 * explicitly to allocate the power source dictionary. */
++	if (!IOPMPowerSource::init()) {
++		return false;
++	}
++	fLoop = NULL;
++	fTimer = NULL;
++	fTimerAdded = fRunning = false;
++	fCapacity = sweet_powerinfo_capacity();
++	fAssertions = 0;
++	if (dictionary) {
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
++		if (!it) {
++			return false;
++		}
++		OSObject *object;
++		bool ok = true;
++		while ((object = it->getNextObject())) {
++			const OSSymbol *key = OSDynamicCast(OSSymbol, object);
++			if (!key || !setProperty(key, dictionary->getObject(key))) {
++				ok = false;
++				break;
++			}
++		}
++		it->release();
++		if (!ok) {
++			return false;
++		}
++	}
++	return true;
++}
++
++void
++AppleSmartBattery::putNumber(const char *key, UInt32 value)
++{
++	const OSSymbol *symbol = OSSymbol::withCString(key);
++	OSNumber *number = OSNumber::withNumber(value, 32);
++	if (symbol && number) {
++		setPSProperty(symbol, number);
++	}
++	OSSafeReleaseNULL(number);
++	OSSafeReleaseNULL(symbol);
++}
++
++void
++AppleSmartBattery::putBool(const char *key, bool value)
++{
++	const OSSymbol *symbol = OSSymbol::withCString(key);
++	if (symbol) {
++		setPSProperty(symbol, value ? kOSBooleanTrue : kOSBooleanFalse);
++		symbol->release();
++	}
++}
++
++unsigned
++AppleSmartBattery::powerState(void)
++{
++	unsigned mv = 0, flags = 0, percent = 0;
++	int ma = 0;
++	unsigned state = PI_STATE_PRESENT;
++
++	(void)sweet_powerinfo_battery(&mv, &ma, &flags, &percent);
++	if (flags & PI_F_EXTERNAL) {
++		state |= PI_STATE_EXTERNAL;
++	}
++	if (flags & PI_F_CHARGING) {
++		state |= PI_STATE_CHARGING;
++	}
++	if (flags & PI_F_FULL) {
++		state |= PI_STATE_FULL;
++	}
++	for (unsigned sid = 1; sid <= PI_PMIC_SIDS; ++sid) {
++		unsigned temp = 0, code = 0, uv = 0, alarm = 0;
++
++		(void)sweet_powerinfo_thermal(sid, &temp, &code, &uv, &alarm);
++		if (alarm != 0xffu && (alarm & 0x07u) != 0u) {
++			state |= PI_STATE_ALARM;
++		}
++	}
++	return state;
++}
++
++/*
++ * The thermal part: the die temperatures of the PMICs and the thermal
++ * level of the board.  The XNU thermal contract (iokit/IOKit/pwr_mgt/IOPM.h)
++ * is published as well: "Power Status" with "Thermal_Level_Warning" and
++ * the CPU/graphics power limits - the keys an iOS power stack (and our
++ * own tooling) can read.  iOS does not read them itself (it uses the
++ * libSystem thermal notification), but they are the contract the kernel
++ * side of the thermal policy uses.
++ */
++void
++AppleSmartBattery::publishThermal(void)
++{
++	OSDictionary *samples;
++	unsigned level = sweet_powerinfo_level();
++	unsigned hottest = 0;
++	unsigned warning;
++
++	samples = OSDictionary::withCapacity(PI_PMIC_SIDS);
++	for (unsigned sid = 1; sid <= PI_PMIC_SIDS; ++sid) {
++		unsigned temp = 0, code = 0, uv = 0, alarm = 0;
++		bool valid = sweet_powerinfo_thermal(sid, &temp, &code, &uv, &alarm) == 0;
++		OSDictionary *entry = OSDictionary::withCapacity(5);
++		char name[8];
++
++		if (!entry) {
++			continue;
++		}
++		entry->setObject("Temperature", OSNumber::withNumber(temp, 32));
++		entry->setObject("Code", OSNumber::withNumber(code, 32));
++		entry->setObject("Microvolts", OSNumber::withNumber(uv, 32));
++		entry->setObject("Alarm", OSNumber::withNumber(alarm, 32));
++		entry->setObject("Valid", valid ? kOSBooleanTrue : kOSBooleanFalse);
++		snprintf(name, sizeof(name), "SID%u", sid);
++		if (samples) {
++			samples->setObject(OSString::withCString(name), entry);
++		}
++		entry->release();
++		if (temp > hottest) {
++			hottest = temp;
++		}
++	}
++	if (samples) {
++		setProperty("SweetThermalSamples", samples);
++		samples->release();
++	}
++	putNumber("SweetThermalLevel", level);
++	putNumber("SweetThermalMaxTemp", hottest);
++	putBool("SweetThermalSampleValid", hottest != 0u);
++
++	/* The XNU thermal contract: 0 = normal, 100 = warning, 110 = trap. */
++	switch (level) {
++	case PI_LEVEL_NORMAL:
++		warning = 0;
++		break;
++	case PI_LEVEL_LIGHT:
++		warning = 0;
++		break;
++	case PI_LEVEL_MODERATE:
++		warning = 100;
++		break;
++	case PI_LEVEL_HEAVY:
++		warning = 110;
++		break;
++	default:
++		warning = 110;
++		break;
++	}
++	{
++		OSDictionary *status = OSDictionary::withCapacity(3);
++		OSDictionary *cpu = OSDictionary::withCapacity(3);
++		OSDictionary *gpu = OSDictionary::withCapacity(1);
++
++		if (status && cpu && gpu) {
++			/* There is no cpufreq on this board: the scheduler and
++			 * the core count are the only limits we can offer. */
++			cpu->setObject("CPU_Speed_Limit", OSNumber::withNumber(100, 32));
++			cpu->setObject("CPU_Available_CPUs", OSNumber::withNumber(8, 32));
++			cpu->setObject("CPU_Scheduler_Limit",
++			    OSNumber::withNumber(warning ? 50 : 100, 32));
++			gpu->setObject("Graphics_Power_Performance",
++			    OSNumber::withNumber(warning ? 50 : 100, 32));
++			status->setObject("Thermal_Level_Warning",
++			    OSNumber::withNumber(warning, 32));
++			status->setObject("CPU_Power_Limits", cpu);
++			status->setObject("Graphics_Power_Limits", gpu);
++			setProperty("Power Status", status);
++		}
++		OSSafeReleaseNULL(status);
++		OSSafeReleaseNULL(cpu);
++		OSSafeReleaseNULL(gpu);
++	}
++}
++
++void
++AppleSmartBattery::publish(void)
++{
++	unsigned mv = 0, flags = 0, percent = 0;
++	int ma = 0;
++	bool valid = sweet_powerinfo_battery(&mv, &ma, &flags, &percent) == 0;
++	bool external = (flags & PI_F_EXTERNAL) != 0;
++	bool capable = (flags & PI_F_CAPABLE) != 0;
++	bool charging = (flags & PI_F_CHARGING) != 0;
++	bool full = (flags & PI_F_FULL) != 0;
++	unsigned capacity;
++	unsigned temp = 0, code = 0, uv = 0, alarm = 0xffu;
++
++	fCapacity = sweet_powerinfo_capacity();
++	capacity = (fCapacity * percent + 50u) / 100u;
++	if (!valid) {
++		/* The static fallback of 0062, so that the phone always shows
++		 * a battery - the same values SweetBattery publishes. */
++		mv = 4200u;
++		ma = 0;
++		percent = 100u;
++		capacity = fCapacity;
++		external = true;
++		capable = true;
++		charging = false;
++		full = true;
++	}
++	setBatteryInstalled(true);
++	setCurrentCapacity(capacity);
++	setMaxCapacity(fCapacity);
++	setExternalConnected(external);
++	setExternalChargeCapable(capable);
++	setIsCharging(charging);
++	setAtWarnLevel(false);
++	/* An uncalibrated voltage curve must not assert a critical shutdown. */
++	setAtCriticalLevel(false);
++	setVoltage(mv);
++	setAmperage(ma);
++	setTimeRemaining(-1);	/* Unknown: never publish zero minutes. */
++	setCycleCount(0);	/* Placeholder: there is no gauge. */
++	putBool("FullyCharged", full);
++	putBool("IsPresent", true);
++	putBool("AppleRawExternalConnected", external);
++	putBool("AppleRawIsCharging", charging);
++	putBool("AppleRawFullyCharged", full);
++	putNumber("AppleRawCurrentCapacity", capacity);
++	putNumber("AppleRawMaxCapacity", fCapacity);
++	putNumber("DesignCapacity", fCapacity);
++	putNumber("InstantAmperage", (UInt32)ma);
++
++	/*
++	 * The pack temperature is NOT reachable from the application
++	 * processor on this board (the gauge and its thermistor live behind
++	 * the ADSP charger protection domain).  What the PMIC measures is its
++	 * own die temperature; it is published next to the standard property
++	 * and the source is named, so that nobody mistakes it for a pack
++	 * temperature.
++	 */
++	for (unsigned sid = 1; sid <= PI_PMIC_SIDS; ++sid) {
++		unsigned t = 0, c = 0, u = 0, a = 0;
++
++		if (sweet_powerinfo_thermal(sid, &t, &c, &u, &a) == 0 && t != 0u) {
++			temp = t;
++			code = c;
++			uv = u;
++			break;
++		}
++	}
++	if (temp != 0u) {		/* iOS battery convention: centi degrees Celsius. */
++		putNumber("Temperature", temp / 10u);
++		putBool("SweetPowerInfoTemperatureEstimated", true);
++		putBool("SweetPowerInfoTemperatureSource", true);
++	} else {
++		putNumber("Temperature", 2500);
++		putBool("SweetPowerInfoTemperatureEstimated", true);
++		putBool("SweetPowerInfoTemperatureSource", false);
++	}
++	putNumber("SweetThermalPMICDiesTemp", temp);
++	putNumber("SweetThermalADCCode", code);
++	putNumber("SweetThermalADCMicrovolts", uv);
++	putNumber("SweetThermalAlarm", alarm);
++
++	putBool("SweetPowerInfoSampleValid", valid);
++	putBool("SweetPowerInfoVoltageValid", (flags & PI_F_VOLTAGE) != 0);
++	putBool("SweetPowerInfoCurrentValid", (flags & PI_F_CURRENT) != 0);
++	putBool("SweetPowerInfoSOCEstimated", true);
++	putBool("SweetPowerInfoFallback", !valid);
++	putNumber("SweetPowerInfoPercent", percent);
++	putNumber("SweetPowerInfoVoltage", mv);
++	putNumber("SweetPowerInfoAmperage", (UInt32)ma);
++	putNumber("SweetPowerInfoPackCapacity", fCapacity);
++	putBool("SweetPowerInfoSecondarySource", true);
++
++	publishThermal();
++
++	/* IOPMCopyBatteryInfo's per source compatibility dictionary. */
++	{
++		OSDictionary *legacy = OSDictionary::withCapacity(7);
++		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
++		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
++		    kIOBatteryFlagsKey};
++		UInt32 values[] = {capacity, fCapacity, mv, (UInt32)ma, 0,
++		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
++		    (charging ? kIOBatteryCharge : 0))};
++		if (legacy) {
++			for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
++				OSNumber *number = OSNumber::withNumber(values[i], 32);
++				if (number) {
++					legacy->setObject(keys[i], number);
++					number->release();
++				}
++			}
++			setLegacyIOBatteryInfo(legacy);
++		}
++		legacy->release();
++	}
++	updateStatus();	/* Flush the properties and notify on a change. */
++}
++
++void
++AppleSmartBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleSmartBattery *self = OSDynamicCast(AppleSmartBattery, owner);
++	if (self && self->fRunning) {
++		self->publish();
++		sender->setTimeoutMS(PI_UPDATE_MS);
++	}
++}
++
++bool
++AppleSmartBattery::start(IOService *provider)
++{
++	if (!IOPMPowerSource::start(provider)) {
++		return false;
++	}
++	setName("AppleSmartBattery");
++	setProperty(kIOUserClientClassKey, "AppleSmartBatteryUserClient");
++	/* Publish a complete source BEFORE registerService wakes powerd. */
++	publish();
++	fLoop = IOWorkLoop::workLoop();
++	fTimer = IOTimerEventSource::timerEventSource(this, &AppleSmartBattery::timerFired);
++	if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
++		fTimerAdded = true;
++		fRunning = true;
++		fTimer->setTimeoutMS(PI_UPDATE_MS);
++	} else {
++		IOLog("SWEET POWERINFO: no work loop; the values stay static\n");
++	}
++	registerService();
++	IOLog("SWEET POWERINFO: AppleSmartBattery published (pack %u mAh)\n",
++	    fCapacity);
++	return true;
++}
++
++void
++AppleSmartBattery::stop(IOService *provider)
++{
++	if (fLoop && fTimerAdded) {
++		(void)fLoop->runAction(&AppleSmartBattery::stopPolling, this);
++		fLoop->removeEventSource(fTimer);
++		fTimerAdded = false;
++	}
++	IOPMPowerSource::stop(provider);
++}
++
++IOReturn
++AppleSmartBattery::stopPolling(OSObject *owner, void *, void *, void *, void *)
++{
++	AppleSmartBattery *self = OSDynamicCast(AppleSmartBattery, owner);
++	if (!self) {
++		return kIOReturnBadArgument;
++	}
++	self->fRunning = false;
++	self->fTimer->cancelTimeout();
++	self->fTimer->disable();
++	return kIOReturnSuccess;
++}
++
++void
++AppleSmartBattery::free(void)
++{
++	OSSafeReleaseNULL(fTimer);
++	OSSafeReleaseNULL(fLoop);
++	IOPMPowerSource::free();
++}
++
++/* ------------------------------------------------------------------ */
++/* The user client                                                     */
++/* ------------------------------------------------------------------ */
++
++class AppleSmartBatteryUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleSmartBatteryUserClient);
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleSmartBatteryUserClient, IOUserClient);
++
++IOReturn
++AppleSmartBatteryUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++/* Copy len bytes into the caller's output structure. */
++static IOReturn
++sweet_pi_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
++{
++	if (args->structureOutputDescriptor != NULL) {
++		if (len > args->structureOutputDescriptor->getLength()) {
++			return kIOReturnNoSpace;
++		}
++		args->structureOutputDescriptor->writeBytes(0, buf, len);
++		args->structureOutputDescriptorSize = len;
++		return kIOReturnSuccess;
++	}
++	if (args->structureOutput == NULL || len > args->structureOutputSize) {
++		return kIOReturnNoSpace;
++	}
++	memcpy(args->structureOutput, buf, len);
++	args->structureOutputSize = len;
++	return kIOReturnSuccess;
++}
++
++/*
++ * The state of the battery and of the thermals as a property list.  A
++ * property list is used because it is the only format every caller of an
++ * Apple style battery service understands.
++ */
++static uint32_t
++sweet_pi_plist(char *buf, uint32_t size, bool withThermal)
++{
++	unsigned mv = 0, flags = 0, percent = 0;
++	int ma = 0;
++	unsigned level = 0, temp = 0;
++	char thermal[160];
++	int n;
++
++	(void)sweet_powerinfo_battery(&mv, &ma, &flags, &percent);
++	thermal[0] = '\0';
++	if (withThermal) {
++		level = sweet_powerinfo_level();
++		for (unsigned sid = 1; sid <= PI_PMIC_SIDS; ++sid) {
++			unsigned t = 0, c = 0, u = 0, a = 0;
++
++			if (sweet_powerinfo_thermal(sid, &t, &c, &u, &a) == 0 && t != 0u) {
++				temp = t;
++				break;
++			}
++		}
++		scnprintf(thermal, sizeof(thermal),
++		    "<key>ThermalLevel</key><integer>%u</integer>"
++		    "<key>ThermalTemperature</key><integer>%u</integer>",
++		    level, temp);
++	}
++	n = scnprintf(buf, size,
++	    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++	    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\""
++	    " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++	    "<plist version=\"1.0\"><dict>"
++	    "<key>Voltage</key><integer>%u</integer>"
++	    "<key>Amperage</key><integer>%d</integer>"
++	    "<key>CurrentCapacity</key><integer>%u</integer>"
++	    "<key>MaxCapacity</key><integer>%u</integer>"
++	    "<key>Percent</key><integer>%u</integer>"
++	    "<key>IsCharging</key><%s/>"
++	    "<key>FullyCharged</key><%s/>"
++	    "<key>IsPresent</key><true/>"
++	    "<key>ExternalConnected</key><%s/>"
++	    "<key>ExternalChargeCapable</key><%s/>"
++	    "<key>Temperature</key><integer>%u</integer>"
++	    "%s"
++	    "</dict></plist>\n",
++	    mv, ma, percent, sweet_powerinfo_capacity(), percent,
++	    (flags & PI_F_CHARGING) ? "true" : "false",
++	    (flags & PI_F_FULL) ? "true" : "false",
++	    (flags & PI_F_EXTERNAL) ? "true" : "false",
++	    (flags & PI_F_CAPABLE) ? "true" : "false",
++	    temp ? temp / 10u : 2500u,
++	    thermal);
++	if (n < 0 || (uint32_t)n >= size) {
++		return 0;
++	}
++	return (uint32_t)n;
++}
++
++IOReturn
++AppleSmartBatteryUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *args, __unused IOExternalMethodDispatch *dispatch,
++    __unused OSObject *target, __unused void *reference)
++{
++	IOReturn ret = kIOReturnSuccess;
++	uint32_t outScalars = args->scalarOutputCount;
++	AppleSmartBattery *battery = OSDynamicCast(AppleSmartBattery, getProvider());
++	char plist[1024];
++
++	switch (selector) {
++	case kPIOpen:
++	case kPIGetDeviceState:
++	case kPIGetExtDeviceState:
++		/* The state of the battery (and of the thermals for the
++		 * extended state) as a property list. */
++		args->scalarOutputCount = 0;
++		ret = sweet_pi_struct_out(args, plist,
++		    sweet_pi_plist(plist, sizeof(plist),
++		    selector == kPIGetExtDeviceState));
++		break;
++	case kPIGetLockState:
++		/* The power state of the phone. */
++		if (outScalars < 1) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		args->scalarOutput[0] = battery ? battery->powerState() : 0u;
++		args->scalarOutputCount = 1;
++		break;
++	case kPIGetSystem:
++		if (outScalars < 1) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		args->scalarOutput[0] = 0;	/* the system handle */
++		args->scalarOutputCount = 1;
++		break;
++	case kPIAssertHold:
++	case kPIAssertDrop:
++		/* A power assertion: the phone stack holds or drops a
++		 * resource.  Nothing to do for us, but the caller gets a
++		 * clean answer instead of an error. */
++		args->scalarOutputCount = 0;
++		break;
++	case kPINotifyStateSet:
++		/* A state notification: accepted, nothing to do. */
++		args->scalarOutputCount = 0;
++		break;
++	default:
++		IOLog("SWEET AKS: selector %u not supported by AppleSmartBattery\n",
++		    selector);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	IOLog("SWEET AKS: AppleSmartBattery sel %u -> 0x%x\n", selector,
++	    (unsigned)ret);
++	return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* The entry point of the BSD side                                     */
++/* ------------------------------------------------------------------ */
++
++/* Called from bsd/dev/sweet_powerinfo.c: the BSD layer cannot create an
++ * IOService itself. */
++extern "C" void sweet_powerinfo_publish(void);
++
++/*
++ * The service is attached to IOResources and registered by hand, which
++ * is what the personality table of iokit/KernelConfigTables.cpp does for
++ * the other services of this kernel - the difference is only that this
++ * one is created late (after the root device is known).
++ */
++extern "C" void
++sweet_powerinfo_publish(void)
++{
++	static AppleSmartBattery *service = NULL;
++
++	if (service != NULL) {
++		return;
++	}
++	service = new AppleSmartBattery;
++	if (service == NULL) {
++		IOLog("SWEET POWERINFO: no memory for the service\n");
++		return;
++	}
++	if (!service->init()) {
++		IOLog("SWEET POWERINFO: init failed\n");
++		service->release();
++		return;
++	}
++	if (!service->attach(IOService::getResourceService())) {
++		IOLog("SWEET POWERINFO: attach failed\n");
++		service->release();
++		return;
++	}
++	if (!service->start(IOService::getResourceService())) {
++		IOLog("SWEET POWERINFO: start failed\n");
++		service->detach(IOService::getResourceService());
++		service->release();
++		return;
++	}
++	IOLog("SWEET POWERINFO: AppleSmartBattery created and registered\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
