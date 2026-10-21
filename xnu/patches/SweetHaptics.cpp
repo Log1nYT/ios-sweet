@@ -22,6 +22,7 @@
  * GUESS, the userland side of this path is not known (see
  * logs/research/impl/17-haptics-cover.md).
  */
+#include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOTimerEventSource.h>

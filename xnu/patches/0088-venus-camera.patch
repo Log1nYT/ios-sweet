@@ -40,6 +40,7 @@
 +
 +#if defined(SWEET)
 +#include <IOKit/IOService.h>
++#include <IOKit/IOKitKeys.h>
 +#include <IOKit/IOUserClient.h>
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOMemoryDescriptor.h>
