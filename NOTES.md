@@ -1,3 +1,11 @@
+## >>> VENUS: v65 REACHES SpringBoard; THE SILENT RESETS WERE `sweetgpuprobe=1` (2026-10-21 23:15) <<<
+
+- v63/v64 (new kernel + `sweetgpu=1 sweetgpuprobe=1`) reset SILENTLY (no panic text although `sweetpanicgrace=300000` keeps panic text on screen 5 min) right after the screen line `SWEET GPU POWER: init probe=1 power=0 gx=0 reset=0` (patch 0113, `sweet_gpu_power_init`). The next printf (`SWEET GPU POWER: probe: GPU_CC at ...`) never appeared, so the reset is between that line and `gp_probe()`'s first print: the four `ml_io_map` calls (gpucc 0x3d90000, gcc 0x100000, ahb 0x3d00000, rsc 0x18220000) or `gp_board_guard()`. Guess: a mapping/access to a TZ-protected block (GCC/RSC) -> xPU violation -> silent SoC reset. NOT proven, which of the four is unknown.
+- v65 = v64 without `sweetgpuprobe=1` (everything else identical, same kernel SHA da18d54a...): boots to userland, photo shows backboardd/SpringBoard/CallKit, IOAccelerator matching -> none (expected). The 0113 power path stays OFF; `sweetgpu=1` (0112 read-only probe) is fine and gives the measurements of the entry above.
+- HFS+ keeps logging `hfs_mark_inconsistent: Runtime corruption detected on iosroot` / `BlockMarkFreeInternal ... free unallocated blocks` (also noted earlier at NOTES "HFS+ runtime corruption"). Needs an offline `fsck.hfsplus -fy` of userdata at some point.
+- Images: v64 `shim/out/shim-boot-venus-v64.img` (resets), **v65** `shim/out/shim-boot-venus-v65.img` (boots). Scripts `logs/build-v64.sh`, `logs/build-v65.sh`.
+- Next: find which line in `sweet_gpu_power_init` resets (bisect: map only gpucc/ahb first, skip gcc/rsc), then `sweetgpupower=1`.
+
 ## >>> VENUS: FIRST GPU MEASUREMENT (v63, 2026-10-21 23:05, from a photo of the screen) <<<
 
 v63 = new all-driver kernel + `sweetgpu=1 sweetgpuprobe=1 sweetpaniclast=1`. The probe runs without a panic now (the alignment fix worked). Read off the screen (observations):
