@@ -1,0 +1,41 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -44,6 +44,7 @@
+ #include <net/if_media.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
++#include <net/route_private.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+@@ -737,6 +738,30 @@
+ 	}
+ 	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+ 	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
++
++	/*
++	 * Default route via the Mac (192.168.7.1), so userland sockets on
++	 * ue0 can reach the real internet once the Mac NATs this subnet.
++	 * Wi-Fi is dead on this unit; this is the only path out.
++	 */
++	if (err == 0) {
++		struct sockaddr_in dst, gw, mask;
++		bzero(&dst, sizeof(dst));
++		dst.sin_len = sizeof(dst);
++		dst.sin_family = AF_INET;
++		bzero(&gw, sizeof(gw));
++		gw.sin_len = sizeof(gw);
++		gw.sin_family = AF_INET;
++		gw.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
++		bzero(&mask, sizeof(mask));
++		mask.sin_len = sizeof(mask);
++		mask.sin_family = AF_INET;
++		int rerr = rtrequest(RTM_ADD, (struct sockaddr *)&dst,
++		    (struct sockaddr *)&gw, (struct sockaddr *)&mask,
++		    RTF_UP | RTF_GATEWAY | RTF_STATIC, NULL);
++		printf("SWEET USB: default route via 192.168.7.1 %s (err %d)\n",
++		    rerr ? "FAILED" : "added", rerr);
++	}
+ }
+ 
+ static void
