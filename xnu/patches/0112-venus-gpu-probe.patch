@@ -1,0 +1,426 @@
+venus 0112: read only GPU probe for the Adreno 660 of the venus board
+
+The GPU of the Mi 11 (SM8350, Adreno 660, KGSL class) has no driver: the iOS
+UI runs on the CPU rasteriser.  This patch adds the first, honest milestone
+of the GPU work - a probe that proves the silicon is there and says what it
+is, without trying to drive it.
+
+It maps the 256 KiB KGSL 3D AHB aperture (0x3d00000, "kgsl_3d0_reg_memory")
+and the GPU_CC clock controller (0x3d90000, "qcom,lahaina-gpucc") read only,
+reads the GPU identity bytes, the clock gates (gpu_cc_ahb_clk, gpu_cc_cx_gmu_clk,
+the GMU root clock) and the power domain status (GX and CX GDSC), and prints
+one compact summary line every 5 s.
+
+It never writes to the GPU: not to the AHB aperture, not to a GDSC, not to
+the GX soft reset and not to a clock gate.  It publishes no IOKit service, so
+the iOS userland keeps using the CPU rasteriser (a fake accelerator would
+move CoreAnimation onto the Metal path and freeze the UI, see
+logs/research/07-gpu-plan.md section 4.3).
+
+Boot args: sweetgpu=1 (default off), sweetgpuaddr=<hex> (override the AHB
+window), sweetgpuprobe=1 (the periodic line).
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8b2fd39..ea7cfe1 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,2 +115,3 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index ab3d3db..932a24c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,2 +56,3 @@ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_gpu_init(void);
+ extern void sweet_filepatch_init(void);
+@@ -662,2 +663,3 @@ sweet_ufs_init(void)
+ 	sweet_sample_start();
++	sweet_gpu_init();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+new file mode 100644
+index 0000000..2e73b98
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,266 @@
++/*
++ * SWEET GPU probe - venus (Xiaomi Mi 11, SM8350, Adreno 660, KGSL class).
++ *
++ * WHAT THIS IS: a read only probe that proves the GPU silicon is there and
++ * says what it is.  It maps the KGSL 3D AHB aperture and the GPU_CC clock
++ * controller, reads the GPU identity bytes, the clock gates and the power
++ * domain status, and prints one compact line every 5 s.
++ *
++ * WHAT THIS IS NOT: a driver.  It does not program a command stream, it
++ * does not enable a clock, it does not vote a rail, it does not publish an
++ * IOKit service and it does not touch the iOS userland.  The iOS UI keeps
++ * running on the CPU rasteriser; nothing here can change that (see
++ * logs/research/07-gpu-plan.md, section 4.3: publishing an accelerator
++ * service would move CoreAnimation onto the Metal path and freeze the UI).
++ *
++ * READ ONLY BY DESIGN.  There is not a single store into any GPU register
++ * in this file.  In particular the GX soft reset (0x03d91008), the GDSC
++ * control registers (0x03d9100c, 0x03d9106c), the CX hardware control
++ * (0x03d91540) and the GPU_CC clock gates are only ever read, and the
++ * GX soft reset is not read either: a stray write to any of them can hang
++ * the whole SoC.
++ *
++ * Boot args (all optional):
++ *   sweetgpu=1          enable the probe (default: off)
++ *   sweetgpuaddr=<hex>  override the AHB window base (default 0x03d00000)
++ *   sweetgpuprobe=1     print the summary every 5 s (default: on when
++ *                       sweetgpu=1; 0 turns the periodic line off and keeps
++ *                       the one shot dump at init)
++ *
++ * The probe never spins: it sleeps in tsleep() and never waits for an
++ * interrupt.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_gpu.h"
++
++/* osfmk/arm/machine_routines.h is not exported to the BSD layer. */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++
++static vm_offset_t gpu_ahb_base;   /* kgsl_3d0_reg_memory, 256 KiB */
++static vm_offset_t gpu_cc_base;    /* qcom,lahaina-gpucc, 36 KiB   */
++static uint32_t gpu_ahb_pa = SWEET_GPU_AHB_PA;
++static uint32_t gpu_cc_pa = SWEET_GPU_CC_PA;
++static uint32_t gpu_chipid = SWEET_GPU_CHIPID;
++static unsigned gpu_probe_secs = SWEET_GPU_PROBE_SECS;
++static int gpu_probe_chan;
++
++/*
++ * One 32 bit read of a device register, ordered after the previous
++ * access.  Read only: no store ever reaches this address space.
++ */
++static uint32_t
++gpu_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* "0x3d00000", "3d00000" and "0X3D00000" are all accepted. */
++static bool
++gpu_parse_hex(const char *s, uint32_t *out)
++{
++	uint32_t v = 0;
++	unsigned digits = 0;
++
++	if (!s) {
++		return false;
++	}
++	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
++		s += 2;
++	}
++	for (; *s != '\0'; ++s) {
++		uint32_t d;
++
++		if (*s >= '0' && *s <= '9') {
++			d = (uint32_t)(*s - '0');
++		} else if (*s >= 'a' && *s <= 'f') {
++			d = (uint32_t)(*s - 'a') + 10u;
++		} else if (*s >= 'A' && *s <= 'F') {
++			d = (uint32_t)(*s - 'A') + 10u;
++		} else {
++			return false;
++		}
++		if (++digits > 8) {
++			return false;
++		}
++		v = (v << 4) | d;
++	}
++	if (digits == 0) {
++		return false;
++	}
++	*out = v;
++	return true;
++}
++
++/*
++ * The compact summary line.  Everything in it is read fresh, so a change
++ * of the clock or power state shows up in the next line.
++ */
++static void
++sweet_gpu_summary(void)
++{
++	uint32_t id0, id1, ahb_clk, gmu_clk, rcg_cmd, rcg_cfg;
++	uint32_t gx_st, cx_hw;
++	unsigned div, src, rcg_on;
++
++	id0 = gpu_rd(gpu_ahb_base, 0);
++	id1 = gpu_rd(gpu_ahb_base, 4);
++	ahb_clk = gpu_rd(gpu_cc_base, SWEET_GPU_CC_AHB_CLK);
++	gmu_clk = gpu_rd(gpu_cc_base, SWEET_GPU_CC_GMU_CLK);
++	rcg_cmd = gpu_rd(gpu_cc_base, SWEET_GPU_CC_GMU_RCG2);
++	rcg_cfg = gpu_rd(gpu_cc_base, SWEET_GPU_CC_GMU_RCG2 + 4);
++	div = (unsigned)(rcg_cfg & SWEET_GPU_RCG_DIV_MASK) + 1u;
++	src = (unsigned)((rcg_cfg >> SWEET_GPU_RCG_SRC_SHIFT) & SWEET_GPU_RCG_SRC_MASK);
++	rcg_on = (rcg_cmd & SWEET_GPU_RCG_ROOT_EN) ? 1u : 0u;
++	gx_st = gpu_rd(gpu_cc_base, SWEET_GPU_CC_GX_GDSC + 4);
++	cx_hw = gpu_rd(gpu_cc_base, SWEET_GPU_CC_CX_HW_CTRL);
++
++	printf("SWEET GPU: chip-id=0x%08x(%u.%u.%u.%u) ahb=0x%08x id0=0x%08x "
++	    "id1=0x%08x gpucc=0x%08x clk_ahb=%u clk_gmu=%u gmu_rcg=%u gmu_div=%u "
++	    "gmu_src=%u gx=%s cx=%s freq=GMU\n",
++	    gpu_chipid,
++	    (unsigned)SWEET_GPU_CHIPID_CORE(gpu_chipid),
++	    (unsigned)SWEET_GPU_CHIPID_MAJOR(gpu_chipid),
++	    (unsigned)SWEET_GPU_CHIPID_MINOR(gpu_chipid),
++	    (unsigned)SWEET_GPU_CHIPID_PATCH(gpu_chipid),
++	    gpu_ahb_pa, id0, id1, gpu_cc_pa,
++	    ahb_clk & 1u, gmu_clk & 1u, rcg_on, div, src,
++	    (gx_st & SWEET_GDSCR_CFG_PWR_UP) ? "on" : "off",
++	    (cx_hw & SWEET_GDSCR_PWR_ON) ? "on" : "off");
++}
++
++/*
++ * The periodic probe.  It only sleeps and reads; it never spins and it
++ * never waits for an interrupt.
++ */
++static void sweet_gpu_probe_thread(__unused void *arg,
++    __unused wait_result_t wr) __attribute__((noreturn));
++
++static void
++sweet_gpu_probe_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		(void)tsleep(&gpu_probe_chan, PZERO, "sweetgpu",
++		    hz * (int)gpu_probe_secs);
++		sweet_gpu_summary();
++	}
++}
++
++/*
++ * One shot dump at init: the identity bytes of the GPU and the state of
++ * the clock controller and of the two power domains.
++ */
++static void
++sweet_gpu_dump(void)
++{
++	unsigned i;
++
++	/*
++	 * The clock controller and the power domains come first: they are
++	 * safe to read, and they tell us whether the GPU is powered at all
++	 * before the first read of the GPU aperture itself.
++	 */
++	printf("SWEET GPU: gpucc ahb_clk=0x%08x gmu_clk=0x%08x gmu_rcg=0x%08x/0x%08x "
++	    "hub_rcg=0x%08x/0x%08x gx_gdsc=0x%08x/0x%08x cx_gdsc=0x%08x cx_hw=0x%08x "
++	    "gx_domain=0x%08x\n",
++	    gpu_rd(gpu_cc_base, SWEET_GPU_CC_AHB_CLK),
++	    gpu_rd(gpu_cc_base, SWEET_GPU_CC_GMU_CLK),
++	    gpu_rd(gpu_cc_base, SWEET_GPU_CC_GMU_RCG2),
++	    gpu_rd(gpu_cc_base, SWEET_GPU_CC_GMU_RCG2 + 4),
++	    gpu_rd(gpu_cc_base, SWEET_GPU_CC_HUB_RCG2),
++	    gpu_rd(gpu_cc_base, SWEET_GPU_CC_HUB_RCG2 + 4),
++	    gpu_rd(gpu_cc_base, SWEET_GPU_CC_GX_GDSC),
++	    gpu_rd(gpu_cc_base, SWEET_GPU_CC_GX_GDSC + 4),
++	    gpu_rd(gpu_cc_base, SWEET_GPU_CC_CX_GDSC),
++	    gpu_rd(gpu_cc_base, SWEET_GPU_CC_CX_HW_CTRL),
++	    gpu_rd(gpu_cc_base, SWEET_GPU_CC_GX_DOMAIN));
++	printf("SWEET GPU: ahb[0..15]=");
++	for (i = 0; i < 16; ++i) {
++		printf("%08x%s", gpu_rd(gpu_ahb_base, i * 4),
++		    (i == 15) ? "" : " ");
++	}
++	printf("\n");
++	printf("SWEET GPU: id bytes[0..7]=");
++	for (i = 0; i < 8; ++i) {
++		printf("%02x%s", gpu_rd(gpu_ahb_base, i) & 0xffu,
++		    (i == 7) ? "" : " ");
++	}
++	printf("\n");
++	/*
++	 * The chip id of an a6xx is not a plain register: CAF KGSL and
++	 * upstream msm both take it from the device tree
++	 * ("qcom,chipid = 0x06060001").  The dump above is the raw
++	 * hardware truth, so look for the value in it anyway: if the
++	 * window answers, the value has to be somewhere in it.
++	 */
++	for (i = 0; i < 64; ++i) {
++		uint32_t v = gpu_rd(gpu_ahb_base, i * 4);
++
++		if (v == SWEET_GPU_CHIPID) {
++			printf("SWEET GPU: chip-id 0x%08x found at ahb+0x%x\n",
++			    v, i * 4);
++			break;
++		}
++	}
++}
++
++int
++sweet_gpu_init(void)
++{
++	uint32_t enabled = 0;
++	uint32_t probe = 0;
++	char addr[32];
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled)) || !enabled) {
++		/* Default off: the probe must never run unless it is asked for. */
++		return 0;
++	}
++	if (PE_parse_boot_argn("sweetgpuaddr", addr, sizeof(addr))) {
++		uint32_t pa;
++
++		if (gpu_parse_hex(addr, &pa) && pa != 0) {
++			gpu_ahb_pa = pa;
++		} else {
++			printf("SWEET GPU: bad sweetgpuaddr=\"%s\", keeping 0x%08x\n",
++			    addr, gpu_ahb_pa);
++		}
++	}
++	if (PE_parse_boot_argn("sweetgpuprobe", &probe, sizeof(probe))) {
++		probe = (probe != 0);
++	} else {
++		probe = 1;
++	}
++	gpu_ahb_base = ml_io_map(gpu_ahb_pa, SWEET_GPU_AHB_SIZE);
++	gpu_cc_base = ml_io_map(gpu_cc_pa, SWEET_GPU_CC_SIZE);
++	if (!gpu_ahb_base || !gpu_cc_base) {
++		printf("SWEET GPU: mapping failed ahb=0x%08x gpucc=0x%08x\n",
++		    gpu_ahb_pa, gpu_cc_pa);
++		return -1;
++	}
++	printf("SWEET GPU: probe start ahb=0x%08x gpucc=0x%08x chip-id=0x%08x "
++	    "(read only, no command stream, no clock change)\n",
++	    gpu_ahb_pa, gpu_cc_pa, gpu_chipid);
++	sweet_gpu_dump();
++	sweet_gpu_summary();
++	if (probe) {
++		if (kernel_thread_start(sweet_gpu_probe_thread, NULL, &thread) ==
++		    KERN_SUCCESS) {
++			thread_deallocate(thread);
++			printf("SWEET GPU: summary every %u s\n", gpu_probe_secs);
++		}
++	}
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_gpu.h b/bsd/dev/sweet_gpu.h
+new file mode 100644
+index 0000000..ee43e02
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.h
+@@ -0,0 +1,106 @@
++/*
++ * SWEET GPU: addresses, register offsets and bit layouts of the venus GPU
++ * (Xiaomi Mi 11, SM8350, Adreno 660, KGSL class).
++ *
++ * Every constant below carries the source it was taken from; the full
++ * evidence list is in logs/research/impl/10-gpu-probe.md.
++ *
++ * READ ONLY: nothing in this header describes a write path.  The GPU reset
++ * (gx sw reset), the GDSC control registers and the clock gates must not
++ * be written: a stray write there can hang the whole SoC.
++ */
++#ifndef SWEET_GPU_H
++#define SWEET_GPU_H
++
++#include <stdint.h>
++
++/*
++ * GPU AHB aperture.  Source: the live device tree of this phone,
++ * /soc/qcom,kgsl-3d0@3d00000:
++ *   reg = <0x3d00000 0x40000  0x3d61000 0x800  0x3de0000 0x10000
++ *          0x3d8b000 0x2000  0x6900000 0x80000  0x634000 0x1000
++ *          0x636000 0x1000>;
++ *   reg-names = "kgsl_3d0_reg_memory", "cx_dbgc", "rscc", "isense_cntl",
++ *               "qdss_gfx", "rdpm_cx", "rdpm_mx";
++ * The first window (256 KiB) is the KGSL 3D register memory: the CAF KGSL
++ * driver claims exactly that window with
++ *   platform_get_resource_byname(pdev, IORESOURCE_MEM, "kgsl_3d0_reg_memory")
++ * (drivers/gpu/msm/adreno.c of the venus kernel tree), and every GPU
++ * register of the a6xx header (drivers/gpu/msm/a6xx_reg.h) is a dword
++ * index into it.
++ */
++#define SWEET_GPU_AHB_PA        0x03d00000u
++#define SWEET_GPU_AHB_SIZE      0x00040000u
++
++/*
++ * GPU clock controller.  Source: the live device tree,
++ *   clock_gpucc: qcom,gpucc@3d90000 { reg = <0x3d90000 0x9000>; }
++ * (compatible = "qcom,lahaina-gpucc", "syscon"; #clock-cells = 1).
++ */
++#define SWEET_GPU_CC_PA         0x03d90000u
++#define SWEET_GPU_CC_SIZE       0x00009000u
++
++/*
++ * GPU_CC register offsets, as byte offsets into the GPU_CC window.
++ * Source: drivers/clk/qcom/gpucc-lahaina.c of the venus kernel tree
++ * (the SM8350 "lahaina" GPU_CC driver).
++ */
++#define SWEET_GPU_CC_PLL0       0x0000u   /* alpha PLL 0                    */
++#define SWEET_GPU_CC_PLL1       0x0100u   /* alpha PLL 1                    */
++#define SWEET_GPU_CC_AHB_CLK    0x1078u   /* gpu_cc_ahb_clk gate, bit 0     */
++#define SWEET_GPU_CC_GMU_CLK    0x1098u   /* gpu_cc_cx_gmu_clk gate, bit 0  */
++#define SWEET_GPU_CC_GMU_RCG2   0x1120u   /* gpu_cc_gmu_clk_src: cmd +0x0, cfg +0x4 */
++#define SWEET_GPU_CC_HUB_RCG2   0x117cu   /* gpu_cc_hub_clk_src: cmd +0x0, cfg +0x4 */
++#define SWEET_GPU_CC_HUB_AHB_DIV 0x11c0u  /* 4 bit divider, hub AHB clock   */
++
++/*
++ * RCG2 register bits.  Source: drivers/clk/qcom/clk-rcg2.c of the venus
++ * kernel tree: cmd bit 1 = root enable, cfg bits 4..0 = source divider
++ * minus one (hid_width = 5 for the GPU_CC root clocks), cfg bits 10..8 =
++ * source select.
++ */
++#define SWEET_GPU_RCG_ROOT_EN   0x00000002u
++#define SWEET_GPU_RCG_DIV_MASK  0x0000001fu
++#define SWEET_GPU_RCG_SRC_SHIFT 8u
++#define SWEET_GPU_RCG_SRC_MASK  0x00000007u
++
++/*
++ * Power domains, as byte offsets into the GPU_CC window (all of them live
++ * inside the 36 KiB GPU_CC aperture).  Source: the live device tree
++ * (qcom,gdsc@3d9100c = gpu_cc_gx_gdsc, qcom,gdsc@3d9106c = gpu_cc_cx_gdsc,
++ * syscon@3d91540 = gpu_cc_cx_hw_ctrl, syscon@3d9158c = gpu_cc_gx_domain_addr,
++ * syscon@3d91008 = gpu_cc_gx_sw_reset) and the bit layout of
++ * drivers/clk/qcom/gdsc.c of the venus kernel tree.
++ */
++#define SWEET_GPU_CC_GX_GDSC    0x100cu   /* 0x03d9100c, GDSCR of the GX domain  */
++#define SWEET_GPU_CC_CX_GDSC    0x106cu   /* 0x03d9106c, GDSCR of the CX domain  */
++#define SWEET_GPU_CC_CX_HW_CTRL 0x1540u   /* 0x03d91540, CX hardware control     */
++#define SWEET_GPU_CC_GX_DOMAIN  0x158cu   /* 0x03d9158c, GX domain register      */
++#define SWEET_GPU_CC_GX_RESET   0x1008u   /* 0x03d91008, GX soft reset: DO NOT
++                                             TOUCH - not even read          */
++
++/* GDSCR bits: drivers/clk/qcom/gdsc.c of the venus kernel tree. */
++#define SWEET_GDSCR_PWR_ON      0x80000000u /* bit 31: power request          */
++#define SWEET_GDSCR_CFG_PWR_UP  0x00010000u /* GDSCR + 4 bit 16: power up done */
++
++/*
++ * The chip id of this GPU comes from the device tree, not from a register:
++ * "qcom,chipid = <0x06060001>" is the Adreno 660.  CAF KGSL reads it with
++ *   of_property_read_u32(node, "qcom,chipid", chipid)
++ * (drivers/gpu/msm/adreno.c) and decodes it with
++ * ADRENO_CHIPID_CORE / MAJOR / MINOR / PATCH (drivers/gpu/msm/adreno.h);
++ * upstream Linux uses the identical layout (ADRENO_CHIPID_ARGS in
++ * drivers/gpu/drm/msm/adreno/adreno_gpu.h) and prints it as "u.6.6.0.1".
++ */
++#define SWEET_GPU_CHIPID        0x06060001u
++#define SWEET_GPU_CHIPID_CORE(id)  (((id) >> 24) & 0xffu)
++#define SWEET_GPU_CHIPID_MAJOR(id) (((id) >> 16) & 0xffu)
++#define SWEET_GPU_CHIPID_MINOR(id) (((id) >> 8) & 0xffu)
++#define SWEET_GPU_CHIPID_PATCH(id) ((id) & 0xffu)
++
++/* Period of the periodic summary line, in seconds. */
++#define SWEET_GPU_PROBE_SECS    5u
++
++int sweet_gpu_init(void);
++
++#endif /* SWEET_GPU_H */
