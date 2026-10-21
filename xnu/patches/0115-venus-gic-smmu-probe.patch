@@ -38,19 +38,25 @@ Both are off by default:
   sweet_smmu=1      the SMMU v5 capability probe
   sweet_smmudump=1  also print the stream match registers
 
+The three hunks of this patch sit on lines that the other GPU, haptics and
+profiler patches do not use as context (the two file list entries go in
+front of the sweet_* group, the two declarations after the include block,
+the two calls right after the persistent log is started), so 0115 applies
+before and after 0116, 0119, 0121, 0122 and 0124.
+
 The register map, the evidence for every address, what the probes prove
 and what a real GICv3 distributor driver and a real SMMU client would
 still need are in logs/research/impl/13-gic-smmu-probe.md.
 
 diff --git a/bsd/conf/files b/bsd/conf/files
-index ea7cfe1..d094fd1 100644
+index ea7cfe1..e8c5364 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -117,2 +117,4 @@ bsd/dev/sweet_gpu.c			standard
- bsd/dev/sweet_usb.c			standard
+@@ -122,2 +122,4 @@ bsd/dev/unix_startup.c			standard
+ bsd/dev/monotonic.c optional monotonic
 +bsd/dev/sweet_gic.c		standard
 +bsd/dev/sweet_smmu.c		standard
- bsd/dev/mem.c				standard
+ bsd/dev/dev_perfmon.c optional config_perfmon
 diff --git a/bsd/dev/sweet_gic.c b/bsd/dev/sweet_gic.c
 new file mode 100644
 index 0000000..0252606
@@ -811,18 +817,19 @@ index 0000000..55740ce
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 932a24c..8cdd27c 100644
+index 932a24c..2027fb7 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -50,2 +50,5 @@ extern void thread_deallocate(thread_t);
- extern int hz;
+@@ -42,2 +42,6 @@
+ 
 +/* Read only capability probes (GICv3 distributor, SMMU v5); both are off. */
 +extern void sweet_gic_init(void);
 +extern void sweet_smmu_init(void);
- static void sweet_log_start(void);
-@@ -670,2 +673,5 @@ sweet_ufs_init(void)
- 	sweet_reboot_init();
++
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -662,2 +666,5 @@ sweet_ufs_init(void)
+ 	sweet_log_start();
 +	/* Read only probes: they print and return, they change nothing. */
 +	sweet_gic_init();
 +	sweet_smmu_init();
- 	return 0;
+ 	sweet_sample_start();
