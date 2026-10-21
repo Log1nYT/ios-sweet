@@ -1,3 +1,11 @@
+## >>> VENUS: v62 = GPU READ-ONLY PROBE IMAGE (2026-10-21 22:45) <<<
+
+- Patch 0114 did not apply (its files.arm64 hunk was anchored on the dropped SweetCamera.cpp line); rebased, `check-patch-order.py` now 114/115 (only 0012, as always). CI run 39663397711 -> `xnu/out-venus-v62kernel` (SHA 092646ac...).
+- Image `shim/out/shim-boot-venus-v62.img` (SHA 66e4aeda...) = that kernel + `venus-v58.adt` + the v61 cmdline + `sweetgpu=1 sweetgpuprobe=1`. NOT booted, `shim/out/CURRENT` still v61. Build script `logs/build-v62.sh`.
+- **Caveat (observation):** the golden v61 runs the OLD kernel (CI 39631098808) which has NO GPU probe. The probe only exists in the new all-driver kernel (39651202226 and later), which is the one that panicked in v59/v60. So v62 may panic before/after the probe lines; read the panic first (patch 0125 prints the previous boot's panic with `sweetpaniclast=1`, /pram).
+- Probe risk: reads the GPU AHB window (0x3d00000) while the GX rail is probably off; an external abort is possible. It reads GPU_CC/GDSC state first and prints it.
+- Next: power-cycle, boot v62 via fastboot (temporary), grep `SWEET GPU` in the live log; answers Q1-Q4 of logs/research/26b-gpu-command-stream.md section 8.
+
 ## >>> VENUS: v59-v61 STATE (2026-10-21 22:35, written when taking over from the opencode session) <<<
 
 **Observations (from logs/supervisor.log, not from the opencode agent's summary):**
