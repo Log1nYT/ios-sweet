@@ -67,6 +67,30 @@ Local binary edits on the CI kernel (no CI run needed, the kernel image is not s
 2. If v43 reaches the home screen: make it permanent with `tools/venus-persist-boot.sh` (`fastboot flash boot_b` + `set_active b`, slot a untouched) - **needs the user's OK, it is destructive**.
 3. With 0102 in the running kernel the phone can reset itself into fastboot on a UDP datagram to 192.168.7.2:5141 -> from then on the Mac drives the phone with no human in the loop.
 
+## >>> VENUS: THE MEMORY MAP WAS WRONG - THAT WAS THE PANIC (2026-10-21 22:10) <<<
+
+**STATE: the root cause of the repeated 32 MiB `kmem_alloc` panic is the DRAM window in the ADT, not the drivers.**
+
+- The Mi 11 has **8 GiB that END at 0x200000000**. The vendor FDT's bank 2 runs further (to 0x280000000), but that top 1 GiB is **reserved** (modem/secure).
+- Our ADT published `dram-size = 0x19a000000` (window 0xe6000000..0x27ff00000), i.e. it claimed the reserved 1 GiB as usable RAM. The allocator handed those pages out and a 32 MiB contiguous allocation could not be satisfied -> `kma_alloc(...33554432...) failed with 3` (KERN_NO_SPACE) -> kernel panic, right after the HID services registered.
+- The value that was **proven good** earlier (NOTES L297, the "8g" ADT) is **`dram-size = 0x11a000000`** (window ends exactly at 0x200000000). `tools/mkadt_venus.py` now uses it.
+- The 0100 reorder and the 0102 fixes were innocent; the bisect that proved it: **v53 = new kernel + the OLD (bad-map) ADT -> panic**, while **v54 = old kernel + the OLD (phantom) ADT -> home screen** (the phantom RAM absorbed the allocation).
+- `/pram` was also wrong (reg[0] must be the BASE, we published base+size -> the mapping pointed past the end of RAM). Fixed: `reg = <0x1f9f00000 0x100000>`.
+
+### The images of this hour (all in shim/out/)
+| image | kernel | ADT | result |
+|---|---|---|---|
+| v45 | CI 39631098808 | v33 | **HOME SCREEN** (`exec Setup` = 0), no panic |
+| v48 | CI 39634274543 | v48 (bad map) | panic |
+| v51 | CI 39651202226 | v49 (bad map) | panic |
+| v54 | CI 39631098808 | v33 | **HOME SCREEN**, power key works |
+| v56 | CI 39631098808 | v52 (bad map) | black screen, logs stopped |
+| **v58** | CI 39631098808 | **v58 (fixed 8G map, native 1440x3200@3x)** | the stable kernel with the correct map |
+| **v59** | CI 39651202226 (all drivers) | v58 | new kernel + fixed map + autonomy (arm+udp) |
+
+### Autonomy
+`tools/venus-supervisor.sh` boots the image named in `shim/out/CURRENT` (or the newest one) whenever the phone is in fastboot, retries the boot 3x (the ABL wedges after standing in fastboot), and walks DOWN the image list when an image comes back to fastboot (it crashed). The kernel resets the phone into fastboot on a UDP datagram to 192.168.7.2:5141 (patch 0102) and, with `sweetrebootarm=1`, re-arms the "boot into the bootloader" cookie at every boot so the loop can repeat.
+
 ## >>> VENUS: THE PANIC IS DECODED (2026-10-21 21:20) <<<
 
 **STATE: the phone reached the HOME SCREEN (v45/v46, `exec Setup` = 0, 34 touches processed). Then a kernel panic killed it - the photo of the panic screen decoded the cause exactly.**
