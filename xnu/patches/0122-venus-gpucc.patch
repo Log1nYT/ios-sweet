@@ -1,0 +1,798 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ea7cfe1..1a5df90 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,2 +113,3 @@ bsd/dev/sweet_file_patch.c		standard
+ bsd/dev/sweet_reboot.c			standard
++bsd/dev/sweet_gpucc.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+diff --git a/bsd/dev/sweet_gpucc.c b/bsd/dev/sweet_gpucc.c
+new file mode 100644
+index 0000000..1db66fb
+--- /dev/null
++++ b/bsd/dev/sweet_gpucc.c
+@@ -0,0 +1,549 @@
++/*
++ * SWEET GPUCC - read only view of the GPU clock controller of the venus GPU
++ * (Xiaomi Mi 11, SM8350, Adreno 660).
++ *
++ * WHAT THIS IS: the piece the other GPU agents need but do not have.  The
++ * GPU clock controller (GPU_CC) owns the clocks of the GPU and the two
++ * power domains (CX = control, GX = graphics) the GPU runs in.  This file
++ * maps that block read only and answers three questions:
++ *
++ *   1. which clock branches of the GPU_CC are enabled right now,
++ *   2. what the GMU root clock is set to (the GMU is the microcontroller
++ *      that owns the GPU *core* clock on this generation - see below),
++ *   3. whether the CX and the GX power domain are powered.
++ *
++ * WHAT THIS IS NOT: a driver.  It enables no clock, raises no power
++ * domain, programs no command stream, talks to no userland and publishes
++ * no IOKit service.
++ *
++ * THE CORE FREQUENCY IS NOT HERE.  On Adreno 6xx the shader clock is owned
++ * by the GMU firmware, not by the host: the frequency is programmed through
++ * the GMU DCVS interface and is only observable through the GMU HFI
++ * mailbox (which needs the GMU firmware running).  The GPU_CC contains no
++ * GPU core clock at all - its clocks are the AHB, the GMU, the hub and the
++ * interconnect clocks.  What *is* readable is the GMU root clock, and
++ * that is what sweet_gpucc_read_clock() returns.  (logs/research/07-gpu-plan.md
++ * section 2.2 and section 6, Stage B.)
++ *
++ * READ ONLY BY DESIGN.  There is not a single store into the GPU_CC
++ * window in this file.  The branch enables (the CBCR registers), the two
++ * RCG2 root clocks, both GDSC control registers and the GX soft reset are
++ * read and never written: a wrong write to the branch control or to the
++ * reset can hang the GPU, the display or the whole SoC.  The only writes
++ * in this file go to the log and to kernel memory.
++ *
++ * Boot args (all optional):
++ *   sweetgpucc=1          enable the probe: map the window and print the
++ *                         dump (default: off, the probe prints nothing)
++ *   sweetgpuccaddr=<hex>  override the GPU_CC base address
++ *                         (default 0x03d90000, the device tree value)
++ *   sweetgpuccsecs=<n>    also print the summary every n seconds
++ *                         (default 0: one shot dump only)
++ *
++ * The API in sweet_gpucc.h works with or without the boot args: it maps
++ * the window on first use and never prints.  sweet_gpu.c (the read only
++ * probe) and sweet_gpu_power.c (the power path) can use it as soon as
++ * they are ready.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_gpucc.h"
++
++/* osfmk/arm/machine_routines.h is not exported to the BSD layer. */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++
++static vm_offset_t gpucc_base;            /* the mapped GPU_CC window */
++static uint32_t gpucc_pa = SWEET_GPUCC_PA;
++static unsigned gpucc_secs;               /* periodic summary, 0 = off */
++static int gpucc_chan;
++
++/*
++ * The clock branches of the GPU_CC.  Names and offsets are the ones the
++ * vendor driver (drivers/clk/qcom/gpucc-lahaina.c of the venus kernel
++ * tree) and upstream Linux (drivers/clk/qcom/gpucc-sm8350.c) use.
++ */
++struct gpucc_branch_def {
++	uint32_t off;
++	const char *name;
++};
++
++static const struct gpucc_branch_def gpucc_branch_defs[] = {
++	{ SWEET_GPUCC_CXO_AON,         "cxo_aon"                },
++	{ SWEET_GPUCC_GX_VSENSE,       "gx_vsense"              },
++	{ SWEET_GPUCC_GX_QDSS_TSCTR,   "gx_qdss_tsctr"          },
++	{ SWEET_GPUCC_GX_GMU,          "gx_gmu"                 },
++	{ SWEET_GPUCC_AHB,             "ahb"                    },
++	{ SWEET_GPUCC_CRC_AHB,         "crc_ahb"                },
++	{ SWEET_GPUCC_CX_QDSS_AT,      "cx_qdss_at"             },
++	{ SWEET_GPUCC_CX_QDSS_TSCTR,   "cx_qdss_tsctr"          },
++	{ SWEET_GPUCC_CX_APB,          "cx_apb"                 },
++	{ SWEET_GPUCC_CX_SNOC_DVM,     "cx_snoc_dvm"            },
++	{ SWEET_GPUCC_SLEEP,           "sleep"                  },
++	{ SWEET_GPUCC_CX_QDSS_TRIG,    "cx_qdss_trig"           },
++	{ SWEET_GPUCC_CX_GMU,          "cx_gmu"                 },
++	{ SWEET_GPUCC_CXO,             "cxo"                    },
++	{ SWEET_GPUCC_CB,              "cb"                     },
++	{ SWEET_GPUCC_HUB_AON,         "hub_aon"                },
++	{ SWEET_GPUCC_HUB_CX_INT,      "hub_cx_int"             },
++	{ SWEET_GPUCC_FREQ_MEASURE,    "freq_measure"           },
++	{ SWEET_GPUCC_HLOS1_VOTE_SMMU, "hlos1_vote_gpu_smmu"    },
++	{ SWEET_GPUCC_MND1X_0_GFX3D,   "mnd1x_0_gfx3d"          },
++	{ SWEET_GPUCC_MND1X_1_GFX3D,   "mnd1x_1_gfx3d"          },
++};
++
++#define GPUCC_NBRANCHES \
++	((uint32_t)(sizeof(gpucc_branch_defs) / sizeof(gpucc_branch_defs[0])))
++
++/*
++ * The nominal frequency of the sources the GMU root clock can be fed
++ * from.  Source: the parent map and the frequency table of
++ * gpu_cc_gmu_clk_src in drivers/clk/qcom/gpucc-lahaina.c of the venus
++ * kernel tree:
++ *
++ *   F(19200000, P_BI_TCXO, 1, 0, 0);
++ *   F(200000000, P_GPLL0_OUT_MAIN_DIV, 1.5, 0, 0);
++ *   F(500000000, P_GPU_CC_PLL1_OUT_MAIN, 1, 0, 0);
++ *
++ * A source with a nominal frequency of 0 is one whose real frequency
++ * cannot be derived from the GPU_CC alone (the alpha PLLs of the GPU_CC
++ * and the GPLL0 of the global GCC are configured elsewhere).
++ */
++struct gpucc_parent_def {
++	uint32_t sel;
++	uint32_t khz;
++	const char *name;
++};
++
++static const struct gpucc_parent_def gmu_parents[] = {
++	{ SWEET_GPUCC_SRC_BI_TCXO,       19200u,   "bi_tcxo"            },
++	{ SWEET_GPUCC_SRC_GPU_CC_PLL0,   0u,      "gpu_cc_pll0"        },
++	{ SWEET_GPUCC_SRC_GPU_CC_PLL1,   500000u, "gpu_cc_pll1"        },
++	{ SWEET_GPUCC_SRC_GCC_GPLL0,     0u,      "gcc_gpll0"          },
++	{ SWEET_GPUCC_SRC_GCC_GPLL0_DIV, 200000u, "gcc_gpll0_div"      },
++	{ SWEET_GPUCC_SRC_PLL_TEST_SE,   0u,      "core_bi_pll_test_se"},
++};
++
++#define GPUCC_NPARENTS \
++	((uint32_t)(sizeof(gmu_parents) / sizeof(gmu_parents[0])))
++
++/*
++ * One 32 bit read of a device register, ordered after the previous
++ * access.  Read only: no store ever reaches this address space.
++ */
++static uint32_t
++gpucc_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(gpucc_base + off);
++
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++/*
++ * Map the GPU_CC window.  Called by the init and by every API entry
++ * point, so that the API works even when the boot arg was not given.
++ */
++static bool
++gpucc_map(void)
++{
++	if (gpucc_base != 0) {
++		return true;
++	}
++	gpucc_base = ml_io_map(gpucc_pa, SWEET_GPUCC_SIZE);
++	if (gpucc_base == 0) {
++		printf("SWEET GPUCC: mapping 0x%08x failed\n", gpucc_pa);
++		return false;
++	}
++	return true;
++}
++
++/* "0x3d90000", "3d90000" and "0X3D90000" are all accepted. */
++static bool
++gpucc_parse_hex(const char *s, uint32_t *out)
++{
++	uint32_t v = 0;
++	unsigned digits = 0;
++
++	if (s == NULL) {
++		return false;
++	}
++	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
++		s += 2;
++	}
++	for (; *s != '\0'; ++s) {
++		uint32_t d;
++
++		if (*s >= '0' && *s <= '9') {
++			d = (uint32_t)(*s - '0');
++		} else if (*s >= 'a' && *s <= 'f') {
++			d = (uint32_t)(*s - 'a') + 10u;
++		} else if (*s >= 'A' && *s <= 'F') {
++			d = (uint32_t)(*s - 'A') + 10u;
++		} else {
++			return false;
++		}
++		if (++digits > 8) {
++			return false;
++		}
++		v = (v << 4) | d;
++	}
++	if (digits == 0) {
++		return false;
++	}
++	*out = v;
++	return true;
++}
++
++/* The nominal frequency of a GMU root clock source, 0 if unknown. */
++static uint32_t
++gpucc_parent_khz(uint32_t sel, const char **name)
++{
++	uint32_t i;
++
++	for (i = 0; i < GPUCC_NPARENTS; ++i) {
++		if (gmu_parents[i].sel == sel) {
++			if (name != NULL) {
++				*name = gmu_parents[i].name;
++			}
++			return gmu_parents[i].khz;
++		}
++	}
++	if (name != NULL) {
++		*name = "unknown";
++	}
++	return 0;
++}
++
++/* Fill in the state of the GMU root clock. */
++static bool
++gpucc_gmu(sweet_gpucc_gmu_t *info)
++{
++	uint32_t cmd, cfg, src, div;
++	const char *name = NULL;
++	uint32_t parent;
++
++	if (info == NULL || !gpucc_map()) {
++		return false;
++	}
++	cmd = gpucc_rd(SWEET_GPUCC_GMU_RCG2);
++	cfg = gpucc_rd(SWEET_GPUCC_GMU_RCG2 + SWEET_GPUCC_RCG2_CFG);
++	src = (cfg >> SWEET_GPUCC_RCG_SRC_SHIFT) & SWEET_GPUCC_RCG_SRC_MASK;
++	div = (cfg & SWEET_GPUCC_RCG_DIV_MASK) + 1u;
++	parent = gpucc_parent_khz(src, &name);
++
++	info->src = src;
++	info->div = div;
++	info->parent_khz = parent;
++	info->root_on = ((cmd & SWEET_GPUCC_RCG_ROOT_OFF) == 0);
++	info->hw_ctrl = ((cfg & SWEET_GPUCC_RCG_HW_CTRL) != 0);
++	info->khz = (parent != 0) ? (parent / div) : 0;
++	return true;
++}
++
++/* Fill in the state of the two power domains. */
++static bool
++gpucc_gdsc(sweet_gpucc_gdsc_t *st)
++{
++	if (st == NULL || !gpucc_map()) {
++		return false;
++	}
++	st->cx_gdscr = gpucc_rd(SWEET_GPUCC_CX_GDSC);
++	st->cx_status = gpucc_rd(SWEET_GPUCC_CX_GDSC + SWEET_GPUCC_GDSC_STATUS);
++	st->cx_hw_ctrl = gpucc_rd(SWEET_GPUCC_CX_HW_CTRL);
++	st->gx_gdscr = gpucc_rd(SWEET_GPUCC_GX_GDSC);
++	st->gx_status = gpucc_rd(SWEET_GPUCC_GX_GDSC + SWEET_GPUCC_GDSC_STATUS);
++	st->gx_domain = gpucc_rd(SWEET_GPUCC_GX_DOMAIN);
++	st->gx_clamp_io = gpucc_rd(SWEET_GPUCC_GX_CLAMP_IO);
++	st->gx_sw_reset = gpucc_rd(SWEET_GPUCC_GX_SW_RESET);
++	/*
++	 * The CX domain has a hardware controller: its state is the power
++	 * request bit of the hw control register.  The GX domain has none:
++	 * it is polled, so its state is the power up complete bit of
++	 * GDSCR + 4.
++	 */
++	st->cx_on = ((st->cx_hw_ctrl & SWEET_GPUCC_GDSCR_PWR_ON) != 0) ||
++	    ((st->cx_status & SWEET_GPUCC_GDSC_PWR_UP) != 0);
++	st->gx_on = ((st->gx_status & SWEET_GPUCC_GDSC_PWR_UP) != 0);
++	return true;
++}
++
++/* Read the branch clocks into the caller's array, return how many. */
++uint32_t
++sweet_gpucc_branches(sweet_gpucc_branch_t *out, uint32_t max)
++{
++	uint32_t i, n = 0;
++
++	if (out == NULL || !gpucc_map()) {
++		return 0;
++	}
++	for (i = 0; i < GPUCC_NBRANCHES && n < max; ++i) {
++		uint32_t v = gpucc_rd(gpucc_branch_defs[i].off);
++
++		out[n].name = gpucc_branch_defs[i].name;
++		out[n].off = gpucc_branch_defs[i].off;
++		out[n].value = v;
++		out[n].enabled = ((v & SWEET_GPUCC_CBCR_CLK_ENABLE) != 0);
++		out[n].halted = ((v & SWEET_GPUCC_CBCR_CLK_OFF) != 0);
++		++n;
++	}
++	return n;
++}
++
++/*
++ * The one shot dump.  Every value that is read is printed, so that the
++ * log is the register map of the GPU_CC at that moment.
++ */
++static void
++gpucc_dump(void)
++{
++	sweet_gpucc_branch_t branches[GPUCC_NBRANCHES];
++	sweet_gpucc_gmu_t gmu;
++	sweet_gpucc_gdsc_t gdsc;
++	uint32_t n, i, on = 0;
++
++	printf("SWEET GPUCC: map base=0x%08x size=0x%x (read only, no writes)\n",
++	    gpucc_pa, SWEET_GPUCC_SIZE);
++
++	/*
++	 * The identity of the block.  Offset 0x0 is not used by the vendor
++	 * driver (the first defined register of the alpha PLL 0 is at 0x04),
++	 * so it is reported verbatim; the alpha PLL status and opmode
++	 * registers say whether the two PLLs of the GPU_CC are calibrated
++	 * and running (opmode bit 11 = power on self calibration done).
++	 */
++	printf("SWEET GPUCC: id cc_id=0x%08x pll0_status=0x%08x pll0_opmode=0x%08x "
++	    "pll0_alpha=0x%08x\n",
++	    gpucc_rd(0x0000),
++	    gpucc_rd(SWEET_GPUCC_PLL0_STATUS),
++	    gpucc_rd(SWEET_GPUCC_PLL0_OPMODE),
++	    gpucc_rd(SWEET_GPUCC_PLL0_ALPHA));
++	printf("SWEET GPUCC: id pll1_status=0x%08x pll1_opmode=0x%08x "
++	    "pll1_alpha=0x%08x\n",
++	    gpucc_rd(SWEET_GPUCC_PLL1_STATUS),
++	    gpucc_rd(SWEET_GPUCC_PLL1_OPMODE),
++	    gpucc_rd(SWEET_GPUCC_PLL1_ALPHA));
++
++	/* The branch clocks: the CBCR of every branch of the GPU_CC. */
++	n = sweet_gpucc_branches(branches, GPUCC_NBRANCHES);
++	for (i = 0; i < n; ++i) {
++		if (branches[i].enabled) {
++			++on;
++		}
++		printf("SWEET GPUCC: branch %-20s off=0x%04x val=0x%08x en=%u off31=%u\n",
++		    branches[i].name, branches[i].off, branches[i].value,
++		    branches[i].enabled ? 1u : 0u, branches[i].halted ? 1u : 0u);
++	}
++	printf("SWEET GPUCC: branches %u of %u enabled\n", on, n);
++
++	/* The two root clocks and the two plain dividers. */
++	printf("SWEET GPUCC: gmu rcg2 cmd=0x%08x cfg=0x%08x m=0x%08x n=0x%08x "
++	    "d=0x%08x\n",
++	    gpucc_rd(SWEET_GPUCC_GMU_RCG2),
++	    gpucc_rd(SWEET_GPUCC_GMU_RCG2 + SWEET_GPUCC_RCG2_CFG),
++	    gpucc_rd(SWEET_GPUCC_GMU_RCG2 + SWEET_GPUCC_RCG2_M),
++	    gpucc_rd(SWEET_GPUCC_GMU_RCG2 + SWEET_GPUCC_RCG2_N),
++	    gpucc_rd(SWEET_GPUCC_GMU_RCG2 + SWEET_GPUCC_RCG2_D));
++	printf("SWEET GPUCC: hub rcg2 cmd=0x%08x cfg=0x%08x m=0x%08x n=0x%08x "
++	    "d=0x%08x\n",
++	    gpucc_rd(SWEET_GPUCC_HUB_RCG2),
++	    gpucc_rd(SWEET_GPUCC_HUB_RCG2 + SWEET_GPUCC_RCG2_CFG),
++	    gpucc_rd(SWEET_GPUCC_HUB_RCG2 + SWEET_GPUCC_RCG2_M),
++	    gpucc_rd(SWEET_GPUCC_HUB_RCG2 + SWEET_GPUCC_RCG2_N),
++	    gpucc_rd(SWEET_GPUCC_HUB_RCG2 + SWEET_GPUCC_RCG2_D));
++	printf("SWEET GPUCC: div hub_ahb=0x%08x hub_cx_int=0x%08x\n",
++	    gpucc_rd(SWEET_GPUCC_HUB_AHB_DIV),
++	    gpucc_rd(SWEET_GPUCC_HUB_CX_INT_DIV));
++
++	/* The GMU root clock: the only frequency this block can tell us. */
++	if (gpucc_gmu(&gmu)) {
++		const char *name = NULL;
++
++		(void)gpucc_parent_khz(gmu.src, &name);
++		printf("SWEET GPUCC: gmu src=%u (%s) div=%u parent=%u kHz "
++		    "hw_ctrl=%u root_on=%u -> %u kHz\n",
++		    gmu.src, name, gmu.div, gmu.parent_khz,
++		    gmu.hw_ctrl ? 1u : 0u, gmu.root_on ? 1u : 0u, gmu.khz);
++	}
++
++	/* The two power domains. */
++	if (gpucc_gdsc(&gdsc)) {
++		printf("SWEET GPUCC: gdsc cx gdscr=0x%08x status=0x%08x "
++		    "hw_ctrl=0x%08x on=%u\n",
++		    gdsc.cx_gdscr, gdsc.cx_status, gdsc.cx_hw_ctrl,
++		    gdsc.cx_on ? 1u : 0u);
++		printf("SWEET GPUCC: gdsc gx gdscr=0x%08x status=0x%08x "
++		    "domain=0x%08x clamp_io=0x%08x sw_reset=0x%08x on=%u\n",
++		    gdsc.gx_gdscr, gdsc.gx_status, gdsc.gx_domain,
++		    gdsc.gx_clamp_io, gdsc.gx_sw_reset,
++		    gdsc.gx_on ? 1u : 0u);
++	}
++	printf("SWEET GPUCC: note the GPU core clock is owned by the GMU "
++	    "(DCVS), it is not readable here\n");
++}
++
++/* The compact summary line, refreshed from the hardware every time. */
++static void
++gpucc_summary(void)
++{
++	sweet_gpucc_gmu_t gmu;
++	sweet_gpucc_gdsc_t gdsc;
++	sweet_gpucc_branch_t branches[GPUCC_NBRANCHES];
++	uint32_t n, i, on = 0;
++
++	n = sweet_gpucc_branches(branches, GPUCC_NBRANCHES);
++	for (i = 0; i < n; ++i) {
++		if (branches[i].enabled) {
++			++on;
++		}
++	}
++	(void)gpucc_gmu(&gmu);
++	(void)gpucc_gdsc(&gdsc);
++	printf("SWEET GPUCC: cx=%u gx=%u gmu=%u kHz (src %u div %u) "
++	    "branches=%u/%u gpu_on=%u\n",
++	    gdsc.cx_on ? 1u : 0u, gdsc.gx_on ? 1u : 0u, gmu.khz, gmu.src,
++	    gmu.div, on, n, sweet_gpucc_is_on() ? 1u : 0u);
++}
++
++/*
++ * The periodic line.  It only sleeps and reads; it never spins and it
++ * never waits for an interrupt.
++ */
++static void gpucc_thread(__unused void *arg,
++    __unused wait_result_t wr) __attribute__((noreturn));
++
++static void
++gpucc_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		(void)tsleep(&gpucc_chan, PZERO, "sweetgpucc",
++		    hz * (int)gpucc_secs);
++		gpucc_summary();
++	}
++}
++
++int
++sweet_gpucc_init(void)
++{
++	uint32_t enabled = 0;
++	uint32_t secs = 0;
++	char addr[32];
++	thread_t thread;
++
++	/*
++	 * Default off: the probe must never run unless it is asked for.
++	 * The API functions below still work (they map the window on first
++	 * use), they just do not print anything.
++	 */
++	if (!PE_parse_boot_argn("sweetgpucc", &enabled, sizeof(enabled)) ||
++	    enabled == 0) {
++		return 0;
++	}
++	if (PE_parse_boot_argn("sweetgpuccaddr", addr, sizeof(addr))) {
++		uint32_t pa;
++
++		if (gpucc_parse_hex(addr, &pa) && pa != 0) {
++			gpucc_pa = pa;
++		} else {
++			printf("SWEET GPUCC: bad sweetgpuccaddr=\"%s\", "
++			    "keeping 0x%08x\n", addr, gpucc_pa);
++		}
++	}
++	if (PE_parse_boot_argn("sweetgpuccsecs", &secs, sizeof(secs))) {
++		gpucc_secs = secs;
++	}
++	if (!gpucc_map()) {
++		return -1;
++	}
++	printf("SWEET GPUCC: probe start base=0x%08x (read only: no clock is "
++	    "gated, no domain is raised)\n", gpucc_pa);
++	gpucc_dump();
++	gpucc_summary();
++	if (gpucc_secs != 0) {
++		if (kernel_thread_start(gpucc_thread, NULL, &thread) ==
++		    KERN_SUCCESS) {
++			thread_deallocate(thread);
++			printf("SWEET GPUCC: summary every %u s\n", gpucc_secs);
++		}
++	}
++	return 0;
++}
++
++/* --- the read only API ---------------------------------------------- */
++
++bool
++sweet_gpucc_mapped(void)
++{
++	return gpucc_base != 0;
++}
++
++/*
++ * The frequency of the GMU root clock in kHz.  This is the clock the GMU
++ * firmware runs at, NOT the GPU core clock: on Adreno 6xx the core clock
++ * is owned by the GMU (DCVS) and is not readable from any register.
++ * Returns false when the root clock is switched off or when its source
++ * has no frequency that can be derived from the GPU_CC alone.
++ */
++bool
++sweet_gpucc_read_clock(uint32_t *khz)
++{
++	sweet_gpucc_gmu_t gmu;
++
++	if (!gpucc_gmu(&gmu)) {
++		if (khz != NULL) {
++			*khz = 0;
++		}
++		return false;
++	}
++	if (!gmu.root_on || gmu.parent_khz == 0) {
++		if (khz != NULL) {
++			*khz = 0;
++		}
++		return false;
++	}
++	if (khz != NULL) {
++		*khz = gmu.khz;
++	}
++	return true;
++}
++
++/*
++ * Is the GPU powered?  The CX domain carries the control logic of the
++ * GPU (the GMU lives there), the GX domain the graphics core.  The GPU
++ * counts as on when the CX domain is powered.
++ */
++bool
++sweet_gpucc_is_on(void)
++{
++	sweet_gpucc_gdsc_t gdsc;
++
++	if (!gpucc_gdsc(&gdsc)) {
++		return false;
++	}
++	return gdsc.cx_on;
++}
++
++/* The raw state of the two power domains. */
++bool
++sweet_gpucc_gdsc_state(sweet_gpucc_gdsc_t *st)
++{
++	return gpucc_gdsc(st);
++}
++
++/* The raw state of the GMU root clock. */
++bool
++sweet_gpucc_gmu_info(sweet_gpucc_gmu_t *info)
++{
++	return gpucc_gmu(info);
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_gpucc.h b/bsd/dev/sweet_gpucc.h
+new file mode 100644
+index 0000000..9069d26
+--- /dev/null
++++ b/bsd/dev/sweet_gpucc.h
+@@ -0,0 +1,217 @@
++/*
++ * SWEET GPUCC: addresses, register offsets and bit layouts of the GPU clock
++ * controller (GPU_CC) of the venus GPU (Xiaomi Mi 11, SM8350, Adreno 660).
++ *
++ * Every constant below carries the source it was taken from; the full
++ * evidence list (device tree, vendor kernel, upstream Linux) is in
++ * logs/research/impl/20-gpucc.md.
++ *
++ * READ ONLY: nothing in this header describes a write path.  The branch
++ * enables (CBCR), the two RCG2 root clocks, both GDSC control registers
++ * and the GX soft reset must never be written from this kernel: a wrong
++ * write to the branch control or to the reset can hang the GPU, the
++ * display or the whole SoC.
++ */
++#ifndef SWEET_GPUCC_H
++#define SWEET_GPUCC_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/*
++ * GPU clock controller window.  Source: the live device tree of this phone
++ * (dtc -I dtb -O dts of venus.dtb), node /soc/qcom,gpucc@3d90000:
++ *
++ *   clock_gpucc: qcom,gpucc@3d90000 {
++ *           compatible = "qcom,lahaina-gpucc", "syscon";
++ *           reg = <0x3d90000 0x9000>;         <- 36 KiB of GPU_CC registers
++ *           reg-names = "cc_base";
++ *           vdd_mx-supply = <0x19>;  vdd_cx-supply = <0x1f>;
++ *           #clock-cells = <0x01>;  #reset-cells = <0x01>;
++ *           phandle = <0x32>;
++ *   };
++ *
++ * The same node is the clock provider of the four GPU clocks the GPU node
++ * asks for (gpu_cc_ahb, gpu_cc_cx_gmu, gpu_cc_hub_aon, gpu_cc_hub_cx_int)
++ * and of the HLOS vote bit gpu_cc_hlos1_vote_gpu_smmu.
++ */
++#define SWEET_GPUCC_PA                 0x03d90000u
++#define SWEET_GPUCC_SIZE               0x00009000u
++
++/*
++ * Register offsets inside the GPU_CC window (byte offsets).
++ *
++ * Source: drivers/clk/qcom/gpucc-lahaina.c of the venus kernel tree
++ * (MiCode/Xiaomi_Kernel_OpenSource, branch venus-r-oss) and, with the
++ * same numbers, drivers/clk/qcom/gpucc-sm8350.c of upstream Linux.  Both
++ * describe the SM8350 "lahaina" GPU_CC.
++ */
++
++/* --- the two alpha PLLs of the GPU_CC (lucid 5LPE) --- */
++#define SWEET_GPUCC_PLL0              0x0000u   /* alpha PLL 0 base          */
++#define SWEET_GPUCC_PLL1              0x0100u   /* alpha PLL 1 base          */
++#define SWEET_GPUCC_PLL0_STATUS       0x0030u   /* PLL0 + 0x30 (STATUS)      */
++#define SWEET_GPUCC_PLL1_STATUS       0x0130u   /* PLL1 + 0x30 (STATUS)      */
++#define SWEET_GPUCC_PLL0_OPMODE       0x0038u   /* PLL0 + 0x38 (OPMODE)      */
++#define SWEET_GPUCC_PLL1_OPMODE       0x0138u   /* PLL1 + 0x38 (OPMODE)      */
++#define SWEET_GPUCC_PLL0_ALPHA        0x0040u   /* PLL0 + 0x40 (ALPHA_VAL)   */
++#define SWEET_GPUCC_PLL1_ALPHA        0x0140u   /* PLL1 + 0x40 (ALPHA_VAL)   */
++
++/* --- the branch clocks (CBCR: bit 0 = clock enable, bit 31 = clock off) --- */
++#define SWEET_GPUCC_CXO_AON           0x1004u   /* gpu_cc_cxo_aon_clk        */
++#define SWEET_GPUCC_GX_VSENSE         0x1058u   /* gpu_cc_gx_vsense_clk      */
++#define SWEET_GPUCC_GX_QDSS_TSCTR     0x105cu   /* gpu_cc_gx_qdss_tsctr_clk  */
++#define SWEET_GPUCC_GX_GMU            0x1064u   /* gpu_cc_gx_gmu_clk         */
++#define SWEET_GPUCC_AHB               0x1078u   /* gpu_cc_ahb_clk            */
++#define SWEET_GPUCC_CRC_AHB           0x107cu   /* gpu_cc_crc_ahb_clk        */
++#define SWEET_GPUCC_CX_QDSS_AT        0x1080u   /* gpu_cc_cx_qdss_at_clk     */
++#define SWEET_GPUCC_CX_QDSS_TSCTR     0x1084u   /* gpu_cc_cx_qdss_tsctr_clk  */
++#define SWEET_GPUCC_CX_APB            0x1088u   /* gpu_cc_cx_apb_clk         */
++#define SWEET_GPUCC_CX_SNOC_DVM       0x108cu   /* gpu_cc_cx_snoc_dvm_clk    */
++#define SWEET_GPUCC_SLEEP             0x1090u   /* gpu_cc_sleep_clk          */
++#define SWEET_GPUCC_CX_QDSS_TRIG      0x1094u   /* gpu_cc_cx_qdss_trig_clk   */
++#define SWEET_GPUCC_CX_GMU            0x1098u   /* gpu_cc_cx_gmu_clk         */
++#define SWEET_GPUCC_CXO               0x109cu   /* gpu_cc_cxo_clk            */
++#define SWEET_GPUCC_CB                0x1170u   /* gpu_cc_cb_clk             */
++#define SWEET_GPUCC_HUB_AON           0x1178u   /* gpu_cc_hub_aon_clk        */
++#define SWEET_GPUCC_HUB_CX_INT        0x1204u   /* gpu_cc_hub_cx_int_clk     */
++#define SWEET_GPUCC_FREQ_MEASURE      0x120cu   /* gpu_cc_freq_measure_clk   */
++#define SWEET_GPUCC_HLOS1_VOTE_SMMU   0x5000u   /* gpu_cc_hlos1_vote_gpu_smmu_clk */
++#define SWEET_GPUCC_MND1X_0_GFX3D     0x802cu   /* gpu_cc_mnd1x_0_gfx3d_clk  */
++#define SWEET_GPUCC_MND1X_1_GFX3D     0x8030u   /* gpu_cc_mnd1x_1_gfx3d_clk  */
++
++/* --- the two root clocks (RCG2: cmd, cfg, m, n, d) --- */
++#define SWEET_GPUCC_GMU_RCG2          0x1120u   /* gpu_cc_gmu_clk_src        */
++#define SWEET_GPUCC_HUB_RCG2          0x117cu   /* gpu_cc_hub_clk_src        */
++#define SWEET_GPUCC_RCG2_CFG          0x0004u   /* cfg  = cmd + 4            */
++#define SWEET_GPUCC_RCG2_M            0x0008u   /* m    = cmd + 8            */
++#define SWEET_GPUCC_RCG2_N            0x000cu   /* n    = cmd + 12           */
++#define SWEET_GPUCC_RCG2_D            0x0010u   /* d    = cmd + 16           */
++
++/* --- the two plain dividers of the hub clock --- */
++#define SWEET_GPUCC_HUB_CX_INT_DIV    0x11bcu   /* 4 bit divider (hub cx int) */
++#define SWEET_GPUCC_HUB_AHB_DIV       0x11c0u   /* 4 bit divider (hub ahb)    */
++
++/* --- the power domains and the reset (all inside the 36 KiB window) --- */
++#define SWEET_GPUCC_GX_GDSC           0x100cu   /* 0x03d9100c GX GDSCR       */
++#define SWEET_GPUCC_CX_GDSC           0x106cu   /* 0x03d9106c CX GDSCR       */
++#define SWEET_GPUCC_GX_SW_RESET       0x1008u   /* 0x03d91008 GX soft reset  */
++#define SWEET_GPUCC_CX_HW_CTRL        0x1540u   /* 0x03d91540 CX hw control  */
++#define SWEET_GPUCC_GX_DOMAIN         0x158cu   /* 0x03d9158c GX domain ctl  */
++#define SWEET_GPUCC_GX_CLAMP_IO       0x1508u   /* GX clamp io control       */
++
++/* The status register of a GDSC is GDSCR + 4. */
++#define SWEET_GPUCC_GDSC_STATUS       0x0004u
++
++/*
++ * Branch (CBCR) bits.  Source: drivers/clk/qcom/clk-branch.h of the venus
++ * kernel tree and of upstream Linux: the branch enable is bit 0, and the
++ * "clock off" state is bit 31 of the same register.
++ */
++#define SWEET_GPUCC_CBCR_CLK_ENABLE   0x00000001u
++#define SWEET_GPUCC_CBCR_CLK_OFF      0x80000000u
++
++/*
++ * RCG2 bits.  Source: drivers/clk/qcom/clk-rcg2.c of the venus kernel tree
++ * and of upstream Linux:
++ *   cmd bit  1     = root enable
++ *   cmd bit 31     = root off (the root clock is switched off)
++ *   cfg bits 4..0  = source divider minus one (hid_width = 5 here)
++ *   cfg bits 10..8 = source select (which clock the branch runs from)
++ *   cfg bit 20     = hardware clock control (the GMU drives this clock)
++ */
++#define SWEET_GPUCC_RCG_ROOT_ENABLE   0x00000002u
++#define SWEET_GPUCC_RCG_ROOT_OFF      0x80000000u
++#define SWEET_GPUCC_RCG_DIV_MASK      0x0000001fu
++#define SWEET_GPUCC_RCG_SRC_SHIFT     8u
++#define SWEET_GPUCC_RCG_SRC_MASK      0x00000007u
++#define SWEET_GPUCC_RCG_HW_CTRL       0x00100000u
++
++/*
++ * The source select of the GMU root clock.  Source: the parent map of
++ * gpu_cc_gmu_clk_src in drivers/clk/qcom/gpucc-lahaina.c of the venus
++ * kernel tree.
++ */
++#define SWEET_GPUCC_SRC_BI_TCXO       0u        /* 19.2 MHz                 */
++#define SWEET_GPUCC_SRC_GPU_CC_PLL0   1u        /* alpha PLL 0 of the GPU_CC */
++#define SWEET_GPUCC_SRC_GPU_CC_PLL1   3u        /* alpha PLL 1 of the GPU_CC */
++#define SWEET_GPUCC_SRC_GCC_GPLL0     5u        /* global GCC GPLL0 main    */
++#define SWEET_GPUCC_SRC_GCC_GPLL0_DIV 6u        /* global GCC GPLL0 div     */
++#define SWEET_GPUCC_SRC_PLL_TEST_SE   7u        /* core_bi_pll_test_se      */
++
++/*
++ * GDSC bits.  Source: drivers/clk/qcom/gdsc.c of the venus kernel tree and
++ * of upstream Linux:
++ *   GDSCR bit 31        = power request (PWR_ON)
++ *   GDSCR bit  1        = hardware control
++ *   GDSCR bit  0        = software collapse
++ *   GDSCR + 4 bit 16    = power up complete
++ *   GDSCR + 4 bit 15    = power down complete
++ */
++#define SWEET_GPUCC_GDSCR_PWR_ON      0x80000000u
++#define SWEET_GPUCC_GDSCR_HW_CTRL     0x00000002u
++#define SWEET_GPUCC_GDSCR_SW_COLLAPSE 0x00000001u
++#define SWEET_GPUCC_GDSC_PWR_UP       0x00010000u
++#define SWEET_GPUCC_GDSC_PWR_DOWN     0x00008000u
++
++/*
++ * The state of the two power domains, read out of the GPU_CC.
++ * cx_on / gx_on are the "the domain is really powered" verdicts:
++ *   CX: the hardware controller bit of the CX hw control register
++ *       (gds_hw_ctrl = 0x1540) or the power-up-complete bit of GDSCR + 4;
++ *   GX: the power-up-complete bit of GDSCR + 4 (the GX domain is polled,
++ *       it has no hardware control register).
++ */
++typedef struct {
++	uint32_t cx_gdscr;       /* GDSCR of the CX domain  (0x106c)          */
++	uint32_t cx_status;      /* GDSCR + 4 of the CX domain                 */
++	uint32_t cx_hw_ctrl;     /* CX hardware control      (0x1540)          */
++	uint32_t gx_gdscr;       /* GDSCR of the GX domain  (0x100c)          */
++	uint32_t gx_status;      /* GDSCR + 4 of the GX domain                 */
++	uint32_t gx_domain;      /* GX domain register      (0x158c)          */
++	uint32_t gx_clamp_io;    /* GX clamp io control     (0x1508)          */
++	uint32_t gx_sw_reset;    /* GX soft reset           (0x1008)          */
++	bool cx_on;              /* the CX (control) domain is powered        */
++	bool gx_on;              /* the GX (graphics) domain is powered        */
++} sweet_gpucc_gdsc_t;
++
++/*
++ * One clock branch of the GPU_CC.
++ */
++typedef struct {
++	const char *name;        /* the name the vendor driver uses            */
++	uint32_t off;            /* offset of the CBCR in the GPU_CC window    */
++	uint32_t value;          /* the raw register                           */
++	bool enabled;            /* bit 0 set: the branch is clocked           */
++	bool halted;             /* bit 31 set: the branch is switched off     */
++} sweet_gpucc_branch_t;
++
++/*
++ * The state of the GMU root clock (the clock the GMU firmware runs at).
++ * The GMU is the microcontroller that owns the GPU *core* clock on this
++ * generation: the core frequency is programmed through the GMU DCVS
++ * interface and is not readable from any register of the GPU_CC.
++ */
++typedef struct {
++	uint32_t src;            /* CFG source select                          */
++	uint32_t div;            /* CFG divider (the register holds div - 1)   */
++	uint32_t parent_khz;     /* nominal frequency of the selected source  */
++	uint32_t khz;            /* the resulting clock of the GMU root        */
++	bool root_on;            /* the root clock is not switched off         */
++	bool hw_ctrl;            /* CFG bit 20: the GMU drives this clock      */
++} sweet_gpucc_gmu_t;
++
++/*
++ * The API.  All of it is read only and safe to call from any context.
++ * The functions map the GPU_CC window on first use (and never print), so
++ * they work whether or not the boot arg sweetgpucc=1 was given.
++ */
++extern int sweet_gpucc_init(void);
++extern bool sweet_gpucc_mapped(void);
++extern bool sweet_gpucc_read_clock(uint32_t *khz);
++extern bool sweet_gpucc_is_on(void);
++extern bool sweet_gpucc_gdsc_state(sweet_gpucc_gdsc_t *st);
++extern bool sweet_gpucc_gmu_info(sweet_gpucc_gmu_t *info);
++extern uint32_t sweet_gpucc_branches(sweet_gpucc_branch_t *out, uint32_t max);
++
++#endif /* SWEET_GPUCC_H */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 932a24c..be4b60c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,2 +53,3 @@ static void sweet_log_echo(void);
+ extern void sweet_sample_start(void);
++extern void sweet_gpucc_init(void);
+ extern void sweet_keys_init(void);
+@@ -661,2 +662,3 @@ sweet_ufs_init(void)
+ 	sweet_log_echo();
++	sweet_gpucc_init();
+ 	sweet_log_start();
