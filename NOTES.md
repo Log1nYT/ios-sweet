@@ -1,3 +1,10 @@
+## >>> VENUS: v62 PANIC DECODED = MY BUG IN THE GPU PROBE; v63 READY (2026-10-22 23:00) <<<
+
+- v62 (new all-driver kernel + fixed 8G map + sweetgpu=1) BOOTED fine to userland (2000 FB swaps, xpcproxy, bluetoothd, fairplayd) and then panicked: `Unaligned kernel data abort`, ESR 0x96000021 (DFSC 0x21 = alignment fault), in the middle of the line `SWEET GPU: id bytes[0..7]=00`. Cause: `sweet_gpu.c` read the id bytes with `gpu_rd(base, i)` for i=0..7 = unaligned 32-bit loads from Device memory. Fixed (aligned dword + shift) in sweet_gpu.c and the embedded copy in 0112; commit 8df7b9d.
+- Useful measurements from the v62 photo (observations): `ahb_clk=0x0`, `gmu_clk=0x00006221`, `gx_gdsc=0x00222001`, `cx_gdsc=0x00222001` (SW_COLLAPSE set, PWR_ON clear = both domains off), `ahb[0..15]` all `0x00000000` with NO external abort. All-zero AHB window = GPU unpowered (report 26b step 0), not a wrong address model.
+- The new kernel therefore does NOT have the 32 MiB kmem panic any more (DRAM map fix works); v59/v60 panics are a separate, still unexplained matter.
+- CI run 39665100074 -> `xnu/out-venus-v63kernel`; image `shim/out/shim-boot-venus-v63.img` (SHA 4a696c18...) = + `sweetpaniclast=1`. Script `logs/build-v63.sh`. Not booted yet.
+
 ## >>> VENUS: v62 = GPU READ-ONLY PROBE IMAGE (2026-10-21 22:45) <<<
 
 - Patch 0114 did not apply (its files.arm64 hunk was anchored on the dropped SweetCamera.cpp line); rebased, `check-patch-order.py` now 114/115 (only 0012, as always). CI run 39663397711 -> `xnu/out-venus-v62kernel` (SHA 092646ac...).
