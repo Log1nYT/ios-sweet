@@ -10,7 +10,7 @@
  bsd/dev/sweet_usb.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_reboot.c
-@@ -0,0 +1,607 @@
+@@ -0,0 +1,660 @@
 +/*
 + * sweet: the phone reboots itself into the Qualcomm fastboot.
 + *
@@ -79,6 +79,7 @@
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +
 +void sweet_reboot_init(void);
++void sweet_reboot_arm(void);
 +void sweet_reboot_panic(void);
 +void sweet_reboot_panic_log(const char *fmt, va_list *args);
 +void sweet_reboot_request(void);
@@ -267,6 +268,16 @@
 +	return false;
 +}
 +
++static void sr_spmi_init(void);
++
++/* True when the SPMI windows are mapped and the SDAM APID was found. */
++static bool
++sr_spmi_init_ready(void)
++{
++	sr_spmi_init();
++	return sr_spmi_ready && (sr_apid != SR_NO_APID);
++}
++
 +static void
 +sr_spmi_init(void)
 +{
@@ -398,6 +409,48 @@
 +		return;
 +	}
 +	sr_reboot(SR_REQ_FASTBOOT, "panic");
++}
++
++/*
++ * Pre-arm the fastboot cookie at boot.
++ *
++ * The panic on venus happens LONG before the SPMI driver is up (the phone
++ * dies in the IOKit/registry init, and the log shows "SWEET REBOOT: SPMI not
++ * ready; no fastboot cookie" - so the panic path could not set the cookie and
++ * the phone stayed dead on the panic screen until a human power-cycled it).
++ *
++ * If we write the "boot into the bootloader" cookie once, at boot, then
++ * EVERY later reset - a panic, a watchdog, a thermal trip, a user-requested
++ * reboot - goes to the Qualcomm fastboot instead of Android, and the Mac-side
++ * supervisor boots the newest image again.  The cookie is cleared by the
++ * bootloader on the next boot, so it has to be re-armed every time; that is
++ * what this function does (it runs from the rootdev attach, once per boot).
++ */
++void
++sweet_reboot_arm(void)
++{
++	int arm = 0;
++	static bool done = false;
++
++	if (done) {
++		return;
++	}
++	PE_parse_boot_argn("sweetrebootarm", &arm, sizeof(arm));
++	if (!arm) {
++		return;
++	}
++	done = true;
++	if (!sr_spmi_init_ready()) {
++		printf("SWEET REBOOT: arm: SPMI not ready yet, will retry\n");
++		done = false;
++		return;
++	}
++	if (sr_set_fastboot_cookie()) {
++		printf("SWEET REBOOT: fastboot cookie armed (any reset -> fastboot)\n");
++	} else {
++		printf("SWEET REBOOT: arm failed (no cookie)\n");
++		done = false;
++	}
 +}
 +
 +/*
