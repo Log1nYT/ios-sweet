@@ -38,7 +38,12 @@ PHYS_BASE = 0xe6000000
 # hands the allocator pages with no backing behind them (the _bzero external
 # abort at NOTES.md L227: the allocator returned 0x2800c0000, just past the
 # real end), so the window stops at the real end of RAM.
-MEM_SIZE = 0x19a000000          # up to the end of DRAM (0x280000000)
+# The 8 GiB of the Mi 11 END at 0x200000000.  The vendor FDT's bank 2 goes
+# further (to 0x280000000), but that top 1 GiB is RESERVED (modem/secure) -
+# publishing it hands the allocator pages with no backing, which is how the
+# 32 MiB kmem allocation failed with KERN_NO_SPACE (see NOTES "Panic root
+# cause" and the 8g ADT that was proven good: dram-size = 0x11a000000).
+MEM_SIZE = 0x11a000000          # up to the real end of RAM (0x200000000)
 # --highmem: same window; kept as an alias so the flag stays harmless.
 HIGH_PHYS_BASE = PHYS_BASE
 HIGH_MEM_SIZE = MEM_SIZE
