@@ -484,29 +484,6 @@
 +	(void)arg;
 +	(void)result;
 +
-+	{
-+		int fix = 0;
-+		/*
-+		 * Wait for the USB console log to come up before we do the
-+		 * work: prints from this early in the boot are lost, and we
-+		 * need to see whether the writes worked.
-+		 */
-+		if (PE_parse_boot_argn("sweetsetupfix", &fix, sizeof(fix)) && fix) {
-+			/*
-+			 * Write right away (UserManagerDaemon reads the
-+			 * preferences early), then keep rewriting for a
-+			 * while: cfprefsd replaces the file during the
-+			 * boot, and the console log only comes up later, so
-+			 * the status is repeated as well.
-+			 */
-+			sfp_setupfix_run();
-+			for (int r = 0; r < 20; r++) {
-+				delay(2 * 1000 * 1000);
-+				sfp_setupfix_run();
-+				sfp_setupfix_report();
-+			}
-+		}
-+	}
 +	if (sfp_dump_spec[0] != '\0') {
 +		for (tries = 0; tries < 60; tries++) {
 +			if (sfp_dump_run() == 0) {
@@ -548,6 +525,29 @@
 +		    sfp[i].done ? "PATCHED" : "NOT PATCHED", sfp[i].err);
 +	}
 +	printf("SWEET FILEPATCH: done\n");
++	{
++		int fix = 0;
++		/*
++		 * Wait for the USB console log to come up before we do the
++		 * work: prints from this early in the boot are lost, and we
++		 * need to see whether the writes worked.
++		 */
++		if (PE_parse_boot_argn("sweetsetupfix", &fix, sizeof(fix)) && fix) {
++			/*
++			 * Write right away (UserManagerDaemon reads the
++			 * preferences early), then keep rewriting for a
++			 * while: cfprefsd replaces the file during the
++			 * boot, and the console log only comes up later, so
++			 * the status is repeated as well.
++			 */
++			sfp_setupfix_run();
++			for (int r = 0; r < 20; r++) {
++				delay(2 * 1000 * 1000);
++				sfp_setupfix_run();
++				sfp_setupfix_report();
++			}
++		}
++	}
 +}
 +
 +void
