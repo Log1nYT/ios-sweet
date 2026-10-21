@@ -1,5 +1,5 @@
 /*
- * sweet: boot-time file patcher.
+ * sweet: boot-time file patcher (+ file dump).
  *
  * The iOS userland image is not on the Mac any more (the 9 GB userdata
  * image was lost), so every change to a file that lives on the phone's
@@ -7,9 +7,10 @@
  * it rewrites a few bytes in a file after the volume is mounted, using the
  * in-kernel VFS API (vnode_open + vn_rdwr).
  *
- * Boot argument:
+ * Boot arguments:
  *
  *   sweetfilepatch=<path>:<off>:<oldhex>:<newhex>[,<path>:<off>:<oldhex>:<newhex>...]
+ *   sweetfiledump=<path>[:<off>[:<len>]][,...]
  *
  * <off> is hexadecimal, <oldhex>/<newhex> are hex byte strings of the same
  * length.  The old bytes are verified before the write: if the file does
@@ -20,7 +21,9 @@
  * to keep the kernel command line short.
  *
  * The patch thread starts with the root device driver, long before the
- * root volume is mounted, so it retries until the file shows up.
+ * root volume is mounted, so it retries until the file shows up.  Every
+ * attempt is logged (the console log only starts streaming over USB a
+ * couple of seconds later, so the status is repeated for a while).
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
@@ -42,6 +45,7 @@ void sweet_filepatch_init(void);
 #define SFP_MAX_BYTES   16
 #define SFP_PATHLEN     160
 #define SFP_ARGLEN      256
+#define SFP_DUMPLEN     64
 
 struct sfp_patch {
 	char     path[SFP_PATHLEN];
@@ -50,10 +54,21 @@ struct sfp_patch {
 	uint8_t  oldb[SFP_MAX_BYTES];
 	uint8_t  newb[SFP_MAX_BYTES];
 	int      done;
+	int      err;
 };
 
 static struct sfp_patch sfp[SFP_MAX_PATCH];
 static int sfp_count;
+
+static void
+sfp_expand(const char *path, char *out, int outlen)
+{
+	if (strcmp(path, "mad") == 0) {
+		strlcpy(out, "/private/usr/libexec/mobileactivationd", outlen);
+	} else {
+		strlcpy(out, path, outlen);
+	}
+}
 
 static int
 sfp_hexval(int c)
@@ -124,11 +139,7 @@ sfp_add(const char *path, uint64_t off, const char *oldhex, const char *newhex)
 	}
 	p->len = (uint32_t)oldlen;
 	p->off = off;
-	if (strcmp(path, "mad") == 0) {
-		strlcpy(p->path, "/private/usr/libexec/mobileactivationd", SFP_PATHLEN);
-	} else {
-		strlcpy(p->path, path, SFP_PATHLEN);
-	}
+	sfp_expand(path, p->path, SFP_PATHLEN);
 	sfp_count++;
 }
 
@@ -164,29 +175,131 @@ sfp_parse(char *spec)
 	}
 }
 
+/* Read len bytes at offset; returns 0 on success. */
+static int
+sfp_read(vnode_t vp, void *buf, uint32_t len, uint64_t off)
+{
+	int resid = 0;
+	int err;
+
+	err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)len, (off_t)off,
+	    UIO_SYSSPACE, IO_NODELOCKED | IO_NOAUTH, kauth_cred_get(), &resid, NULL);
+	if (err != 0) {
+		return err;
+	}
+	return (resid != 0) ? EIO : 0;
+}
+
+static int
+sfp_write(vnode_t vp, const void *buf, uint32_t len, uint64_t off)
+{
+	int resid = 0;
+	int err;
+
+	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)buf, (int)len, (off_t)off,
+	    UIO_SYSSPACE, IO_NODELOCKED | IO_NOAUTH, kauth_cred_get(), &resid, NULL);
+	if (err != 0) {
+		return err;
+	}
+	return (resid != 0) ? EIO : 0;
+}
+
+/* Dump a region of a file as hex, so we can see what is on the phone. */
+static int
+sfp_dump_one(char *spec)
+{
+	char path[SFP_PATHLEN];
+	char *c1, *c2;
+	uint64_t off = 0;
+	uint32_t len = SFP_DUMPLEN;
+	uint8_t buf[SFP_DUMPLEN];
+	vnode_t vp = NULL;
+	vfs_context_t ctx = vfs_context_kernel();
+	int err, i;
+
+	c1 = strchr(spec, ':');
+	if (c1 != NULL) {
+		*c1++ = '\0';
+		c2 = strchr(c1, ':');
+		if (c2 != NULL) {
+			*c2++ = '\0';
+			uint64_t l = sfp_parse_off(c2);
+			len = (l == (uint64_t)-1) ? SFP_DUMPLEN : (uint32_t)l;
+		}
+		off = sfp_parse_off(c1);
+		if (off == (uint64_t)-1) {
+			off = 0;
+		}
+	}
+	if (len == 0 || len > SFP_DUMPLEN) {
+		len = SFP_DUMPLEN;
+	}
+	sfp_expand(spec, path, SFP_PATHLEN);
+	err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+	if (err != 0) {
+		printf("SWEET FILEDUMP: %s open failed (err %d)\n", path, err);
+		return 1;
+	}
+	err = sfp_read(vp, buf, len, off);
+	if (err != 0) {
+		printf("SWEET FILEDUMP: %s read@0x%llx failed (err %d)\n",
+		    path, (unsigned long long)off, err);
+		vnode_close(vp, 0, ctx);
+		return 1;
+	}
+	printf("SWEET FILEDUMP: %s@0x%llx:", path, (unsigned long long)off);
+	for (i = 0; i < (int)len; i++) {
+		printf(" %02x", buf[i]);
+	}
+	printf("\n");
+	vnode_close(vp, 0, ctx);
+	return 0;
+}
+
+static char sfp_dump_spec[SFP_ARGLEN];
+
+/* Returns the number of dumps that failed (ENOENT etc). */
+static int
+sfp_dump_run(void)
+{
+	char spec[SFP_ARGLEN];
+	char *p;
+	int failed = 0;
+
+	strlcpy(spec, sfp_dump_spec, SFP_ARGLEN);
+	p = spec;
+	while (p != NULL && *p != '\0') {
+		char *comma = strchr(p, ',');
+		if (comma != NULL) {
+			*comma = '\0';
+		}
+		failed += sfp_dump_one(p);
+		p = (comma != NULL) ? comma + 1 : NULL;
+	}
+	return failed;
+}
+
 static int
 sfp_apply(struct sfp_patch *p)
 {
 	vnode_t vp = NULL;
 	vfs_context_t ctx = vfs_context_kernel();
 	uint8_t buf[SFP_MAX_BYTES];
-	int resid = 0;
 	int err;
 
 	err = vnode_open(p->path, FREAD | FWRITE, 0, 0, &vp, ctx);
 	if (err != 0) {
 		return err;
 	}
-	err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)p->len, (off_t)p->off,
-	    UIO_SYSSPACE, IO_NODELOCKED | IO_NOAUTH, kauth_cred_get(), &resid, NULL);
-	if (err != 0 || resid != 0) {
-		printf("SWEET FILEPATCH: read %s@0x%llx failed (err %d resid %d)\n",
-		    p->path, (unsigned long long)p->off, err, resid);
+	err = sfp_read(vp, buf, p->len, p->off);
+	if (err != 0) {
+		printf("SWEET FILEPATCH: read %s@0x%llx failed (err %d)\n",
+		    p->path, (unsigned long long)p->off, err);
 		vnode_close(vp, 0, ctx);
-		return (err != 0) ? err : EIO;
+		return err;
 	}
 	if (memcmp(buf, p->oldb, p->len) != 0) {
-		printf("SWEET FILEPATCH: %s@0x%llx mismatch (have %02x%02x%02x%02x,"
+		printf("SWEET FILEPATCH: %s@0x%llx MISMATCH (have %02x%02x%02x%02x,"
 		    " want %02x%02x%02x%02x) - skipped\n",
 		    p->path, (unsigned long long)p->off,
 		    (p->len > 0) ? buf[0] : 0, (p->len > 1) ? buf[1] : 0,
@@ -196,13 +309,12 @@ sfp_apply(struct sfp_patch *p)
 		vnode_close(vp, 0, ctx);
 		return EIO;
 	}
-	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)p->newb, (int)p->len, (off_t)p->off,
-	    UIO_SYSSPACE, IO_NODELOCKED | IO_NOAUTH, kauth_cred_get(), &resid, NULL);
-	if (err != 0 || resid != 0) {
-		printf("SWEET FILEPATCH: write %s@0x%llx failed (err %d resid %d)\n",
-		    p->path, (unsigned long long)p->off, err, resid);
+	err = sfp_write(vp, p->newb, p->len, p->off);
+	if (err != 0) {
+		printf("SWEET FILEPATCH: write %s@0x%llx failed (err %d)\n",
+		    p->path, (unsigned long long)p->off, err);
 		vnode_close(vp, 0, ctx);
-		return (err != 0) ? err : EIO;
+		return err;
 	}
 	printf("SWEET FILEPATCH: patched %s@0x%llx (%u bytes)\n",
 	    p->path, (unsigned long long)p->off, p->len);
@@ -218,7 +330,15 @@ sfp_thread(void *arg, wait_result_t result)
 	(void)arg;
 	(void)result;
 
-	for (tries = 0; tries < 180; tries++) {
+	if (sfp_dump_spec[0] != '\0') {
+		for (tries = 0; tries < 60; tries++) {
+			if (sfp_dump_run() == 0) {
+				break;
+			}
+			delay(1000 * 1000);
+		}
+	}
+	for (tries = 0; tries < 300; tries++) {
 		int pending = 0;
 
 		for (i = 0; i < sfp_count; i++) {
@@ -226,20 +346,29 @@ sfp_thread(void *arg, wait_result_t result)
 				continue;
 			}
 			pending++;
-			if (sfp_apply(&sfp[i]) == 0) {
+			sfp[i].err = sfp_apply(&sfp[i]);
+			if (sfp[i].err == 0) {
 				sfp[i].done = 1;
 			}
 		}
 		if (pending == 0) {
 			break;
 		}
+		/* repeat the status: the USB console log only comes up later */
+		if ((tries % 10) == 0) {
+			for (i = 0; i < sfp_count; i++) {
+				printf("SWEET FILEPATCH: try %d %s@0x%llx err %d\n",
+				    tries, sfp[i].path, (unsigned long long)sfp[i].off,
+				    sfp[i].err);
+			}
+		}
 		/* the root volume is mounted a little after this thread starts */
 		delay(1000 * 1000);
 	}
 	for (i = 0; i < sfp_count; i++) {
-		if (!sfp[i].done) {
-			printf("SWEET FILEPATCH: %s NOT patched\n", sfp[i].path);
-		}
+		printf("SWEET FILEPATCH: %s@0x%llx %s (err %d)\n", sfp[i].path,
+		    (unsigned long long)sfp[i].off,
+		    sfp[i].done ? "PATCHED" : "NOT PATCHED", sfp[i].err);
 	}
 	printf("SWEET FILEPATCH: done\n");
 }
@@ -250,12 +379,13 @@ sweet_filepatch_init(void)
 	char spec[SFP_ARGLEN];
 	thread_t t;
 
-	if (!PE_parse_boot_argn("sweetfilepatch", spec, sizeof(spec))) {
-		return;
+	if (PE_parse_boot_argn("sweetfilepatch", spec, sizeof(spec))) {
+		sfp_parse(spec);
 	}
-	sfp_parse(spec);
-	if (sfp_count == 0) {
-		printf("SWEET FILEPATCH: no valid patches in \"%s\"\n", spec);
+	if (PE_parse_boot_argn("sweetfiledump", spec, sizeof(spec))) {
+		strlcpy(sfp_dump_spec, spec, SFP_ARGLEN);
+	}
+	if (sfp_count == 0 && sfp_dump_spec[0] == '\0') {
 		return;
 	}
 	printf("SWEET FILEPATCH: %d patch(es) queued\n", sfp_count);
