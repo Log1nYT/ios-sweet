@@ -1,0 +1,769 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..160483f 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -1,7 +1,19 @@
+ /*
+  * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
+- * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+- * No interrupt clear, peripheral enable, charger config, or PMIC writes.
++ * PMIC READ, plus a whitelisted write path for the battery registers.
++ *
++ * Layout (arbiter v5/v6, i.e. Linux drivers/spmi/spmi-pmic-arb.c):
++ *   reads  go through the observer window of the APID (0x80 bytes):
++ *           CMD +0x00, STATUS +0x08, RDATA0 +0x18
++ *   writes go through the read/write channel window of the APID
++ *           (0x10000 bytes): CMD +0x00, STATUS +0x08, WDATA0 +0x10
++ * The command word is (opcode << 27) | ((addr & 0xff) << 4) | bc, with
++ * EXT_READL = 1 and EXT_WRITE = 2.
++ *
++ * Writes are allowed to the four registers in sp_write_rules only, on the
++ * configured battery SID, and only when the APID is owned by the APPS
++ * (EE 0).  Every write is logged and read back.  No interrupt clear, no
++ * peripheral enable, no other charger configuration.
+  * Init is serialized by the single built-in SweetBattery personality.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+  */
+@@ -10,22 +22,61 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <pexpert/pexpert.h>
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ #define SP_CORE_PA 0x0c440000u
++#define SP_CHNL_PA 0x0c600000u
+ #define SP_OBS_PA  0x0e600000u
+ #define SP_CFG_PA  0x0c40a000u
+ #define SP_NO_APID 0xffffu
+ 
+-static vm_offset_t sp_core, sp_obs, sp_cfg;
++/* Observer window per APID (EE 0) and read/write channel window per APID. */
++#define SP_OBS_STRIDE  0x80u
++#define SP_CHNL_STRIDE 0x10000u
++#define SP_CHNL_SIZE   0x2000000u	/* 512 APID windows of 64 kB */
++
++/* Registers inside one window. */
++#define SP_CMD    0x00u
++#define SP_STATUS 0x08u
++#define SP_WDATA0 0x10u
++#define SP_RDATA0 0x18u
++
++/* SPMI opcodes (Linux spmi-pmic-arb.c).  EXT_READL is the opcode of the
++ * observer read that already works, EXT_WRITE is its write counterpart (both
++ * carry the 8 bit register offset inside the peripheral).  EXT_WRITEL is the
++ * other encoding of the same offset: if the read back verification of a write
++ * fails, that is the first thing to try. */
++#define SP_OP_EXT_WRITE  2u
++#define SP_OP_EXT_WRITEL 0u
++#define SP_OP_EXT_READL  1u
++
++/* The battery PMIC of the venus board (Mi 11) is PM8350B = SPMI SID 3. */
++#define SP_SID_DEFAULT 3u
++#define SP_SID_MAX     5u
++
++static vm_offset_t sp_core, sp_chnl, sp_obs, sp_cfg;
+ static IOLock *sp_lock;
+ static unsigned sp_count;
+-static bool sp_attempted, sp_ready;
++static unsigned sp_sid = SP_SID_DEFAULT;
++static bool sp_attempted, sp_ready, sp_writable;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+ static bool sp_poisoned[512];
+ 
++/* The only registers this driver may write, and why. */
++struct sp_write_rule {
++	unsigned addr;
++	const char *name;
++};
++static const struct sp_write_rule sp_write_rules[] = {
++	{0x1042, "CHGR charging enable"},
++	{0x1340, "USBIN input current limit"},
++	{0x4746, "BCL monitor enable"},
++	{0x4759, "BCL IBAT deglitch"},
++};
++
+ static uint32_t
+ sp_rd(vm_offset_t base, unsigned off)
+ {
+@@ -34,6 +85,53 @@ sp_rd(vm_offset_t base, unsigned off)
+ 	return value;
+ }
+ 
++/* The battery blocks of the SMB5 charger family, the BCL v5 block and the
++ * PMK8350 ADC7.  The keys driver keeps its own lanes (008/4c1). */
++static bool
++sp_peripheral_ok(unsigned peripheral)
++{
++	switch (peripheral) {
++	case 0x10:	/* CHGR  */
++	case 0x11:	/* DCDC  */
++	case 0x12:	/* BATIF */
++	case 0x13:	/* USBIN */
++	case 0x14:	/* DCIN  */
++	case 0x15:	/* TYPEC */
++	case 0x16:	/* MISC  */
++	case 0x31:	/* ADC7  (PMK8350 VADC) */
++	case 0x47:	/* BCL v5 (PM8350B battery current limit) */
++	case 0x48:	/* QG    (PM6150 fuel gauge, sweet board) */
++		return true;
++	default:
++		return false;
++	}
++}
++
++static const char *
++sp_write_name(unsigned addr)
++{
++	for (unsigned i = 0; i < sizeof(sp_write_rules) / sizeof(sp_write_rules[0]); ++i) {
++		if (sp_write_rules[i].addr == addr) {
++			return sp_write_rules[i].name;
++		}
++	}
++	return "not allowed";
++}
++
++static bool
++sp_write_allowed(unsigned sid, unsigned addr)
++{
++	if (sid != sp_sid || addr > 0xffffu) {
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(sp_write_rules) / sizeof(sp_write_rules[0]); ++i) {
++		if (sp_write_rules[i].addr == addr) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ static uint16_t
+ sp_find_apid(unsigned ppid)
+ {
+@@ -62,9 +160,16 @@ sweet_spmi_init(void)
+ 	if (!sp_lock) {
+ 		return -1;
+ 	}
++	/* The SID of the battery PMIC: sweetbatsid= overrides the default. */
++	int sid = (int)SP_SID_DEFAULT;
++	if (PE_parse_boot_argn("sweetbatsid", &sid, sizeof(sid)) &&
++	    sid >= 0 && (unsigned)sid <= SP_SID_MAX) {
++		sp_sid = (unsigned)sid;
++	}
+ 	sp_core = ml_io_map(SP_CORE_PA, 0x2000);
+ 	sp_cfg = ml_io_map(SP_CFG_PA, 0x1000);
+ 	sp_obs = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
++	sp_chnl = ml_io_map(SP_CHNL_PA, SP_CHNL_SIZE); /* 512 * 0x10000 */
+ 	if (!sp_core || !sp_cfg || !sp_obs) {
+ 		printf("SWEET BATTERY: SPMI mapping failed\n");
+ 		return -1;
+@@ -77,20 +182,31 @@ sweet_spmi_init(void)
+ 		    arb_version, sp_count);
+ 		return -1;
+ 	}
++	/* Only the v5/v6 channel layout is known here; without the channel
++	 * region the driver stays read only. */
++	sp_writable = sp_chnl != 0;
+ 	sp_ready = true;
+-	printf("SWEET BATTERY: SPMI arb=%#x APIDs=%u, observer reads only\n",
+-	    arb_version, sp_count);
++	printf("SWEET BATTERY: SPMI arb=%#x APIDs=%u sid=%u, %s\n",
++	    arb_version, sp_count, sp_sid,
++	    sp_writable ? "observer reads + channel writes" : "observer reads only");
+ 	return 0;
+ }
+ 
++unsigned
++sweet_spmi_sid(void)
++{
++	return sp_sid;
++}
++
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
++	/* Restrict access to the battery blocks; keys retain their own lanes.
++	 * sid 0 = sweet PM6150 / venus PMK8350; the venus battery PMIC
++	 * (PM8350B) is sid 3. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	if (!sp_ready || !out || sid > SP_SID_MAX || addr > 0xffffu ||
++	    !sp_peripheral_ok(peripheral)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -99,19 +215,19 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		IOLockUnlock(sp_lock);
+ 		return -1;
+ 	}
+-	unsigned off = 0x80u * apid;
+-	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
++	unsigned off = SP_OBS_STRIDE * apid;
++	uint32_t cmd = (SP_OP_EXT_READL << 27) | ((addr & 0xffu) << 4);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
++	*(volatile uint32_t *)(sp_obs + off + SP_CMD) = cmd; /* EXT_READL, BC=0 */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ 	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t status = sp_rd(sp_obs, off + 0x08u);
++		uint32_t status = sp_rd(sp_obs, off + SP_STATUS);
+ 		if (status & 1u) {
+ 			if (status & 0x0eu) {
+ 				IOLockUnlock(sp_lock);
+ 				return -1;
+ 			}
+-			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++			*out = (uint8_t)sp_rd(sp_obs, off + SP_RDATA0);
+ 			IOLockUnlock(sp_lock);
+ 			return 0;
+ 		}
+@@ -123,4 +239,84 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++
++/* Write one byte of a whitelisted register on the battery SID.
++ * The write goes through the arbiter's read/write channel (the observer
++ * is read only) and is verified by reading the register back. */
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++{
++	if (!sp_ready || !sp_writable || !sp_write_allowed(sid, addr)) {
++		printf("SWEET BATTERY: SPMI write refused sid=%u addr=%#x\n",
++		    sid, addr);
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
++	if (apid == SP_NO_APID || sp_poisoned[apid]) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	/* Only the APPS (EE 0) may write this APID: another owner (the ADSP
++	 * charger protection domain) would race us. */
++	if ((sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
++		printf("SWEET BATTERY: SPMI write refused sid=%u addr=%#x APID=%u not APPS owned\n",
++		    sid, addr, apid);
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	unsigned off = SP_CHNL_STRIDE * apid;
++	uint32_t cmd = (SP_OP_EXT_WRITE << 27) | ((addr & 0xffu) << 4);
++	bool done = false;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(sp_chnl + off + SP_WDATA0) = value;
++	*(volatile uint32_t *)(sp_chnl + off + SP_CMD) = cmd; /* EXT_WRITE, BC=0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(sp_chnl, off + SP_STATUS);
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				printf("SWEET BATTERY: SPMI write failed sid=%u addr=%#x val=%#x status=%#x\n",
++				    sid, addr, value, status);
++			} else {
++				done = true;
++			}
++			break;
++		}
++		delay(1);
++	}
++	if (!done) {
++		sp_poisoned[apid] = true;
++		printf("SWEET BATTERY: SPMI write timeout sid=%u addr=%#x APID=%u disabled\n",
++		    sid, addr, apid);
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	IOLockUnlock(sp_lock);
++	/* The write must be visible in the observer before it is trusted. */
++	uint8_t back = 0;
++	if (sweet_spmi_read(sid, addr, &back) || back != value) {
++		printf("SWEET BATTERY: SPMI write verify failed sid=%u addr=%#x (%s) wrote=%#x read=%#x\n",
++		    sid, addr, sp_write_name(addr), value, back);
++		return -1;
++	}
++	printf("SWEET BATTERY: SPMI write sid=%u addr=%#x (%s) val=%#x verified\n",
++	    sid, addr, sp_write_name(addr), value);
++	return 0;
++}
++
++/* Read a register, modify the masked bits and write it back. */
++int
++sweet_spmi_update(unsigned sid, unsigned addr, uint8_t mask, uint8_t value)
++{
++	uint8_t old = 0;
++	if (sweet_spmi_read(sid, addr, &old)) {
++		return -1;
++	}
++	uint8_t next = (uint8_t)((old & (uint8_t)~mask) | (value & mask));
++	if (next == old) {
++		return 0; /* already in the wanted state */
++	}
++	return sweet_spmi_write(sid, addr, next);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 45565d1..d31ec51 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,13 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* Write one byte of a whitelisted register on the battery SID.
++ * Thread context only; 0 success (read back and verified), -1 failure. */
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
++/* Read-modify-write: (old & ~mask) | (value & mask). */
++int sweet_spmi_update(unsigned sid, unsigned addr, uint8_t mask, uint8_t value);
++/* SPMI SID of the battery PMIC (sweetbatsid, default 3 = PM8350B). */
++unsigned sweet_spmi_sid(void);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..3d330d7 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -1,8 +1,23 @@
+ /*
+- * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+- * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+- * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+- * See report.md for binary evidence, register provenance and integration.
++ * Built-in iOS battery bring-up service.
++ *
++ * Default (no boot arg): the static fallback of 0062 - 100 %, 4200 mV,
++ * "charger connected", not charging - so the phone always shows a battery.
++ *
++ * sweetbattery=1: poll the battery PMIC over SPMI every 30 seconds and
++ * publish the REAL charger state, battery voltage and battery current.
++ * There is no fuel gauge on this board (the real gauge is behind the ADSP
++ * charger protection domain), so the state of charge stays a voltage
++ * derived ESTIMATE and is published as such.
++ *
++ *   sweetbattery=1      enable the real probe (default: off, static values)
++ *   sweetbatsid=<0..5>  SPMI SID of the battery PMIC (default 3 = PM8350B,
++ *                       the charger PMIC of the venus board / Mi 11)
++ *   sweetbattmah=<mAh>  pack size (default 4600 on venus, 5020 elsewhere)
++ *   sweetcharge=1       also write the PMIC charging enable (0x1042); off by
++ *                       default, because the ADSP may own the charger
++ *
++ * Register sources: logs/research/06-power-battery-charging.md
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -15,6 +30,41 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
++extern "C" int sweet_spmi_update(unsigned sid, unsigned addr, uint8_t mask, uint8_t value);
++extern "C" unsigned sweet_spmi_sid(void);
++
++/* SMB5 charger registers of PM8350B (SID 3). */
++#define SB_CHGR_STATUS1   0x1006u	/* bits[2:0] charge state */
++#define SB_CHGR_STATUS2   0x1007u	/* bit1 battery overvoltage */
++#define SB_CHGR_STATUS7   0x100du	/* bits[3:2] pack too hot / too cold */
++#define SB_CHGR_CMD_EN    0x1042u	/* bit0 charging enable (write) */
++#define SB_POWER_PATH     0x110bu	/* USBIN/DCIN/valid/suspend */
++#define SB_APSD_RESULT    0x1308u	/* adapter type */
++#define SB_QC_CHANGE      0x1309u	/* negotiated USB voltage */
++#define SB_USBIN_CMD_IL   0x1340u	/* input current limit (write) */
++
++/* POWER_PATH_STATUS bits. */
++#define SB_PP_USBIN   0x10u
++#define SB_PP_DCIN    0x08u
++#define SB_PP_VALID   0x01u
++#define SB_PP_SUSPEND 0x40u
++
++/* BCL v5 block of PM8350B (SID 3): the battery voltage and current ADCs. */
++#define SB_BCL_MONITOR_EN 0x4746u	/* bit7 monitor enable (write) */
++#define SB_BCL_IADC_DGL   0x4759u	/* IBAT ADC deglitch (write) */
++#define SB_BCL_VBAT_READ  0x4776u	/* battery voltage, 49.827 mV per code */
++#define SB_BCL_IBAT_READ  0x4786u	/* battery current, 78.127 mA per code */
++
++/* BATTERY_CHARGER_STATUS_1 charge states. */
++#define SB_CHG_INHIBIT  0u
++#define SB_CHG_TRICKLE  1u
++#define SB_CHG_TAPER    4u
++#define SB_CHG_TERMINATE 5u
++
++/* Pack sizes in mAh (the Mi 11 pack is 4600 mAh, not 5020 mAh). */
++#define SB_MAH_VENUS  4600u
++#define SB_MAH_SWEET  5020u
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -24,18 +74,34 @@ public:
+ 	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void free(void) APPLE_KEXT_OVERRIDE;
+ private:
++	struct Sample {
++		unsigned percent;	/* 0..100, from the voltage curve */
++		unsigned mv;		/* battery voltage in mV */
++		int ma;		/* battery current in mA, + = charging */
++		bool external;		/* a power source is present */
++		bool capable;		/* the port can charge the pack */
++		bool charging;		/* the PMIC is charging */
++		bool full;		/* the PMIC says the pack is full */
++		bool voltageValid;	/* mv is a real measurement */
++		bool currentValid;	/* ma is a real measurement */
++		bool real;		/* the charger state is real */
++	};
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fProbed, fChargeEnable;
++	unsigned fSid;
++	unsigned fMaxCapacity;
++	unsigned fLastPercent;
++	unsigned fLastMv;
++	int fLastMa;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+-	void publish(unsigned percent, unsigned mv, int ma, bool external,
+-	    bool capable, bool charging, bool full, bool measured, bool currentValid);
++	void publish(const Sample &sample);
+ 	void poll(void);
++	void probe(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+-	static bool readWord(unsigned address, uint16_t *value);
+ 	static unsigned estimatePercent(unsigned mv);
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+@@ -51,7 +117,12 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fProbed = fChargeEnable = false;
++	fSid = 0;
++	fMaxCapacity = SB_MAH_SWEET;
++	fLastPercent = 100;
++	fLastMv = 4200;
++	fLastMa = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -98,38 +169,44 @@ SweetBattery::putBool(const char *key, bool value)
+ }
+ 
+ void
+-SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+-    bool capable, bool charging, bool full, bool measured, bool currentValid)
++SweetBattery::publish(const Sample &s)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (powerd computes C*100/M). */
++	const unsigned capacity = (fMaxCapacity * s.percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
+-	setExternalConnected(external);
+-	setExternalChargeCapable(capable);
+-	setIsCharging(charging);
++	setMaxCapacity(fMaxCapacity);
++	setExternalConnected(s.external);
++	setExternalChargeCapable(s.capable);
++	setIsCharging(s.charging);
+ 	setAtWarnLevel(false);
+ 	/* An uncalibrated voltage curve must not assert a critical shutdown. */
+ 	setAtCriticalLevel(false);
+-	setVoltage(mv);
+-	setAmperage(ma);
++	setVoltage(s.mv);
++	setAmperage(s.ma);
+ 	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
+ 	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
+-	putBool("FullyCharged", full);
+-	putBool("AppleRawExternalConnected", external);
++	putBool("FullyCharged", s.full);
++	putBool("AppleRawExternalConnected", s.external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
+-	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
++	putNumber("AppleRawMaxCapacity", fMaxCapacity);
++	putNumber("DesignCapacity", fMaxCapacity);
++	putNumber("InstantAmperage", (UInt32)s.ma);
++	/* iOS battery convention: centidegrees C.  A real pack temperature needs
++	 * the PMK8350 ADC7 (channel 0x303) and the device tree calibration of
++	 * that channel; this build has neither, so the 25 C placeholder stays
++	 * and is flagged as not measured. */
+ 	putNumber("Temperature", 2500);
+-	putBool("SweetBatteryHardwareSampleValid", measured);
+-	putBool("SweetBatteryCurrentValid", currentValid);
+-	putBool("SweetBatterySOCEstimated", measured);
++	putBool("SweetBatteryHardwareSampleValid", s.real);
++	putBool("SweetBatteryVoltageValid", s.voltageValid);
++	putBool("SweetBatteryCurrentValid", s.currentValid);
++	putBool("SweetBatterySOCEstimated", true);
+ 	putBool("SweetBatteryTemperatureEstimated", true);
+-	putBool("SweetBatteryFallback", !measured);
+-	putNumber("SweetBatteryPercent", percent);
++	putBool("SweetBatteryFallback", !s.real);
++	putNumber("SweetBatteryPercent", s.percent);
++	putNumber("SweetBatteryVoltage", s.mv);
++	putNumber("SweetBatteryAmperage", (UInt32)s.ma);
++	putNumber("SweetBatteryPackCapacity", fMaxCapacity);
+ 
+ 	/* IOPMCopyBatteryInfo's per-source compatibility dictionary. */
+ 	OSDictionary *legacy = OSDictionary::withCapacity(7);
+@@ -137,9 +214,9 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
+-		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+-		    (charging ? kIOBatteryCharge : 0))};
++		UInt32 values[] = {capacity, fMaxCapacity, s.mv, (UInt32)s.ma, 0,
++		    (UInt32)(kIOBatteryInstalled | (s.external ? kIOBatteryChargerConnect : 0) |
++		    (s.charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+ 			OSNumber *number = OSNumber::withNumber(values[i], 32);
+ 			if (number) {
+@@ -151,38 +228,16 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		legacy->release();
+ 	}
+ 	updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
+-	int mode = measured ? 1 : 0;
++	int mode = s.real ? (s.voltageValid ? 2 : 1) : 0;
+ 	if (mode != fLastMode) {
+-		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
+-		    percent, mv, external, charging);
++		IOLog("SWEET BATTERY: %s, %u%% %umV %dmA external=%d charging=%d\n",
++		    s.real ? (s.voltageValid ? "PMIC voltage/current" : "charger state only") :
++		    "static fallback",
++		    s.percent, s.mv, s.ma, s.external, s.charging);
+ 		fLastMode = mode;
+ 	}
+ }
+ 
+-/* Keep the proven single-byte observer command. Read two matching whole
+- * words to reject most torn ADC samples without writing the QG HOLD bit.
+- * This is a bounded consistency check, not a hardware snapshot guarantee. */
+-bool
+-SweetBattery::readWord(unsigned address, uint16_t *value)
+-{
+-	uint16_t previous = 0;
+-	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+-		uint8_t lo, hi;
+-		if (sweet_spmi_read(0, address, &lo) ||
+-		    sweet_spmi_read(0, address + 1, &hi)) {
+-			return false;
+-		}
+-		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
+-		if (attempt && next == previous) {
+-			*value = next;
+-			return true;
+-		}
+-		previous = next;
+-	}
+-	return false;
+-}
+-
+ unsigned
+ SweetBattery::estimatePercent(unsigned mv)
+ {
+@@ -203,47 +258,130 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++/* One-shot discovery: which blocks does the battery SID have, and prepare
++ * the BCL v5 block so that its voltage and current ADCs produce data. */
+ void
+-SweetBattery::poll(void)
++SweetBattery::probe(void)
+ {
+-	uint8_t type, present, usb, path, charger, error, temperature;
+-	uint16_t rawVoltage;
+-	bool valid = fReal &&
+-	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
+-	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
+-	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
+-	    !sweet_spmi_read(0, 0x1310, &usb) &&
+-	    !sweet_spmi_read(0, 0x110b, &path) &&
+-	    !sweet_spmi_read(0, 0x1006, &charger) &&
+-	    !sweet_spmi_read(0, 0x1007, &error) &&
+-	    !sweet_spmi_read(0, 0x100d, &temperature);
+-	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
+-	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+-	valid = valid && mv >= 2800 && mv <= 4600;
+-	if (!valid) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
+-		return;
++	static const unsigned blocks[] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
++	    0x16, 0x47};
++	for (unsigned i = 0; i < sizeof(blocks) / sizeof(blocks[0]); ++i) {
++		unsigned base = blocks[i] << 8;
++		uint8_t type = 0, subtype = 0;
++		if (!sweet_spmi_read(fSid, base + 4, &type) &&
++		    !sweet_spmi_read(fSid, base + 5, &subtype)) {
++			printf("SWEET BATTERY: probe sid=%u block=%#x type=%#x subtype=%#x\n",
++			    fSid, base, type, subtype);
++		}
++	}
++	/* BCL v5 needs two writes before the ADCs are valid: enable the
++	 * monitor (0x4746 bit7) and set the IBAT ADC deglitch (0x4759). */
++	if (sweet_spmi_update(fSid, SB_BCL_MONITOR_EN, 0x80u, 0x80u) ||
++	    sweet_spmi_update(fSid, SB_BCL_IADC_DGL, 0x0fu, 0x0eu)) {
++		printf("SWEET BATTERY: BCL init failed; no battery voltage/current\n");
++	} else {
++		printf("SWEET BATTERY: BCL monitor and IBAT deglitch enabled\n");
+ 	}
+-	bool external = (usb & 0x10u) != 0;
+-	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
+-	unsigned state = charger & 7u;
+-	bool charging = capable && state >= 1 && state <= 4 &&
+-	    !(error & 2u) && !(temperature & 0x0cu);
+-	/* Inhibit (0) does not by itself establish full capacity. */
+-	bool full = external && state == 5 && !(error & 2u);
+-	int ma = 0;
+-	uint8_t subtype;
+-	uint16_t rawCurrent;
+-	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
+-	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
+-	    rawCurrent != 0x8000;
+-	if (currentValid) {
+-		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+-		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+-		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
++	if (fChargeEnable) {
++		if (sweet_spmi_update(fSid, SB_CHGR_CMD_EN, 0x01u, 0x01u)) {
++			printf("SWEET BATTERY: charging enable write failed\n");
++		} else {
++			printf("SWEET BATTERY: charging enabled in the PMIC\n");
++		}
+ 	}
+-	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+-	    charging, full, true, currentValid);
++}
++
++void
++SweetBattery::poll(void)
++{
++	Sample s;
++	/* The static fallback of 0062: the phone must always show a battery. */
++	s.percent = 100;
++	s.mv = 4200;
++	s.ma = 0;
++	s.external = true;
++	s.capable = true;
++	s.charging = false;
++	s.full = true;
++	s.voltageValid = false;
++	s.currentValid = false;
++	s.real = false;
++
++	if (fReal) {
++		if (!fProbed) {
++			fProbed = true;
++			probe();
++		}
++		uint8_t path = 0, status1 = 0, status2 = 0, status7 = 0;
++		uint8_t apsd = 0, qc = 0;
++		bool pathOk = !sweet_spmi_read(fSid, SB_POWER_PATH, &path);
++		bool st1Ok = !sweet_spmi_read(fSid, SB_CHGR_STATUS1, &status1);
++		bool st2Ok = !sweet_spmi_read(fSid, SB_CHGR_STATUS2, &status2);
++		bool st7Ok = !sweet_spmi_read(fSid, SB_CHGR_STATUS7, &status7);
++		(void)sweet_spmi_read(fSid, SB_APSD_RESULT, &apsd);
++		(void)sweet_spmi_read(fSid, SB_QC_CHANGE, &qc);
++		if (pathOk || st1Ok) {
++			bool external = pathOk && ((path & (SB_PP_USBIN | SB_PP_DCIN)) != 0);
++			bool capable = pathOk && (path & SB_PP_VALID) &&
++			    !(path & SB_PP_SUSPEND);
++			unsigned state = st1Ok ? (unsigned)(status1 & 7u) : 0u;
++			bool error = st2Ok && (status2 & 0x02u);
++			bool tooHot = st7Ok && (status7 & 0x0cu);
++			bool charging = capable && state > SB_CHG_INHIBIT &&
++			    state <= SB_CHG_TAPER && !error && !tooHot;
++			bool full = capable && state == SB_CHG_TERMINATE && !error;
++
++			/* BCL v5: the real battery voltage and current. */
++			uint8_t vbat = 0, ibat = 0;
++			bool vbatOk = !sweet_spmi_read(fSid, SB_BCL_VBAT_READ, &vbat) &&
++			    vbat != 0x7fu && vbat != 0u;
++			unsigned mv = vbatOk ? (unsigned)vbat * 49827u / 1000u : 0u;
++			vbatOk = vbatOk && mv >= 2800u && mv <= 4600u;
++			bool ibatOk = !sweet_spmi_read(fSid, SB_BCL_IBAT_READ, &ibat);
++			int pmicMa = 0;
++			if (ibatOk) {
++				int raw = (ibat & 0x80u) ? (int)ibat - 256 : (int)ibat;
++				pmicMa = (int)((int64_t)raw * 78127 / 1000);
++			}
++			if (vbatOk) {
++				fLastMv = mv;
++			} else {
++				mv = fLastMv; /* last known good value */
++			}
++			if (ibatOk) {
++				fLastMa = pmicMa;
++			} else {
++				pmicMa = fLastMa;
++			}
++			/* The PMIC counts the current into the pack: negative means
++			 * charging (Linux convention).  IOPMPowerSource wants a
++			 * positive current while charging, so the sign flips. */
++			s.mv = mv;
++			s.ma = -pmicMa;
++			s.voltageValid = vbatOk;
++			s.currentValid = ibatOk;
++			s.external = external;
++			s.capable = capable;
++			s.charging = charging;
++			s.full = full;
++			s.real = true;
++			s.percent = full ? 100u :
++			    (vbatOk ? estimatePercent(mv) : fLastPercent);
++			if (vbatOk) {
++				fLastPercent = s.percent;
++			}
++			printf("SWEET BATTERY: sid=%u %u%% %umV ibat=%d mA (pmic %d) "
++			    "external=%d capable=%d charging=%d full=%d state=%u "
++			    "path=%#x status1=%#x status2=%#x status7=%#x apsd=%#x qc=%#x\n",
++			    fSid, s.percent, s.mv, s.ma, pmicMa, s.external, s.capable,
++			    s.charging, s.full, state, path, status1, status2, status7,
++			    apsd, qc);
++		} else {
++			printf("SWEET BATTERY: no charger registers on sid=%u; "
++			    "static fallback\n", fSid);
++		}
++	}
++	publish(s);
+ }
+ 
+ void
+@@ -262,9 +400,22 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
++	int real = 0, charge = 0, mah = 0, venus = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
++	(void)PE_parse_boot_argn("sweetcharge", &charge, sizeof(charge));
++	(void)PE_parse_boot_argn("venus", &venus, sizeof(venus));
++	fChargeEnable = charge == 1;
++	/* Pack size: 4600 mAh for the Mi 11 (venus), 5020 mAh for the sweet
++	 * board; sweetbattmah= overrides both. */
++	fMaxCapacity = venus ? SB_MAH_VENUS : SB_MAH_SWEET;
++	if (PE_parse_boot_argn("sweetbattmah", &mah, sizeof(mah)) &&
++	    mah > 0 && mah <= 20000) {
++		fMaxCapacity = (unsigned)mah;
++	}
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++	fSid = sweet_spmi_sid();
++	printf("SWEET BATTERY: real=%d sid=%u pack=%u mAh charge=%d\n",
++	    fReal, fSid, fMaxCapacity, fChargeEnable);
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
