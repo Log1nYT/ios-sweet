@@ -63,6 +63,12 @@ GICR, GICR_SIZE = 0x17a60000, 0x100000
 FB, FB_SIZE = 0xe2a00000, 1440 * 3200 * 4
 VENUS_ECID = 0x56454e5553000001  # 'VENUS' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1440, 3200, 1440 * 4
+# The canvas (the size the iOS userland renders at, /arm-io/disp0
+# canvas-width/canvas-height) is NOT the panel size: it is the iPhone X
+# screen, 1125x2436 = 375x812 points at display-scale 3.  The kernel reports
+# the same size in GetDisplaySize and scales the canvas up to the panel
+# (xnu/patches/0111-venus-canvas-scale.patch).
+CANVAS_W, CANVAS_H = 1125, 2436
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); probe-verified on venus
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -257,9 +263,15 @@ def build(seed=None, qemu=False, highmem=False, features=()):
         ('crypto-hash-method', cstr('sha2-384')),
         # MobileGestalt's screen class: display-scale (u32, default 0) comes
         # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
-        # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1440x3200 @2x =
-        # 750x1334 points (iPhone 8 class devices).
-        ('display-scale', u32(2)),
+        # SpringBoard's FBSDisplayMode "infxinf@0x" invalid.
+        #
+        # The point size is pixel size / display-scale, and UIKit only has
+        # status bar / layout data for real iPhone screens ("No status bar
+        # visual provider for screen", the red rdar://45025538 bar): 1440x3200
+        # at 2x is 720x1600 points, which no iPhone has. The canvas below is
+        # 1125x2436, so 3x makes it 375x812 points = the iPhone X screen (the
+        # presentation upstream sweet uses, on a 1080x2400 panel).
+        ('display-scale', u32(3)),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
@@ -342,12 +354,24 @@ def build(seed=None, qemu=False, highmem=False, features=()):
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone X size, see SweetFramebuffer.cpp);
         # the kernel's AppleCLCD matches the compatible string.
+        #
+        # The canvas is the size the userland renders at, and it must be the
+        # size the kernel reports in GetDisplaySize (user client selector 8):
+        # the framework builds the render target from the canvas and the
+        # display mode from GetDisplaySize, and if the two disagree
+        # backboardd swaps empty frames (a black panel, no crash) - that is
+        # what the 750x1334 canvas here did.  1125x2436 at display-scale 3 is
+        # 375x812 points = a real iPhone screen (the iPhone X, the
+        # presentation upstream sweet uses on its 1080x2400 panel).  The
+        # panel itself stays 1440x3200 (the ABL splash memory,
+        # boot_args.Video): the kernel scales the canvas up to fill it
+        # (patch 0111).
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1440)),  # 750x1334 -> no swaps on the 1440x3200 panel
-            ('canvas-height', u32(3200)),
+            ('canvas-width', u32(CANVAS_W)),   # 375x812 points at 3x (iPhone X)
+            ('canvas-height', u32(CANVAS_H)),
         ])]
 
     # /arm-io/isp - the camera ISP node (25x "path IODeviceTree:/arm-io/isp

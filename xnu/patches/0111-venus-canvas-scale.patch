@@ -1,0 +1,205 @@
+venus 0111: present the iPhone X canvas (1125x2436 @3x) on the 1440x3200 panel
+
+The userland renders at the "canvas" size (the /arm-io/disp0 canvas-width /
+canvas-height properties, the same ones IOMobileFramebuffer.framework reads)
+and asks the kernel for the display size (user client selector 8,
+GetDisplaySize).  Both have to be the same size: the framework builds the
+render target from the canvas and the display mode (and with it the point
+size = pixel size / /chosen display-scale) from GetDisplaySize.  When they
+disagree, backboardd swaps empty frames - a black panel, no crash, no clue
+(that is what the 750x1334 canvas on venus was).
+
+The canvas is now 1125x2436 (375x812 points at 3x = a real iPhone screen,
+the iPhone X presentation upstream sweet uses; 1440x3200 at 2x would be
+720x1600 points, which no iPhone has).  The panel (the ABL splash memory,
+boot_args.Video) stays 1440x3200: the canvas is scaled up to fill it
+(nearest neighbour, the inverse mapping, so every panel pixel is written).
+sweetfb_letterbox=1 draws the canvas 1:1 centered instead, sweetfb_native=1
+presents the real panel size (1440x3200) as before.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -86,6 +86,19 @@
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
++/*
++ * The canvas is the size the userland renders at; it comes from the device
++ * tree (/arm-io/disp0 canvas-width/canvas-height), the same properties
++ * IOMobileFramebuffer.framework reads. GetDisplaySize(8) must report it:
++ * the framework sizes the render target from the canvas and the display
++ * mode from GetDisplaySize, and if the two disagree backboardd swaps empty
++ * frames (a picture that never appears, no crash).
++ *
++ * The panel (boot_args.Video, the ABL splash memory) can be larger than the
++ * canvas (venus: 1440x3200 panel, 1125x2436 canvas). The canvas is then
++ * scaled up to fill the panel (nearest neighbour); boot-arg
++ * sweetfb_letterbox=1 draws it 1:1 centered instead.
++ */
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -109,6 +122,9 @@
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	uint32_t      fScaleX, fScaleY;         /* panel px per canvas px, 16.16 */
++	uint32_t      fInvScaleX, fInvScaleY;   /* canvas px per panel px, 16.16 */
++	bool          fScaleUp;         /* the canvas is smaller than the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -176,10 +192,43 @@
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+-		fLogicalW = SWEET_FB_LOGICAL_W;
+-		fLogicalH = SWEET_FB_LOGICAL_H;
++	fScaleUp = false;
++	fScaleX = fScaleY = 0;
++	fInvScaleX = fInvScaleY = 0;
++	if (!native) {
++		/*
++		 * The canvas the userland renders at: /arm-io/disp0
++		 * canvas-width/canvas-height (the properties
++		 * IOMobileFramebuffer.framework reads for the same thing).
++		 * GetDisplaySize(8) has to report exactly this size, or the
++		 * render target and the display mode disagree and backboardd
++		 * swaps empty frames (the "no picture, no crash" case).
++		 */
++		OSNumber *cw = OSDynamicCast(OSNumber, provider->getProperty("canvas-width"));
++		OSNumber *ch = OSDynamicCast(OSNumber, provider->getProperty("canvas-height"));
++		if (cw != NULL && ch != NULL) {
++			uint32_t w = cw->unsigned32BitValue();
++			uint32_t h = ch->unsigned32BitValue();
++			if (w > 0 && h > 0) {
++				fLogicalW = w;
++				fLogicalH = h;
++			}
++		} else if (fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++			/* No canvas in the tree: present the iPhone X size. */
++			fLogicalW = SWEET_FB_LOGICAL_W;
++			fLogicalH = SWEET_FB_LOGICAL_H;
++		}
+ 	}
++	int letterbox = 0;
++	PE_parse_boot_argn("sweetfb_letterbox", &letterbox, sizeof(letterbox));
++	if (fLogicalW < fWidth && fLogicalH < fHeight && !letterbox) {
++		/* The canvas is smaller than the panel: scale it up to fill it. */
++		fScaleUp = true;
++		fScaleX = (fWidth << 16) / fLogicalW;
++		fScaleY = (fHeight << 16) / fLogicalH;
++		fInvScaleX = (fLogicalW << 16) / fWidth;
++		fInvScaleY = (fLogicalH << 16) / fHeight;
++	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+@@ -223,8 +272,9 @@
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
++	    fScaleUp ? " (scaled to the panel)" : "");
+ 	return true;
+ }
+ 
+@@ -380,6 +430,94 @@
+ 		}
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
++		}
++		if (fScaleUp) {
++			/*
++			 * The canvas (fLogicalW x fLogicalH) is smaller than the
++			 * panel (fWidth x fHeight): scale it up, nearest
++			 * neighbour. The destination rect is the canvas rect
++			 * scaled; every panel pixel takes the canvas pixel that
++			 * covers it (the inverse mapping), so there are no holes
++			 * and no column is left over.
++			 */
++			if (dx < 0) {
++				sx -= dx;
++				w += dx;
++				dx = 0;
++			}
++			if (dy < 0) {
++				sy -= dy;
++				h += dy;
++				dy = 0;
++			}
++			if (w > (int32_t)fLogicalW - dx) {
++				w = (int32_t)fLogicalW - dx;
++			}
++			if (h > (int32_t)fLogicalH - dy) {
++				h = (int32_t)fLogicalH - dy;
++			}
++			if (w > (int32_t)s->width - sx) {
++				w = (int32_t)s->width - sx;
++			}
++			if (h > (int32_t)s->height - sy) {
++				h = (int32_t)s->height - sy;
++			}
++			if (w <= 0 || h <= 0 || bpe != 4) {
++				s->release();
++				continue;
++			}
++			/* The destination rect, in panel pixels (rounded up, so the
++			 * last panel row/column is written too). */
++			int32_t pdx = (int32_t)(((uint64_t)dx * fScaleX) >> 16);
++			int32_t pdy = (int32_t)(((uint64_t)dy * fScaleY) >> 16);
++			int32_t pw = (int32_t)((((uint64_t)(dx + w) * fScaleX + 0xffff) >> 16)) - pdx;
++			int32_t ph = (int32_t)((((uint64_t)(dy + h) * fScaleY + 0xffff) >> 16)) - pdy;
++			if (pw > (int32_t)fWidth - pdx) {
++				pw = (int32_t)fWidth - pdx;
++			}
++			if (ph > (int32_t)fHeight - pdy) {
++				ph = (int32_t)fHeight - pdy;
++			}
++			if (pw <= 0 || ph <= 0) {
++				s->release();
++				continue;
++			}
++			/* The last source pixel this rectangle reads. */
++			int32_t lastx = sx + (int32_t)(((uint32_t)(pdx + pw - 1) * fInvScaleX) >> 16) - dx;
++			int32_t lasty = sy + (int32_t)(((uint32_t)(pdy + ph - 1) * fInvScaleY) >> 16) - dy;
++			if (lastx >= (int32_t)s->width) {
++				lastx = (int32_t)s->width - 1;
++			}
++			if (lasty >= (int32_t)s->height) {
++				lasty = (int32_t)s->height - 1;
++			}
++			uint64_t last = (uint64_t)s->offset + (uint64_t)lasty * s->bytesPerRow +
++			    (uint64_t)(lastx + 1) * 4;
++			if (s->elementWidth != 1 || s->elementHeight != 1 || s->memory == NULL ||
++			    last > s->memory->getLength()) {
++				s->release();
++				continue;
++			}
++			for (int32_t j = 0; j < ph; j++) {
++				int32_t py = pdy + j;
++				int32_t syy = sy + (int32_t)(((uint32_t)py * fInvScaleY) >> 16) - dy;
++				if (syy < 0 || syy >= (int32_t)s->height) {
++					continue;
++				}
++				const uint32_t *srow = (const uint32_t *)(src + s->offset +
++				    (uint64_t)syy * s->bytesPerRow);
++				uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++				for (int32_t i = 0; i < pw; i++) {
++					int32_t px = pdx + i;
++					int32_t sxx = sx + (int32_t)(((uint32_t)px * fInvScaleX) >> 16) - dx;
++					if (sxx < 0 || sxx >= (int32_t)s->width) {
++						continue;
++					}
++					drow[px] = srow[sxx];
++				}
++			}
++			s->release();
++			continue;
+ 		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
