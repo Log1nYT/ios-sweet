@@ -27,7 +27,7 @@
 #include <sys/systm.h>
 #include <sys/errno.h>
 #include <sys/fcntl.h>
-#include <sys/string.h>
+#include <libkern/libkern.h>
 #include <sys/uio.h>
 #include <sys/vnode.h>
 #include <sys/kauth.h>
@@ -35,6 +35,8 @@
 #include <kern/clock.h>
 #include <kern/sched_prim.h>
 #include <pexpert/pexpert.h>
+
+void sweet_filepatch_init(void);
 
 #define SFP_MAX_PATCH   8
 #define SFP_MAX_BYTES   16
