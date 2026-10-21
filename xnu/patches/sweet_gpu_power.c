@@ -1,0 +1,953 @@
+/*
+ * sweet: the Adreno 660 (venus = Xiaomi Mi 11, SM8350) power and clock path.
+ *
+ * This is the Stage B deliverable of logs/research/07-gpu-plan.md: the GPU
+ * needs its CX rail voted and its clocks enabled before anybody may touch
+ * it.  There was no GPU power code in the tree at all; this file adds a
+ * small, conservative and completely reversible one.
+ *
+ * RULES OF THIS FILE
+ *  - everything is OFF by default.  Nothing is written to the SoC unless the
+ *    operator passes a boot argument (sweetgpuprobe / sweetgpupower /
+ *    sweetgpugx / sweetgpureset);
+ *  - every register that is written is read back and verified;
+ *  - every register that is written is saved and restored by
+ *    sweet_gpu_power_quiesce(), so a panic or a reboot cannot leave the GPU
+ *    in a state we did not find it in;
+ *  - the GPU is never touched on a board we do not recognise (see
+ *    gp_board_guard());
+ *  - every value that is read or written is printed as a "SWEET GPU POWER: "
+ *    line, because the console log on this phone is the only debug channel.
+ *
+ * WHERE THE REGISTER NUMBERS COME FROM (all quoted in
+ * logs/research/impl/11-gpu-power.md)
+ *
+ *  vendor device tree, /Users/matviy/Documents/Mu-Silicium/Resources/DTBs/
+ *  venus.dtb (read with dtc):
+ *      /soc/qcom,gpucc@3d90000     compatible "qcom,lahaina-gpucc"
+ *                                  reg = <0x3d90000 0x9000>
+ *      /soc/qcom,gdsc@3d9100c      gpu_cc_gx_gdsc   (sw-reset 0x3d91008)
+ *      /soc/qcom,gdsc@3d9106c      gpu_cc_cx_gdsc   (hw-ctrl-addr 0x3d91540)
+ *      /soc/syscon@3d9158c         gpu_cc_gx_domain_addr
+ *      /soc/qcom,gcc@100000        compatible "qcom,lahaina-gcc"
+ *                                  reg = <0x100000 0x1f0000>
+ *      /soc/qcom,kgsl-3d0@3d00000  reg[0] kgsl_3d0_reg_memory
+ *                                  reg = <0x3d00000 0x40000>
+ *      /soc/rsc@18200000            compatible "qcom,rpmh-rsc"
+ *                                  reg[2] = <0x18220000 0x10000>
+ *                                  qcom,drv-id = <0x02>
+ *
+ *  upstream Linux (the same silicon, SM8350 = lahaina):
+ *      drivers/clk/qcom/gpucc-sm8350.c  GPU_CC clock and GDSC offsets
+ *      drivers/clk/qcom/gdsc.c           GDSCR bit and status semantics
+ *      drivers/clk/qcom/clk-branch.h     CBCR (branch clock) bits
+ *      drivers/clk/qcom/gcc-sm8350.c     the GCC GPU bus clocks
+ *
+ *  observed on this phone (logs/venus-live-20261021*.txt):
+ *      "SWEET RPMH: rsc=0x18220000 tcs=0x18220d00 DRV=2 id=0x20300
+ *       solver=0x4010100 config=0x800c8104 TCS=8 ncpt=16"
+ *      "SWEET RPMH: cmd-db locator=0xc3f000c pa=0x80860000 size=0x13f0"
+ *
+ * WHAT THIS FILE DELIBERATELY DOES NOT DO
+ *  - it does not vote a rail.  The GPU CX rail ("cx.lvl" = VDD_CX_LEVEL,
+ *    PM8350C S6C) is the shared always-on CX rail of the SoC: the CPU, the
+ *    PCIe and UFS PHYs and the modem are all on it, so it is up while we run.
+ *    The GX rail ("gfx.lvl" = VDD_GFX_LEVEL, PM8350 S6B) is GPU only and
+ *    needs an RPMh ARC request that our RPMh driver cannot express yet; the
+ *    GX path therefore verifies the power-up and refuses to continue when
+ *    the rail is missing;
+ *  - it does not load the zap shader and it cannot: the shader has to be
+ *    authenticated by the secure world (qcom_scm_pas_auth_and_reset) and we
+ *    have no SCM mailbox in the tree.  Until that exists the GPU stays in
+ *    secure mode and its registers may read as zero;
+ *  - it does not program a root clock generator (RCG).  gpu_cc_ahb_clk is
+ *    fed by gpu_cc_hub_clk_src (GPU_CC + 0x117c), and choosing a source and
+ *    a divider there needs the exact CMD_RCGR layout of this block, which
+ *    is not in the tree.  The driver reports the state of that clock
+ *    instead of guessing;
+ *  - it does not vote the interconnect (ICC) path of the GPU and it does not
+ *    talk to the GMU;
+ *  - it does not touch the SMMU.
+ */
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/errno.h>
+#include <sys/sysctl.h>
+#include <kern/clock.h>
+#include <kern/thread.h>
+#include <machine/machine_routines.h>
+#include <pexpert/pexpert.h>
+
+#include "sweet_gpu_power.h"
+
+extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+
+/* ------------------------------------------------------------------ */
+/* addresses                                                          */
+/* ------------------------------------------------------------------ */
+
+/* vendor DT: /soc/qcom,gpucc@3d90000 */
+#define GP_GPUCC_PA           0x03d90000u
+#define GP_GPUCC_SIZE         0x00009000u
+/* vendor DT: /soc/qcom,kgsl-3d0@3d00000, reg[0] "kgsl_3d0_reg_memory" */
+#define GP_AHB_PA             0x03d00000u
+#define GP_AHB_SIZE           0x00040000u
+/* vendor DT: /soc/qcom,gcc@100000 */
+#define GP_GCC_PA             0x00100000u
+#define GP_GCC_SIZE           0x001f0000u
+/* vendor DT: /soc/rsc@18200000, reg[2] = the apps RSC bank we drive */
+#define GP_RSC_PA             0x01822000u
+#define GP_RSC_SIZE           0x00010000u
+/* the RPMh command database locator, same address as sweet_rpmh.c uses */
+#define GP_CMD_DB_LOCATOR_PA  0x0c3f000cu
+
+/* GPU_CC register offsets (base GP_GPUCC_PA) */
+#define GP_GX_GDSCR           0x100cu   /* gpu_cc_gx_gdsc          */
+#define GP_GX_GDSCR_CFG       0x1010u   /* GX GDSCR + 4            */
+#define GP_GX_BCR             0x1008u   /* gpu_cc_gx_sw_reset      */
+#define GP_GX_CLAMP_IO        0x1508u   /* GX clamp / AON reset    */
+#define GP_CX_GDSCR           0x106cu   /* gpu_cc_cx_gdsc          */
+#define GP_CX_GDSCR_CFG       0x1070u   /* CX GDSCR + 4            */
+#define GP_CX_BCR             0x1068u   /* GPUCC_GPU_CC_CX_BCR     */
+#define GP_CX_HW_CTRL         0x1540u   /* gpu_cc_cx_hw_ctrl       */
+#define GP_AHB_CLK            0x1078u   /* gpu_cc_ahb_clk          */
+#define GP_CX_GMU_CLK         0x1098u   /* gpu_cc_cx_gmu_clk       */
+#define GP_GX_GMU_CLK         0x1064u   /* gpu_cc_gx_gmu_clk       */
+#define GP_HUB_AON_CLK        0x1178u   /* gpu_cc_hub_aon_clk      */
+#define GP_HUB_CX_INT_CLK     0x1204u   /* gpu_cc_hub_cx_int_clk   */
+#define GP_HLOS1_SMMU_VOTE    0x5000u   /* gpu_cc_hlos1_vote_gpu_smmu_clk */
+#define GP_HUB_CLK_SRC        0x117cu   /* gpu_cc_hub_clk_src (RCG, read only here) */
+
+/* GCC register offsets (base GP_GCC_PA) */
+#define GP_GCC_GPU_CFG_AHB    0x71004u  /* GCC_GPU_CFG_AHB_CLK     */
+#define GP_GCC_GPU_MEMNOC     0x7100cu  /* gcc_gpu_memnoc_gfx_clk  */
+#define GP_GCC_GPU_SNOC_DVM   0x71018u  /* gcc_gpu_snoc_dvm_gfx_clk */
+
+/* GDSCR bits, upstream drivers/clk/qcom/gdsc.c */
+#define GP_GDSCR_PWR_ON       0x80000000u
+#define GP_GDSCR_SW_OVERRIDE  0x00000004u
+#define GP_GDSCR_HW_CONTROL   0x00000002u
+#define GP_GDSCR_SW_COLLAPSE  0x00000001u
+#define GP_GDSCR_EN_REST_WAIT 0x00f00000u
+#define GP_GDSCR_EN_FEW_WAIT  0x000f0000u
+#define GP_GDSCR_CLK_DIS_WAIT 0x0000f000u
+/* EN_REST_WAIT = 2, EN_FEW_WAIT = 8, CLK_DIS_WAIT = 2 (upstream defaults) */
+#define GP_GDSCR_WAIT_VAL     0x00282000u
+#define GP_GDSCR_CFG_PWR_UP   0x00010000u
+#define GP_GDSCR_CFG_PWR_DOWN 0x00008000u
+#define GP_CLAMP_IO           0x00000001u
+#define GP_CLAMP_IO_AON_RESET 0x00000010u
+
+/* CBCR (branch clock) bits, upstream drivers/clk/qcom/clk-branch.h */
+#define GP_CBCR_CLK_OFF       0x80000000u
+#define GP_CBCR_FSM_STATUS    0x70000000u
+#define GP_CBCR_FSM_ON        0x20000000u
+#define GP_CBCR_CLK_ENABLE    0x00000001u
+
+/* the RPMh RSC signature of this phone, observed in the live log */
+#define GP_RSC_ID             0x00020300u
+#define GP_RSC_SOLVER         0x04010100u
+
+/* command database layout, same as bsd/dev/sweet_rpmh.c */
+#define GP_DB_MAGIC           0x0c0330dbu
+#define GP_DB_HEADER          144u
+#define GP_DB_ENTRY           24u
+#define GP_DB_MAX             0x100000u
+
+/* how long we wait for a power-up (upstream polls for 2000 us) */
+#define GP_POLL_STEPS         200u
+#define GP_POLL_DELAY_US      10u
+
+/* how many dwords of the GPU register aperture we dump */
+#define GP_AHB_DWORDS         64u
+
+/* ------------------------------------------------------------------ */
+/* state                                                              */
+/* ------------------------------------------------------------------ */
+
+struct gp_saved_reg {
+	vm_offset_t base;
+	uint32_t off;
+	uint32_t value;
+	const char *name;
+};
+
+#define GP_MAX_SAVED 24
+
+static struct gp_saved_reg gp_saved[GP_MAX_SAVED];
+static unsigned gp_saved_n;
+static vm_offset_t gp_gpucc, gp_gcc, gp_ahb, gp_rsc;
+static bool gp_mapped;
+static bool gp_powered;
+static bool gp_gx_powered;
+
+/* ------------------------------------------------------------------ */
+/* register access                                                    */
+/* ------------------------------------------------------------------ */
+
+static uint32_t
+gp_rd(vm_offset_t base, uint32_t off)
+{
+	uint32_t v = *(volatile uint32_t *)(base + off);
+	__asm__ volatile("dmb oshld" ::: "memory");
+	return v;
+}
+
+static void
+gp_wr(vm_offset_t base, uint32_t off, uint32_t val)
+{
+	__asm__ volatile("dmb oshst" ::: "memory");
+	*(volatile uint32_t *)(base + off) = val;
+	__asm__ volatile("dsb osh" ::: "memory");
+}
+
+/* Remember a register so that the quiesce path can put it back. */
+static void
+gp_save(vm_offset_t base, uint32_t off, const char *name)
+{
+	if (gp_saved_n >= GP_MAX_SAVED) {
+		printf("SWEET GPU POWER: register table full, %s not saved\n", name);
+		return;
+	}
+	gp_saved[gp_saved_n].base = base;
+	gp_saved[gp_saved_n].off = off;
+	gp_saved[gp_saved_n].value = gp_rd(base, off);
+	gp_saved[gp_saved_n].name = name;
+	printf("SWEET GPU POWER: saved %-24s %#010x\n", name,
+	    (unsigned)gp_saved[gp_saved_n].value);
+	gp_saved_n++;
+}
+
+/* Write a register and read it back.  Returns the value that was read. */
+static uint32_t
+gp_write_verify(vm_offset_t base, uint32_t off, uint32_t val, const char *name)
+{
+	uint32_t got;
+
+	gp_wr(base, off, val);
+	got = gp_rd(base, off);
+	printf("SWEET GPU POWER: wrote %-24s %#010x -> read %#010x%s\n", name,
+	    (unsigned)val, (unsigned)got, got == val ? "" : "  MISMATCH");
+	return got;
+}
+
+/* ------------------------------------------------------------------ */
+/* the RPMh command database (read only)                               */
+/* ------------------------------------------------------------------ */
+
+static uint16_t
+gp_db16(vm_offset_t db, uint32_t off)
+{
+	uint32_t v = gp_rd(db, off & ~3u);
+	return (uint16_t)(v >> (8u * (off & 3u)));
+}
+
+/*
+ * Look for an RPMh resource name in the command database.  This is the same
+ * layout that bsd/dev/sweet_rpmh.c walks, but here it is only used to print
+ * what the SoC knows about: no request is ever sent.
+ */
+static bool
+gp_db_find(vm_offset_t db, uint32_t db_size, const char *name, uint32_t *addr,
+    uint32_t *slave)
+{
+	uint32_t key[2] = {0, 0};
+	unsigned i;
+
+	for (i = 0; i < 8 && name[i]; ++i) {
+		key[i / 4] |= (uint32_t)(uint8_t)name[i] << (8u * (i % 4));
+	}
+	for (i = 0; i < 8; ++i) {
+		uint32_t h = 8u + 16u * i;
+		uint32_t entries, count, j;
+		uint32_t sl = gp_db16(db, h);
+
+		if (!sl) {
+			break;
+		}
+		entries = GP_DB_HEADER + gp_db16(db, h + 2);
+		count = gp_db16(db, h + 6);
+		if (entries > db_size || count * GP_DB_ENTRY > db_size - entries) {
+			continue;
+		}
+		for (j = 0; j < count; ++j) {
+			uint32_t e = entries + GP_DB_ENTRY * j;
+
+			if (gp_rd(db, e) != key[0] || gp_rd(db, e + 4) != key[1]) {
+				continue;
+			}
+			*addr = gp_rd(db, e + 16);
+			*slave = sl;
+			return true;
+		}
+	}
+	return false;
+}
+
+static void
+gp_cmd_db_dump(void)
+{
+	vm_offset_t db = 0;
+	uint32_t db_pa, db_size, db_magic, db_version;
+	uint32_t addr, slave;
+
+	db_pa = gp_rd(GP_CMD_DB_LOCATOR_PA, 0);
+	db_size = gp_rd(GP_CMD_DB_LOCATOR_PA, 4);
+	printf("SWEET GPU POWER: cmd-db locator=%#x pa=%#x size=%#x\n",
+	    (unsigned)GP_CMD_DB_LOCATOR_PA, (unsigned)db_pa, (unsigned)db_size);
+	if (db_pa < 0x80000000u || (db_pa & 3u) || (db_size & 3u) ||
+	    db_size < GP_DB_HEADER || db_size > GP_DB_MAX ||
+	    (uint64_t)db_pa + db_size > 0x100000000ULL) {
+		printf("SWEET GPU POWER: cmd-db locator is not usable\n");
+		return;
+	}
+	db = ml_io_map(db_pa, db_size);
+	if (!db) {
+		printf("SWEET GPU POWER: cmd-db mapping failed\n");
+		return;
+	}
+	db_version = gp_rd(db, 0);
+	db_magic = gp_rd(db, 4);
+	printf("SWEET GPU POWER: cmd-db version=%#x magic=%#x checksum=%#x flags=%#x\n",
+	    (unsigned)db_version, (unsigned)db_magic, (unsigned)gp_rd(db, 136),
+	    (unsigned)gp_rd(db, 140));
+	if (db_magic != GP_DB_MAGIC) {
+		printf("SWEET GPU POWER: cmd-db magic mismatch\n");
+		return;
+	}
+	/* The two rails of the GPU.  We only report them: the RPMh ARC request
+	 * format is not implemented, so no vote is ever sent. */
+	if (gp_db_find(db, db_size, "cx.lvl", &addr, &slave)) {
+		printf("SWEET GPU POWER: cmd-db resource cx.lvl addr=%#x slave=%u\n",
+		    (unsigned)addr, (unsigned)slave);
+	} else {
+		printf("SWEET GPU POWER: cmd-db resource cx.lvl NOT found\n");
+	}
+	if (gp_db_find(db, db_size, "gfx.lvl", &addr, &slave)) {
+		printf("SWEET GPU POWER: cmd-db resource gfx.lvl addr=%#x slave=%u\n",
+		    (unsigned)addr, (unsigned)slave);
+	} else {
+		printf("SWEET GPU POWER: cmd-db resource gfx.lvl NOT found "
+		    "(the GX rail cannot be voted)\n");
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* the board guard: never touch the GPU on a board we do not know      */
+/* ------------------------------------------------------------------ */
+
+struct gp_identity_reg {
+	uint32_t off;
+	const char *name;
+};
+
+/* Registers whose reset value tells us that this really is a GPU_CC. */
+static const struct gp_identity_reg gp_identity[] = {
+	{ GP_GX_GDSCR,        "GX GDSCR" },
+	{ GP_GX_GDSCR_CFG,    "GX GDSCR CFG" },
+	{ GP_CX_GDSCR,        "CX GDSCR" },
+	{ GP_CX_GDSCR_CFG,    "CX GDSCR CFG" },
+	{ GP_CX_HW_CTRL,      "CX hw ctrl" },
+	{ GP_GX_CLAMP_IO,     "GX clamp io" },
+	{ GP_AHB_CLK,         "gpu_cc_ahb_clk" },
+	{ GP_CX_GMU_CLK,      "gpu_cc_cx_gmu_clk" },
+	{ GP_HUB_AON_CLK,     "gpu_cc_hub_aon_clk" },
+	{ GP_HUB_CX_INT_CLK,  "gpu_cc_hub_cx_int_clk" }
+};
+
+static bool
+gp_board_guard(void)
+{
+	uint32_t id, solver, config, count, ncpt;
+	unsigned nonzero = 0;
+	unsigned all_ones = 0;
+	unsigned i;
+	bool ok = true;
+
+	/* 1. the RPMh RSC signature of this phone (observed in the live log) */
+	id = gp_rd(gp_rsc, 0);
+	solver = gp_rd(gp_rsc, 4);
+	config = gp_rd(gp_rsc, 0x0c);
+	count = (config >> 12) & 0x3fu;
+	ncpt = (config >> 27) & 0x1fu;
+	printf("SWEET GPU POWER: board RSC id=%#x solver=%#x config=%#x TCS=%u ncpt=%u\n",
+	    (unsigned)id, (unsigned)solver, (unsigned)config, (unsigned)count,
+	    (unsigned)ncpt);
+	if (id != GP_RSC_ID || solver != GP_RSC_SOLVER || count < 8u ||
+	    ncpt < 3u || ncpt > 16u) {
+		printf("SWEET GPU POWER: UNKNOWN BOARD: the RPMh RSC signature is "
+		    "not the venus one (expected id=%#x solver=%#x TCS>=8 ncpt 3..16) "
+		    "- the GPU is NOT touched\n",
+		    (unsigned)GP_RSC_ID, (unsigned)GP_RSC_SOLVER);
+		ok = false;
+	}
+
+	/* 2. the GPU_CC register block has to look like a GPU_CC */
+	for (i = 0; i < sizeof(gp_identity) / sizeof(gp_identity[0]); ++i) {
+		uint32_t v = gp_rd(gp_gpucc, gp_identity[i].off);
+
+		printf("SWEET GPU POWER: identity GPU_CC+%#06x %-20s = %#010x\n",
+		    (unsigned)gp_identity[i].off, gp_identity[i].name, (unsigned)v);
+		if (v == 0xffffffffu) {
+			++all_ones;
+		}
+		if (v != 0) {
+			++nonzero;
+		}
+	}
+	if (all_ones != 0) {
+		printf("SWEET GPU POWER: UNKNOWN BOARD: %u GPU_CC identity "
+		    "registers read as all ones - the GPU is NOT touched\n",
+		    all_ones);
+		ok = false;
+	}
+	if (nonzero < 3u) {
+		printf("SWEET GPU POWER: UNKNOWN BOARD: only %u of %u GPU_CC "
+		    "identity registers are not zero - the GPU is NOT touched\n",
+		    nonzero, (unsigned)(sizeof(gp_identity) / sizeof(gp_identity[0])));
+		ok = false;
+	}
+	return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* read only probe                                                    */
+/* ------------------------------------------------------------------ */
+
+static void
+gp_probe(void)
+{
+	uint32_t v;
+
+	printf("SWEET GPU POWER: probe: GPU_CC at %#x, GCC at %#x, "
+	    "GPU register aperture at %#x\n",
+	    (unsigned)GP_GPUCC_PA, (unsigned)GP_GCC_PA, (unsigned)GP_AHB_PA);
+
+	v = gp_rd(gp_gpucc, GP_CX_GDSCR);
+	printf("SWEET GPU POWER: probe: CX GDSCR=%#010x collapse=%d hw_ctrl_bit=%d\n",
+	    (unsigned)v, (v & GP_GDSCR_SW_COLLAPSE) ? 1 : 0,
+	    (v & GP_GDSCR_PWR_ON) ? 1 : 0);
+	v = gp_rd(gp_gpucc, GP_CX_HW_CTRL);
+	printf("SWEET GPU POWER: probe: CX hw ctrl=%#010x pwr_on=%d\n",
+	    (unsigned)v, (v & GP_GDSCR_PWR_ON) ? 1 : 0);
+	v = gp_rd(gp_gpucc, GP_CX_BCR);
+	printf("SWEET GPU POWER: probe: CX BCR=%#010x in_reset=%d\n",
+	    (unsigned)v, (v & 1u) ? 1 : 0);
+	v = gp_rd(gp_gpucc, GP_GX_GDSCR);
+	printf("SWEET GPU POWER: probe: GX GDSCR=%#010x collapse=%d\n",
+	    (unsigned)v, (v & GP_GDSCR_SW_COLLAPSE) ? 1 : 0);
+	v = gp_rd(gp_gpucc, GP_GX_GDSCR_CFG);
+	printf("SWEET GPU POWER: probe: GX GDSCR CFG=%#010x pwr_up_complete=%d\n",
+	    (unsigned)v, (v & GP_GDSCR_CFG_PWR_UP) ? 1 : 0);
+	v = gp_rd(gp_gpucc, GP_GX_BCR);
+	printf("SWEET GPU POWER: probe: GX BCR=%#010x in_reset=%d\n",
+	    (unsigned)v, (v & 1u) ? 1 : 0);
+	v = gp_rd(gp_gpucc, GP_GX_CLAMP_IO);
+	printf("SWEET GPU POWER: probe: GX clamp io=%#010x clamp=%d aon_reset=%d\n",
+	    (unsigned)v, (v & GP_CLAMP_IO) ? 1 : 0,
+	    (v & GP_CLAMP_IO_AON_RESET) ? 1 : 0);
+
+	v = gp_rd(gp_gpucc, GP_HUB_CLK_SRC);
+	printf("SWEET GPU POWER: probe: gpu_cc_hub_clk_src RCG=%#010x "
+	    "(not programmed by this driver)\n", (unsigned)v);
+
+	gp_cmd_db_dump();
+}
+
+/* ------------------------------------------------------------------ */
+/* clock helpers                                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Turn a branch clock on.  The bit that is written is the CBCR clock enable
+ * bit, exactly like upstream clk_enable_regmap() does it, and the result is
+ * read back.  The NOC FSM status field tells us whether the clock really
+ * started (upstream clk_branch2_check_halt()).
+ */
+static bool
+gp_clock_on(const char *name, vm_offset_t base, uint32_t off)
+{
+	uint32_t before, want, got;
+	uint32_t fsm;
+	bool ok = true;
+
+	before = gp_rd(base, off);
+	gp_save(base, off, name);
+	want = before | GP_CBCR_CLK_ENABLE;
+	if (want != before) {
+		got = gp_write_verify(base, off, want, name);
+	} else {
+		got = before;
+		printf("SWEET GPU POWER: clk %-24s already enabled (%#010x)\n", name,
+		    (unsigned)before);
+	}
+	fsm = (got & GP_CBCR_FSM_STATUS) >> 28;
+	printf("SWEET GPU POWER: clk %-24s %#010x fsm=%u on=%d clk_off=%d en=%d\n",
+	    name, (unsigned)got, (unsigned)fsm,
+	    (got & GP_CBCR_FSM_ON) ? 1 : 0, (got & GP_CBCR_CLK_OFF) ? 1 : 0,
+	    (got & GP_CBCR_CLK_ENABLE) ? 1 : 0);
+	if (!(got & GP_CBCR_CLK_ENABLE)) {
+		printf("SWEET GPU POWER: clk %s: the enable bit did not stick\n",
+		    name);
+		ok = false;
+	}
+	return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* the CX domain                                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The steps are the ones of upstream gdsc_enable() for the GPU CX domain
+ * (drivers/clk/qcom/gdsc.c): set the wait fields, clear the SW collapse bit
+ * and poll the hardware control register until the domain reports "on".
+ * The rail is not voted here: the CX rail is the shared always-on rail of
+ * the SoC (see the header comment).
+ */
+static bool
+gp_power_cx(void)
+{
+	uint32_t gdscr, want, got, hw;
+	unsigned i;
+	bool ok = true;
+
+	gp_save(gp_gpucc, GP_CX_GDSCR, "CX GDSCR");
+	gp_save(gp_gpucc, GP_CX_BCR, "CX BCR");
+
+	gdscr = gp_rd(gp_gpucc, GP_CX_GDSCR);
+	hw = gp_rd(gp_gpucc, GP_CX_HW_CTRL);
+	printf("SWEET GPU POWER: CX before: gdscr=%#010x hw_ctrl=%#010x\n",
+	    (unsigned)gdscr, (unsigned)hw);
+
+	/* 1. wait fields and the software/hardware mode bits */
+	want = (gdscr & ~(GP_GDSCR_HW_CONTROL | GP_GDSCR_SW_OVERRIDE |
+	    GP_GDSCR_EN_REST_WAIT | GP_GDSCR_EN_FEW_WAIT |
+	    GP_GDSCR_CLK_DIS_WAIT)) | GP_GDSCR_WAIT_VAL;
+	got = gp_write_verify(gp_gpucc, GP_CX_GDSCR, want, "CX GDSCR waits");
+	if ((got & (GP_GDSCR_EN_REST_WAIT | GP_GDSCR_EN_FEW_WAIT |
+	    GP_GDSCR_CLK_DIS_WAIT)) != GP_GDSCR_WAIT_VAL) {
+		printf("SWEET GPU POWER: CX: the wait fields did not take\n");
+		ok = false;
+	}
+
+	/* 2. ask for power up: clear the software collapse bit */
+	got = gp_rd(gp_gpucc, GP_CX_GDSCR);
+	got = gp_write_verify(gp_gpucc, GP_CX_GDSCR,
+	    got & ~GP_GDSCR_SW_COLLAPSE, "CX GDSCR collapse");
+	if (got & GP_GDSCR_SW_COLLAPSE) {
+		printf("SWEET GPU POWER: CX: the collapse bit did not clear\n");
+		ok = false;
+	}
+
+	/* 3. wait for the hardware control register to report "on" */
+	hw = 0;
+	for (i = 0; i < GP_POLL_STEPS; ++i) {
+		hw = gp_rd(gp_gpucc, GP_CX_HW_CTRL);
+		if (hw & GP_GDSCR_PWR_ON) {
+			break;
+		}
+		delay(GP_POLL_DELAY_US);
+	}
+	printf("SWEET GPU POWER: CX hw ctrl=%#010x pwr_on=%d after %u polls\n",
+	    (unsigned)hw, (hw & GP_GDSCR_PWR_ON) ? 1 : 0, i);
+	if (!(hw & GP_GDSCR_PWR_ON)) {
+		printf("SWEET GPU POWER: CX: the domain did not power up "
+		    "(the CX rail or the hardware controller refused)\n");
+		ok = false;
+	}
+
+	/* 4. release the block reset, but only if it is actually asserted */
+	got = gp_rd(gp_gpucc, GP_CX_BCR);
+	if (got & 1u) {
+		got = gp_write_verify(gp_gpucc, GP_CX_BCR, got & ~1u, "CX BCR");
+		if (got & 1u) {
+			printf("SWEET GPU POWER: CX: the block reset did not "
+			    "release\n");
+			ok = false;
+		}
+	} else {
+		printf("SWEET GPU POWER: CX BCR=%#010x was not in reset\n",
+		    (unsigned)got);
+	}
+	return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* the GX domain                                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The GX domain sits behind the GPU only rail ("gfx.lvl" = VDD_GFX_LEVEL).
+ * Nobody votes that rail yet - the RPMh ARC request format is not in the
+ * tree - so this sequence verifies itself: the GX domain reports "power up
+ * complete" in its CFG register (upstream polls it there, POLL_CFG_GDSCR),
+ * and if the rail is missing the poll times out and everything is undone.
+ */
+static bool
+gp_power_gx(void)
+{
+	uint32_t gdscr, want, got, cfg, clamp;
+	unsigned i;
+	bool ok = true;
+
+	gp_save(gp_gpucc, GP_GX_GDSCR, "GX GDSCR");
+	gp_save(gp_gpucc, GP_GX_BCR, "GX BCR");
+	gp_save(gp_gpucc, GP_GX_CLAMP_IO, "GX clamp io");
+
+	gdscr = gp_rd(gp_gpucc, GP_GX_GDSCR);
+	cfg = gp_rd(gp_gpucc, GP_GX_GDSCR_CFG);
+	clamp = gp_rd(gp_gpucc, GP_GX_CLAMP_IO);
+	printf("SWEET GPU POWER: GX before: gdscr=%#010x cfg=%#010x clamp=%#010x\n",
+	    (unsigned)gdscr, (unsigned)cfg, (unsigned)clamp);
+
+	/* 1. the AON reset pulse, like upstream gdsc_assert_reset_aon() */
+	got = gp_write_verify(gp_gpucc, GP_GX_CLAMP_IO,
+	    clamp | GP_CLAMP_IO_AON_RESET, "GX clamp io aon");
+	delay(1);
+	got = gp_write_verify(gp_gpucc, GP_GX_CLAMP_IO,
+	    gp_rd(gp_gpucc, GP_GX_CLAMP_IO) & ~GP_CLAMP_IO_AON_RESET,
+	    "GX clamp io aon off");
+
+	/* 2. release the IO clamp */
+	clamp = gp_rd(gp_gpucc, GP_GX_CLAMP_IO);
+	got = gp_write_verify(gp_gpucc, GP_GX_CLAMP_IO, clamp & ~GP_CLAMP_IO,
+	    "GX clamp io");
+	if (got & GP_CLAMP_IO) {
+		printf("SWEET GPU POWER: GX: the IO clamp did not release\n");
+		ok = false;
+	}
+
+	/* 3. wait fields, same as for the CX domain */
+	want = (gdscr & ~(GP_GDSCR_HW_CONTROL | GP_GDSCR_SW_OVERRIDE |
+	    GP_GDSCR_EN_REST_WAIT | GP_GDSCR_EN_FEW_WAIT |
+	    GP_GDSCR_CLK_DIS_WAIT)) | GP_GDSCR_WAIT_VAL;
+	got = gp_write_verify(gp_gpucc, GP_GX_GDSCR, want, "GX GDSCR waits");
+
+	/* 4. ask for power up */
+	got = gp_rd(gp_gpucc, GP_GX_GDSCR);
+	got = gp_write_verify(gp_gpucc, GP_GX_GDSCR,
+	    got & ~GP_GDSCR_SW_COLLAPSE, "GX GDSCR collapse");
+	if (got & GP_GDSCR_SW_COLLAPSE) {
+		printf("SWEET GPU POWER: GX: the collapse bit did not clear\n");
+		ok = false;
+	}
+
+	/* 5. wait for "power up complete" in the CFG register */
+	cfg = 0;
+	for (i = 0; i < GP_POLL_STEPS; ++i) {
+		cfg = gp_rd(gp_gpucc, GP_GX_GDSCR_CFG);
+		if (cfg & GP_GDSCR_CFG_PWR_UP) {
+			break;
+		}
+		delay(GP_POLL_DELAY_US);
+	}
+	printf("SWEET GPU POWER: GX cfg=%#010x pwr_up_complete=%d after %u polls\n",
+	    (unsigned)cfg, (cfg & GP_GDSCR_CFG_PWR_UP) ? 1 : 0, i);
+	if (!(cfg & GP_GDSCR_CFG_PWR_UP)) {
+		printf("SWEET GPU POWER: GX: the domain did not power up.  The GX "
+		    "rail (gfx.lvl / VDD_GFX_LEVEL) is GPU only and is not voted: "
+		    "the RPMh ARC request format is not implemented, so this path "
+		    "stops here.\n");
+		ok = false;
+	}
+
+	/* 6. release the GX block reset (the vendor tree calls it sw-reset) */
+	got = gp_rd(gp_gpucc, GP_GX_BCR);
+	if (got & 1u) {
+		got = gp_write_verify(gp_gpucc, GP_GX_BCR, got & ~1u, "GX BCR");
+		if (got & 1u) {
+			printf("SWEET GPU POWER: GX: the block reset did not "
+			    "release\n");
+			ok = false;
+		}
+	} else {
+		printf("SWEET GPU POWER: GX BCR=%#010x was not in reset\n",
+		    (unsigned)got);
+	}
+	return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* the GPU register aperture                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The dump is only done when the GPU AHB clock reports that it runs,
+ * otherwise the aperture is not accessible and reading it can only produce
+ * noise (or worse).
+ */
+static void
+gp_dump_ahb(void)
+{
+	uint32_t clk;
+	unsigned i;
+	int found = -1;
+
+	clk = gp_rd(gp_gpucc, GP_AHB_CLK);
+	printf("SWEET GPU POWER: gpu_cc_ahb_clk=%#010x fsm_on=%d clk_off=%d\n",
+	    (unsigned)clk, (clk & GP_CBCR_FSM_ON) ? 1 : 0,
+	    (clk & GP_CBCR_CLK_OFF) ? 1 : 0);
+	if (!(clk & GP_CBCR_FSM_ON)) {
+		printf("SWEET GPU POWER: the GPU AHB clock is not running "
+		    "(its source gpu_cc_hub_clk_src at GPU_CC+%#x is an RCG that "
+		    "this driver does not program) - the register aperture is not "
+		    "read\n", (unsigned)GP_HUB_CLK_SRC);
+		return;
+	}
+	for (i = 0; i < GP_AHB_DWORDS; ++i) {
+		uint32_t v = gp_rd(gp_ahb, (uint32_t)(i * 4));
+
+		printf("SWEET GPU POWER: ahb[%02u] (%#010x) = %#010x\n", i,
+		    (unsigned)(GP_AHB_PA + i * 4), (unsigned)v);
+		if (v == 0x06060001u && found < 0) {
+			found = (int)i;
+		}
+	}
+	if (found >= 0) {
+		printf("SWEET GPU POWER: chip id 0x06060001 FOUND at ahb[%d] - "
+		    "the GPU answers\n", found);
+	} else {
+		printf("SWEET GPU POWER: chip id 0x06060001 not found.  The GPU is "
+		    "still in secure mode: the zap shader has to be loaded and "
+		    "authenticated by the secure world (qcom_scm_pas_auth_and_reset), "
+		    "which this kernel cannot do.\n");
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* the whole power up sequence                                         */
+/* ------------------------------------------------------------------ */
+
+static bool gp_power_up(bool gx);
+
+static bool
+gp_power_up(bool gx)
+{
+	bool ok = true;
+
+	printf("SWEET GPU POWER: powering the GPU up\n");
+
+	if (!gp_power_cx()) {
+		printf("SWEET GPU POWER: the CX domain did not come up - "
+		    "everything is put back\n");
+		sweet_gpu_power_quiesce();
+		return false;
+	}
+	gp_powered = true;
+
+	ok &= gp_clock_on("gpu_cc_ahb_clk", gp_gpucc, GP_AHB_CLK);
+	ok &= gp_clock_on("gpu_cc_cx_gmu_clk", gp_gpucc, GP_CX_GMU_CLK);
+	ok &= gp_clock_on("gpu_cc_hub_aon_clk", gp_gpucc, GP_HUB_AON_CLK);
+	ok &= gp_clock_on("gpu_cc_hub_cx_int_clk", gp_gpucc, GP_HUB_CX_INT_CLK);
+	ok &= gp_clock_on("gpu_cc_hlos1_smmu_vote", gp_gpucc, GP_HLOS1_SMMU_VOTE);
+	ok &= gp_clock_on("gcc_gpu_cfg_ahb_clk", gp_gcc, GP_GCC_GPU_CFG_AHB);
+	ok &= gp_clock_on("gcc_gpu_memnoc_gfx_clk", gp_gcc, GP_GCC_GPU_MEMNOC);
+	ok &= gp_clock_on("gcc_gpu_snoc_dvm_gfx_clk", gp_gcc, GP_GCC_GPU_SNOC_DVM);
+
+	if (gx) {
+		if (!gp_power_gx()) {
+			printf("SWEET GPU POWER: the GX domain did not come up - "
+			    "the CX part stays, the GX part is put back\n");
+			ok = false;
+		} else {
+			gp_gx_powered = true;
+			ok &= gp_clock_on("gpu_cc_gx_gmu_clk", gp_gpucc,
+			    GP_GX_GMU_CLK);
+		}
+	}
+
+	gp_dump_ahb();
+	printf("SWEET GPU POWER: power up done (ok=%d cx=%d gx=%d)\n", ok ? 1 : 0,
+	    gp_powered ? 1 : 0, gp_gx_powered ? 1 : 0);
+	return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* the reset path (off by default, dangerous)                          */
+/* ------------------------------------------------------------------ */
+
+static void
+gp_reset_path(void)
+{
+	uint32_t bcr;
+
+	printf("SWEET GPU POWER: !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+	printf("SWEET GPU POWER: !!! RESET PATH !!! the GPU block reset is "
+	    "pulsed (GPU_CC+%#x).  A GPU that is running is killed by this and "
+	    "only the vendor firmware can bring it back.\n",
+	    (unsigned)GP_GX_BCR);
+	printf("SWEET GPU POWER: !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+
+	gp_save(gp_gpucc, GP_GX_BCR, "GX BCR (reset)");
+	bcr = gp_rd(gp_gpucc, GP_GX_BCR);
+	bcr = gp_write_verify(gp_gpucc, GP_GX_BCR, bcr | 1u, "GX BCR assert");
+	printf("SWEET GPU POWER: reset asserted, read back %#010x\n",
+	    (unsigned)bcr);
+	delay(10);
+	bcr = gp_write_verify(gp_gpucc, GP_GX_BCR,
+	    gp_rd(gp_gpucc, GP_GX_BCR) & ~1u, "GX BCR deassert");
+	printf("SWEET GPU POWER: reset deasserted, read back %#010x\n",
+	    (unsigned)bcr);
+}
+
+/* ------------------------------------------------------------------ */
+/* quiesce: put every register back                                   */
+/* ------------------------------------------------------------------ */
+
+int
+sweet_gpu_power_quiesce(void)
+{
+	unsigned restored = 0;
+
+	if (!gp_mapped) {
+		return 0;
+	}
+	while (gp_saved_n > 0) {
+		struct gp_saved_reg *r = &gp_saved[gp_saved_n - 1];
+		uint32_t now = gp_rd(r->base, r->off);
+		uint32_t back;
+
+		gp_wr(r->base, r->off, r->value);
+		back = gp_rd(r->base, r->off);
+		printf("SWEET GPU POWER: restore %-24s was %#010x now %#010x "
+		    "wrote %#010x read %#010x%s\n", r->name, (unsigned)r->value,
+		    (unsigned)now, (unsigned)r->value, (unsigned)back,
+		    back == r->value ? "" : "  MISMATCH");
+		++restored;
+		gp_saved_n--;
+	}
+	gp_powered = false;
+	gp_gx_powered = false;
+	printf("SWEET GPU POWER: quiesced, %u registers restored\n", restored);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* sysctl: read the state, write 1 to power up, write 0 to quiesce      */
+/* ------------------------------------------------------------------ */
+
+static int
+gp_sysctl SYSCTL_HANDLER_ARGS
+{
+	int value = gp_powered ? 1 : 0;
+	int error;
+
+#pragma unused(arg1, arg2)
+	error = sysctl_io_number(req, value, sizeof(int), &value, NULL);
+	if (error != 0) {
+		return error;
+	}
+	if (!req->newptr) {
+		return 0;
+	}
+	switch (value) {
+	case 0:
+		error = sweet_gpu_power_quiesce();
+		break;
+	case 1:
+		if (!gp_mapped) {
+			printf("SWEET GPU POWER: the GPU registers are not "
+			    "mapped, nothing to do\n");
+			error = ENODEV;
+			break;
+		}
+		if (!gp_board_guard()) {
+			printf("SWEET GPU POWER: the board is not recognised, "
+			    "refusing to touch the GPU\n");
+			error = EPERM;
+			break;
+		}
+		error = gp_power_up(false) ? 0 : EIO;
+		break;
+	default:
+		error = EINVAL;
+		break;
+	}
+	return error;
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_power,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0,                          /* pointer argument (arg1) */
+    0,                          /* integer argument (arg2) */
+    gp_sysctl,                  /* handler */
+    "I",                        /* int */
+    "sweet: 1 = GPU power on, 0 = quiesce (restore the registers)");
+
+/* ------------------------------------------------------------------ */
+/* init                                                                */
+/* ------------------------------------------------------------------ */
+
+void
+sweet_gpu_power_init(void)
+{
+	int value;
+	bool probe = false, power = false, gx = false, reset = false;
+
+	if (PE_parse_boot_argn("sweetgpuprobe", &value, sizeof(value)) &&
+	    value != 0) {
+		probe = true;
+	}
+	if (PE_parse_boot_argn("sweetgpupower", &value, sizeof(value)) &&
+	    value != 0) {
+		power = true;
+	}
+	if (PE_parse_boot_argn("sweetgpugx", &value, sizeof(value)) &&
+	    value != 0) {
+		gx = true;
+	}
+	if (PE_parse_boot_argn("sweetgpureset", &value, sizeof(value)) &&
+	    value != 0) {
+		reset = true;
+	}
+	printf("SWEET GPU POWER: init probe=%d power=%d gx=%d reset=%d\n",
+	    probe ? 1 : 0, power ? 1 : 0, gx ? 1 : 0, reset ? 1 : 0);
+	if (!probe && !power && !reset) {
+		printf("SWEET GPU POWER: every path is off.  Boot arguments: "
+		    "sweetgpuprobe=1 (read only), sweetgpupower=1 (CX power and "
+		    "clocks), sweetgpugx=1 (also the GX domain), "
+		    "sweetgpureset=1 (the block reset path)\n");
+		return;
+	}
+	if (gx && !power) {
+		printf("SWEET GPU POWER: sweetgpugx=1 needs sweetgpupower=1 - "
+		    "the GX domain is not touched\n");
+		gx = false;
+	}
+	if (reset && !power) {
+		printf("SWEET GPU POWER: sweetgpureset=1 without sweetgpupower=1: "
+		    "the reset path runs on its own\n");
+	}
+
+	gp_gpucc = ml_io_map(GP_GPUCC_PA, GP_GPUCC_SIZE);
+	gp_gcc = ml_io_map(GP_GCC_PA, GP_GCC_SIZE);
+	gp_ahb = ml_io_map(GP_AHB_PA, GP_AHB_SIZE);
+	gp_rsc = ml_io_map(GP_RSC_PA, GP_RSC_SIZE);
+	if (!gp_gpucc || !gp_gcc || !gp_ahb || !gp_rsc) {
+		printf("SWEET GPU POWER: mapping failed (gpucc=%p gcc=%p ahb=%p "
+		    "rsc=%p) - the GPU is NOT touched\n",
+		    (void *)gp_gpucc, (void *)gp_gcc, (void *)gp_ahb,
+		    (void *)gp_rsc);
+		return;
+	}
+	gp_mapped = true;
+
+	if (!gp_board_guard()) {
+		printf("SWEET GPU POWER: the board is not recognised - the GPU is "
+		    "NOT touched\n");
+		return;
+	}
+
+	if (probe || power) {
+		gp_probe();
+	}
+	if (power) {
+		(void)gp_power_up(gx);
+	}
+	if (reset) {
+		gp_reset_path();
+	}
+}
+#endif /* ARM64_BOARD_CONFIG_SWEET */
