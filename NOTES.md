@@ -1,3 +1,158 @@
+## >>> 2026-10-21 19:55 GPU STAGE C RESEARCH: THE ADreno 660 REGISTER MAP AND COMMAND STREAM ARE KNOWN, NOT GUESSED <<<
+
+**New report: `logs/research/26b-gpu-command-stream.md` (+ the sources it cites in `logs/research/gpu5/`, 2.2 MB of text).**
+
+- **The register map is settled.** Upstream Linux now ships the a6xx register map as XML
+  (`drivers/gpu/drm/msm/registers/adreno/a6xx.xml`) and CAF's own `a6xx_reg.h` (the phone's driver)
+  has **the same offsets, value for value** — 53/53 cross-checked registers agree. No guessing needed.
+- **Addressing model:** a register index is a *dword* index; CPU address = `0x3d00000 + (index << 2)`
+  (`msm_gpu.h:651`). The 256 KiB AHB window = 0x10000 dword indices = the whole GPU register space.
+  Blocks: CP 0x08xx, RBBM 0x00xx/0x02xx, GRAS 0x86xx, RB 0x88xx, VPC 0x96xx, VFD 0xa6xx, SP 0xaexx,
+  TPL1 (tiler) 0xb3xx, UCHE 0x0exx, VBIF 0x30xx, GBIF 0x3cxx, GMU 0x1a8xx+.
+- **`GPU_CTRL`, `RBBM_CONTROL`, `SC_*`, `VB_*` do NOT exist on a6xx** (they are A2xx-A5xx names).
+  The a6xx equivalents are `RBBM_*`, `SP_*`, `VPC_*`/`VFD_*`/`VSC_*`, `TPL1_*`.
+- **The command stream is PM4** (TYPE0/2/3/4/7). `CP_CONTEXT_REG_BUNCH`=0x5c (a6xx register writes),
+  `CP_MEM_WRITE`=0x3d, `CP_INDIRECT_BUFFER`=0x3f, `CP_LOAD_STATE4`=0x30. **There is no header field that
+  selects the block on a6xx** — the 16-bit register index inside the packet does (the prompt's
+  "block selected by the header word" is true only for A2xx-A5xx).
+- **Open questions (8) + a one-boot, read-only measurement plan** are in the report §7/§8: read
+  `RBBM_STATUS` 0x0210, `RBBM_INT_0_STATUS` 0x0201, `CP_RB_BASE/WPTR` 0x0800/0x0807,
+  `VBIF_VERSION` 0x3000, `GBIF_HALT` 0x3c45, one `ADDR_MODE_CNTL` per block, and the GMU
+  always-on counter. Five of the eight questions are answered by a single boot with **no writes**.
+- **The real Stage-C blocker is not the register map — it is the SQE/zap firmware** (the DT has no
+  `zap-shader` node; without the CP microcode no command will run). TODO-2/TODO-3 in the report.
+- Rule adopted for all GPU work: **every register offset/opcode gets a `file:line` citation**, and
+  load-bearing values need two independent sources.
+
+## >>> VENUS: v43 = NEW CI KERNEL WITH SELF-REBOOT + ACTIVATION (2026-10-21 18:55) <<<
+
+**STATE: image `shim/out/shim-boot-venus-v43.img` (SHA256 `ee05ec39ec92b559d2931085fc0bf313ca72af9b487eb3789f4eee8b0782eeae`) is BUILT and waiting for one power-cycle. The Mac-side supervisor boots it by itself the moment the phone appears in fastboot.**
+
+### What changed since the 17:55 handoff
+- **Research wave 1 finished**: 27 reports in `logs/research/01..28-*.md` (RE of the daemon reply path, the Hactivation decision path, the data-ark format, the client requirements, the dsc pipeline, battery/power, GPU, camera, sensors/HID, connectivity, stability, daily-driver plan, RE toolkit, fast build loop, the HFS+ create bug, the offline image workflow, audio, the IOKit gap inventory, touch, USB, SEP absence, performance, networking, the upstream backlog, autoboot without a Mac, thermal, the capability matrix).
+- **Implementation wave 2 landed** (patch numbers after 0101): 0102 self-reboot into fastboot, 0103 display stays on, 0104 real battery from the PMIC (SPMI SID 3, BCL v5), 0110 journaled HFS+ root, 0111 iPhone-sized canvas.
+- **CI run 39626374060 built the new kernel** (`logs/ci-39626374060/kernel.development.sweet`, SHA `d6b75fb297f23ba891c5d91643d6995f49d1b4da5a8cba27fb0e96ca29777623`) with 0102/0103/0104/0110/0111 in it. `tools/research/check-patch-order.py` reports `103 of 104 patches applied` (only the long-broken 0012 fails, it has never applied in any CI run).
+- **0090-venus-battery.patch was removed** (it was never committed and it conflicted with 0104, which supersedes it).
+
+### The activation path is now fully mapped (three independent RE reports agree)
+- The client's `MobileActivation.framework` is a **thin XPC relay**: `MAEGetActivationStateWithError` -> `_getActivationStateThroughMAD` -> `-[MadGate getActivationState:]`. It does **not** verify any Apple signature. So a daemon-side lie is enough.
+- The real daemon path is `-[MobileActivationDaemon getActivationStateWithCompletionBlock:]` @ mh+**0x41dd0**. The gate that produced "Unavailable" (not "Unactivated") is the `DataMigrationCompleted` check at mh+**0x41e2c** (reports 01 and 03). The nil fallback at **0x41e94** is "Unactivated".
+- The native Apple escape hatch is **Hactivation**: `-[DeviceType should_hactivate]` (getter @ mh+**0x170d4**) gates a branch @ mh+**0x1b5a0**/**0x1b5d0** that logs *"Hactivation is enabled, short circuiting activation state to Activated."*, sets `ActivationState=Activated`, `BrickState=false` and **never loads an activation record** (report 02).
+- The **client also caches** the state at the first read and SpringBoard additionally needs the purplebuddy prefs `SetupDone=true` / `SetupFinishedAllSteps=true` / `SetupVersion=11`. `BYBuddyIOSCurrentVersion` for iOS 16.7 was read out of the dyld shared cache (SetupAssistant.framework, `_BYBuddyIOSCurrentVersion` @ 0x1a3b20228) = **11** - exactly the value the kernel preset writes (report 04).
+
+### v43 cmdline (589 B of 607)
+```
+sweetlog=0 sweetscan=- sweetsetupfix=1 sweetfb_force_on=1
+sweetfilepatch=mad:170d4:00484039:20008052   # should_hactivate -> 1
+                mad:1b5d0:e0030034:1f2003d5   # always take the Hactivation branch
+                mad:41e2c:76050036:1f2003d5   # drop the DataMigrationCompleted gate
+                mad:41e94:000545f9:000845f9   # nil fallback -> "Activated"
+                mad:4629c:a00c0036:1f2003d5   # never report "device is not activated"
+                mad:462cc:f50c00b4:1f2003d5   # do not error out on a nil record
+sweetfiledump=mad:170d4:8,mad:1b5d0:8,mad:41e2c:8,<purplebuddy.plist>:0:96
+```
+Local binary edits on the CI kernel (no CI run needed, the kernel image is not signed):
+- `vnode_setattr` call @ vaddr 0xfffffe00074f1c58 -> `nop` (it deadlocked against cfprefsd).
+- the daemon path literal `/private/usr/libexec/mobileactivationd` -> `/usr/libexec/mobileactivationd` (there is no `/private` on our root).
+- the preset's data-ark path -> `/nonexistent/ark` so the kernel **never creates a file** (creating is what corrupted the volume).
+- `sweetlog=0`: the persistent console ring was written into the **tail of the root volume** every 10 s - that alone can wreck the HFS+ metadata (report 15). The live UDP stream is a RAM ring and is unaffected.
+
+### The phone state right now
+- The phone is **hung in the v41 boot** (console silent since 18:01, but it still enumerates on USB as "Sweet iOS _USB Ethernet_"). v41 was a zero-write diagnostic image, so nothing is corrupted by it.
+- The Mac **OOM-killed the `fastboot` client twice** ("Killed: 9") - that is why v38/v39/v40 never actually booted. The thumbnail agents were killed; free memory now.
+- The supervisor (`tools/venus-supervisor.sh`, rewritten) boots the newest image whenever fastboot appears, keeps the UDP logger alive, asks the phone to reset itself when the console goes quiet, and reports to Telegram.
+
+### Next concrete actions
+1. One power-cycle (Vol- + Power) -> the supervisor boots v43 automatically -> check the log for `SWEET FILEPATCH: ... PATCHED`, the purplebuddy dump, and whether Setup/SpringBoard still ask for activation.
+2. If v43 reaches the home screen: make it permanent with `tools/venus-persist-boot.sh` (`fastboot flash boot_b` + `set_active b`, slot a untouched) - **needs the user's OK, it is destructive**.
+3. With 0102 in the running kernel the phone can reset itself into fastboot on a UDP datagram to 192.168.7.2:5141 -> from then on the Mac drives the phone with no human in the loop.
+
+## >>> VENUS: CLIENT NEEDS THE ACTIVATION RECORD, NOT JUST THE STATE (2026-10-21 15:05) <<<
+
+**STATE: patch 0101 (AKS returns an activation record) building in CI 39596537168.**
+- **The client wants a record, not just the state.** Even with the daemon forced to report `Activated` (6 byte patches) and Setup.app no longer running, SpringBoard still shows the activation screen. The reply the client (MobileActivation.framework in the dyld cache) gets must carry an **ActivationRecord** (key 0x215b38) as well as `ActivationState`.
+- **Where the record comes from:** mobileactivationd reads it from the **key store** (libaks selector 43, 1 scalar + 12-byte struct in, 32 KB out) - our emulated AppleKeyStore answered `kIOReturnNotFound`, and the daemon logged `Failed to create data ark.` (the directory `/private/var/mobile/Library/mad/` does not exist on the phone) and never got a record.
+- **Patch 0101** (`iokit/Kernel/arm/SweetKeyStore.cpp`): selector 43 now returns a property list with `ActivationState = Activated` (+ BrickState/BuildVersion/ProductVersion/DataMigrationCompleted/PreSydroDataMigrationCompleted and empty FairPlay blobs), so the daemon can hand a record to the client.
+- **Second wall found: we cannot create files on the phone.** The kernel file writer (patch 0100 `sweetsetupfix=1`) writes the three sweet preferences fine (`err 0` - they existed and cfprefsd re-reads them: the dumped purplebuddy.plist came back as a binary plist with our keys), but writing a **new** file (`/var/mobile/Library/Preferences/mad.plist`) **hangs the thread** - our own sweet_hfs driver (patch 0026/0052) deadlocks on the create path (suspect: vnode_setattr with va_data_size/ownership on a fresh inode, or the create itself). The v29a test (same kernel, no daemon path patch) printed nothing -> the thread is stuck in that write, not in the daemon.
+- **Consequence:** the data-ark route needs either the HFS+ create path fixed or the ark written over an existing file; the **AKS route avoids files completely** and is what 0101 tries first.
+- **Still open:** what exactly the client validates in the record (the daemon's `verify_activation_record` / `verify_activation_record_certificates` may reject our empty FairPlay blobs - if the AKS record is fetched but the screen stays, the next step is to patch the daemon's verification to return success).
+
+## >>> VENUS: UMD "early boot setup" IS THE ACTIVATION SCREEN (2026-10-21 14:10) <<<
+
+**STATE: the activation screen is UserManagerDaemon's early-boot setup, not Setup.app. Patch 0100 now writes the sweet setup-skip prefs (CI 39589630645, commit 4507c78).**
+- **What upstream sweet does** (dipa-studio/ios-sweet): README says `| Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status |`; `tools/sweet-root-tweaks.py` (upstream) skips Setup with **preferences** and seeds the **data ark**:
+  - `com.apple.purplebuddy.plist`: `SetupDone=True, SetupFinishedAllSteps=True, SetupVersion=11, daemonizeNeedsToRun=False`
+  - `com.apple.purplebuddy.notbackedup.plist`: all `ShouldRun*MiniBuddy=False`, `SilentICDPUpgrade=False`
+  - `com.apple.managedconfiguration.notbackedup.plist`: `LockdownActivationIndicatesCloudConfigurationAvailable=False`
+  - `com.apple.springboard.plist`: `BKNoWatchdogs=True`, `MCForceShowCloudConfigurationUI=False`
+  - data ark: `<system container>/Library/internal/data_ark.plist` = `-ActivationState Activated`, `-BrickState False`, BuildVersion/ProductVersion, `DataMigrationCompleted`, `PreSydroDataMigrationCompleted`
+  - ADT /chosen (we already have them): certificate-production-status 0, effective-production-status-ap 0, certificate-security-mode 1, effective-security-mode-sep 1.
+- **On venus the screen comes from UserManagerDaemon**: the log shows `****** STARTING EARLYBOOT SETUP **** / UMD_INIT: Regular mode Setup for user:501` and SpringBoard shows `SBCoverSheetPrimarySlidingViewController`. Setup.app itself already does **not** run any more (our daemon patches).
+- **Why the prefs do not help yet:** the phone rewrites `com.apple.purplebuddy.plist` itself - the dumped file has `SetupVersion`=21, `SetupFinishedAllSteps`=19, `SetupLaunchSentinel_`, `MagnifierTipKitSeen` and **no `SetupDone` key at all** (upstream's sweet file has SetupDone=true). The file is a binary plist; the object table starts at 0x15, bools at 0x6b/0x6c/0x6d.
+- **mobileactivationd patches (6, all applied and persistent in /usr/libexec/mobileactivationd on the phone):**
+  | off | what | bytes |
+  |---|---|---|
+  | 0x2127c | DataArk default state -> "Activated" | 030545f9 -> 030945f9 |
+  | 0x5a18  | ignore the stored state (copy 1) | d30000b5 -> 1f2003d5 |
+  | 0x5a24  | nil fallback state (copy 1) | 000545f9 -> 000945f9 |
+  | 0x5a44  | force the activated branch (copy 1) | 600d0036 -> 1f2003d5 |
+  | 0x24de0 | ignore the stored state (reply path) | 360100b5 -> 1f2003d5 |
+  | 0x24dec | nil fallback state (reply path) | 000545f9 -> 000945f9 |
+  The state is read in **two** places (0x1000059c0 and the reply builder 0x1000231a0) - patching only the first one changes nothing, that is why v22/v24 did not move the screen.
+- **Patch 0100 grew a file writer**: `sweetfileset`-style writes plus the built-in preset **`sweetsetupfix=1`** (writes the three pref files as XML plists, uid/gid 501 mode 0600, and the data ark into /private/var/mobile/Library/mad/ and the system container path). The image is `shim/out/shim-boot-venus-v28.img` (CI 39589630645, commit 4507c78).
+- **Data ark does not exist on the phone** (both candidate paths ENOENT) and the daemon's own container lookup is broken, so the daemon cannot create it - hence the preset writes it directly.
+- **Remember:** the patcher refuses to re-apply a patch whose "old" bytes are missing (it logs MISMATCH) - the daemon patches are already in the file, so they must NOT be listed again (or the old bytes updated).
+
+## >>> RESEARCH / IMPLEMENTATION WAVES (2026-10-21 17:55) <<<
+
+**User plan: after the research wave, launch ~100 IMPLEMENTATION agents (write the features), then ~100 AUDIT agents.**
+- **Wave 1 - research (27 agents, launched 17:40-17:55, reports in logs/research/01..27-*.md):**
+  01 mad reply path (XPC reply construction + byte patches) | 02 Hactivation decision (DT props) | 03 data ark format + validation chain | 04 client-side activation requirements (public write-ups) | 05 dsc extraction pipeline for iOS 16.7 | 06 power/battery/charging | 07 GPU plan | 08 camera plan | 09 sensors/HID | 10 connectivity (Wi-Fi/NFC/GNSS/modem) | 11 stability audit | 12 daily-driver plan | 13 RE toolkit | 14 fast local compile loop | 15 HFS+ create corruption bug | 16 offline image workflow | 17 audio plan | 18 IOKit gap inventory | 19 touch driver improvements | 20 USB plan | 21 SEP absence analysis | 22 performance budget | 23 networking plan | 24 upstream backlog | 25 autoboot without a Mac | 26 thermal plan | 27 capability matrix.
+- **Wave 2 - implementation (~100 agents, to be launched when wave 1 reports land):** each agent implements ONE concrete item from the reports and writes (a) the code/patch under a distinct path (xnu/patches/01xx-*.patch, bsd/dev/sweet_*.c, tools/...) and (b) logs/research/impl/<slug>.md with what it changed and how to test it. No two agents may touch the same file.
+- **Wave 3 - audit (~100 agents):** each reviews one implementation from wave 2 (correctness, races, code-signing/AMFI, HFS+ safety, boot-time cost, whether it can be delivered by the kernel file patcher) and writes logs/research/audit/<slug>.md with a verdict and concrete fixes.
+- **Rules for the waves:** every agent writes its report to a file (durable), returns a <=15-line summary, touches ONLY its own files, and never flashes/erases the phone.
+- **Phone state:** after the 17:16 experiment (creating /var/db/ark.plist) the HFS+ volume went inconsistent and the phone panicked. Safe image to boot while the research runs: **shim-boot-venus-v35.img** (pristine daemon, no file writes). The file-create path must stay disabled until agent 15 finds the HFS+ bug.
+
+## >>> VENUS ACTIVATION BYPASS WORKED (2026-10-21 13:35) <<<
+
+**STATE: activation screen is gone, SpringBoard runs, touch works. v22b booted.**
+- **v22b image** `shim/out/shim-boot-venus-v22b.img` (SHA256 `f4411af8c8a25a1b…`) = CI kernel `39583408437` (commit `a641ec4`) with ONE local byte patch in the kernel binary: the literal `/private/usr/libexec/mobileactivationd` -> `/usr/libexec/mobileactivationd` (same length, NUL padded). **Patching a string inside the built kernel image works and needs no CI run** - the kernel image is not signature-checked.
+- **Boot log** `logs/venus-live-20261021l.txt` (the UDP logger `tools/venus-udplog.py` never connects, so it survives reboots; the old `nc -ukl` connected to the first sender and silently dropped every later boot):
+  ```
+  SWEET FILEPATCH: /usr/libexec/mobileactivationd@0x2127c PATCHED (err 0)
+  SWEET FILEPATCH: /usr/libexec/mobileactivationd@0x5a24  PATCHED (err 0)
+  SWEET FILEPATCH: /usr/libexec/mobileactivationd@0x5a18  PATCHED (err 0)
+  SWEET FILEPATCH: /usr/libexec/mobileactivationd@0x5a44  PATCHED (err 0)
+  ```
+  -> **`exec Setup` is GONE** and **no `SWEET AKS: mobileactivationd sel 43` call** (the daemon no longer needs the activation record from AKS), `exec SpringBoard` present, `SWEET FB: display on`.
+- **Touch works** (v18 ST FTS driver): `controller ready` -> `mapping 1 selected (fw)` -> `sense-on sent` -> `polling FIFO` -> `ev 43 …`; a real tap produced `SWEET HID: touch 0 down at 515,2235`.
+- **The 4 activation patches** (mobileactivationd 20H392, file offset == mh offset):
+  | off | what | old -> new |
+  |---|---|---|
+  | 0x2127c | DataArk default state | `ldr x3,[x8,#0xa08]` -> `#0xa10` ("Activated") |
+  | 0x5a18  | `cbnz` (use stored state) | `d30000b5` -> `1f2003d5` (nop) |
+  | 0x5a24  | nil fallback state | `ldr x0,[x8,#0xa08]` -> `#0xa10` |
+  | 0x5a44  | `tbz` (not-activated branch) | `600d0036` -> `1f2003d5` (nop) |
+- **Next:** confirm the home screen on the panel, then check touch accuracy (coordinates 515,2235 for a tap near the bottom), then the remaining walls: battery/charging, camera, GPU, Wi-Fi (dead chip), sensors, NFC.
+- **Reminder:** the kernel patches the file on EVERY boot, so the fake activation survives reboots as long as we boot our own kernel.
+
+## >>> VENUS ACTIVATION BYPASS (2026-10-21 12:45) <<<
+
+**STATE: patch 0100 (kernel file patcher) written, CI building. Goal: fake "Activated" without SEP.**
+- **Situation:** v20 (Claude) made the phone reachable over the network (0097/0099 default route + Mac NAT), and Setup moved to `com.apple.onboarding.activation.bundle`, but `mobileactivationd` fails at the **AKS** step: `SWEET AKS: mobileactivationd sel 43 arg0 -1 in 1/12 out 0/32768 -> 0xe00002c7` (kIOReturnNotFound). No real activation is possible (no SEP, no baseband), so the only way to the home screen is a **local fake activation**.
+- **Key constraint:** the iOS userdata image is gone from the Mac, so userland changes can only be delivered **by the kernel** -> new patch **0100-sweet-file-patch.patch** (`bsd/dev/sweet_file_patch.c`): patches bytes in a file on the mounted root volume via `vnode_open` + `vn_rdwr`, driven by the boot arg
+  `sweetfilepatch=<path>:<off>:<oldhex>:<newhex>[,...]` (old bytes verified before writing; path alias `mad` = /private/usr/libexec/mobileactivationd). Hooked in `bsd/dev/sweet_ufs.c` init (rootdev), retries every second until the volume is mounted.
+- **Static analysis of mobileactivationd 20H392** (`logs/mobileactivationd-20H392.bin`, file offset == mh offset):
+  - CFString constant pool at 0x100215a08: `Unactivated` = slot 0x215a08, `Activated` = 0x215a10, `FactoryActivated` = 0x215a18; keys `ActivationState` = 0x215b60, `ActivationRecord` = 0x215b38, `LastActivated` = 0x215b68.
+  - **site A** mh+0x2127c: `ldr x3,[x8,#0xa08]` -> stores `ActivationState = Unactivated` into the DataArk defaults (key loaded at 0x21270).
+  - **site B** mh+0x5a24: `ldr x0,[x8,#0xa08]` -> the nil fallback for the state read (compared with "Activated" at 0x5a38, `tbz w0,#0` at 0x5a44 -> the "not activated" path).
+  - Bytes: A `03 05 45 f9` -> `03 09 45 f9`, B `00 05 45 f9` -> `00 09 45 f9` (imm12 0x141 -> 0x142).
+  - The "activated" path also fetches the **activation record** from AKS (function at mh+0x17740 -> the AKS call) and puts it in the reply; if that fails the reply may still be an error -> possible follow-up patch: NOP the `cbz x27` at mh+0x5af4, or make the kernel AKS return a synthetic record.
+- **Planned cmdline (558 B, limit 607):** the v20 cmdline minus `sweetteeconnect=`, `sweetteeopenok=1`, `sweetteewrite=` plus
+  `sweetfilepatch=mad:2127c:030545f9:030945f9,mad:5a24:000545f9:000945f9`.
+- **CI:** first attempt 39577712535 failed: `sys/string.h` does not exist in xnu (use `<libkern/libkern.h>`). Fixed in commit `2e0f963`; CI run **39579017043** building. Image will be `shim/out/shim-boot-venus-v21.img` (built by `logs/build-v21.sh`).
+- **Remember:** restart the `nc -ukl 5140` listener before every boot (it stays connected to the previous boot's UDP source port) and power-cycle the phone into fastboot by hand.
+
 ## 2026-10-21: USB-Ethernet as a real network path (Wi-Fi chip is dead)
 
 Wi-Fi hardware on this unit is burned out, so official Setup activation over
