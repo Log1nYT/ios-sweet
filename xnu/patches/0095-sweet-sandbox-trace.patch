@@ -1,0 +1,75 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..146ef01 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -35,6 +35,8 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
++#include <pexpert/pexpert.h>
++#include <sys/malloc.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -285,9 +287,60 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++/*
++ * DIAG (boot-arg sweetteewrite=name,name, shared with 0091/0092): every Sandbox
++ * mac_syscall of a named process is printed with its op and the first 48 bytes
++ * of the argument block, so the layout of op 4 (container path) etc. can be read
++ * off the live log. Capped at 400 lines.
++ */
++static void
++sweet_sandbox_trace(struct proc *p, int call, user_addr_t arg)
++{
++	static char names[128];
++	static int parsed, budget = 400;
++	char name[32];
++	uint8_t raw[48];
++
++	if (!parsed) {
++		names[0] = '\0';
++		(void)PE_parse_boot_argn("sweetteewrite", names, sizeof(names));
++		parsed = 1;
++	}
++	if (names[0] == '\0' || budget <= 0) {
++		return;
++	}
++	proc_name(proc_pid(p), name, sizeof(name));
++	size_t nl = strlen(name);
++	bool match = false;
++	for (const char *t = names; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == nl && nl > 0 && strncmp(t, name, nl) == 0) {
++			match = true;
++			break;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	if (!match) {
++		return;
++	}
++	budget--;
++	memset(raw, 0, sizeof(raw));
++	int cerr = copyin(arg, raw, sizeof(raw));
++	printf("SWEET Sandbox: |%s| op %d arg=%#llx copyin=%d raw=", name, call, (unsigned long long)arg, cerr);
++	for (size_t i = 0; i < sizeof(raw); i++) {
++		printf("%02x", raw[i]);
++	}
++	printf("\n");
++}
++
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
++	sweet_sandbox_trace(p, call, arg);
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+ 		char name[32];
