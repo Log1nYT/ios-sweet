@@ -447,6 +447,8 @@ static const struct {
 	    sfp_ark, 501, 501, 0600 },
 };
 
+static int sfp_setupfix_err[sizeof(sfp_setupfix) / sizeof(sfp_setupfix[0])];
+
 /* Write the setup-skipping preferences and the activation record. */
 static void
 sfp_setupfix_run(void)
@@ -455,8 +457,19 @@ sfp_setupfix_run(void)
 		int err = sfp_write_file(sfp_setupfix[i].path, sfp_setupfix[i].data,
 		    (uint32_t)strlen(sfp_setupfix[i].data), sfp_setupfix[i].uid,
 		    sfp_setupfix[i].gid, sfp_setupfix[i].mode);
+		sfp_setupfix_err[i] = err;
 		printf("SWEET SETUPFIX: %s -> %s (err %d)\n", sfp_setupfix[i].path,
 		    err == 0 ? "written" : "FAILED", err);
+	}
+}
+
+/* Repeat the status for a while: the console log only comes up later. */
+static void
+sfp_setupfix_report(void)
+{
+	for (unsigned int i = 0; i < sizeof(sfp_setupfix) / sizeof(sfp_setupfix[0]); i++) {
+		printf("SWEET SETUPFIX: %s -> %s (err %d)\n", sfp_setupfix[i].path,
+		    sfp_setupfix_err[i] == 0 ? "written" : "FAILED", sfp_setupfix_err[i]);
 	}
 }
 
@@ -470,8 +483,19 @@ sfp_thread(void *arg, wait_result_t result)
 
 	{
 		int fix = 0;
+		/*
+		 * Wait for the USB console log to come up before we do the
+		 * work: prints from this early in the boot are lost, and we
+		 * need to see whether the writes worked.
+		 */
 		if (PE_parse_boot_argn("sweetsetupfix", &fix, sizeof(fix)) && fix) {
+			delay(20 * 1000 * 1000);
 			sfp_setupfix_run();
+			for (int r = 0; r < 6; r++) {
+				delay(5 * 1000 * 1000);
+				sfp_setupfix_run();
+				sfp_setupfix_report();
+			}
 		}
 	}
 	if (sfp_dump_spec[0] != '\0') {
