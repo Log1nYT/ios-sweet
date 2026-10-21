@@ -193,7 +193,7 @@ sweet_gpu_dump(void)
 	printf("\n");
 	printf("SWEET GPU: id bytes[0..7]=");
 	for (i = 0; i < 8; ++i) {
-		printf("%02x%s", gpu_rd(gpu_ahb_base, i) & 0xffu,
+		printf("%02x%s", (gpu_rd(gpu_ahb_base, i & ~3u) >> (8 * (i & 3u))) & 0xffu,
 		    (i == 7) ? "" : " ");
 	}
 	printf("\n");
