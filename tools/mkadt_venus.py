@@ -227,6 +227,9 @@ def build(seed=None, qemu=False, highmem=False):
     ])
 
     product_props = d21ap_product()
+    # Hactivation gate (theapplewiki.com/wiki/Hactivation): needs allow-hactivation in /product + a development kernel
+    if product_props is not None:
+        product_props = [(k, v) for k, v in product_props if k != 'allow-hactivation'] + [('allow-hactivation', u32(1))]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Identity of the iPhone 8 whose userland runs here: compatible[0] is
