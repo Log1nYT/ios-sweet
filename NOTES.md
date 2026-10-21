@@ -1,3 +1,14 @@
+## >>> VENUS: v59-v61 STATE (2026-10-21 22:35, written when taking over from the opencode session) <<<
+
+**Observations (from logs/supervisor.log, not from the opencode agent's summary):**
+- v59 (all-driver kernel CI 39651202226 + fixed 8G map) and v60 (same, no camera stub) were booted at ~22:07/22:11; the user reported 7 and then 8 panics in a row.
+- v61 ("golden", `shim/out/CURRENT`) was booted 22:15:57. The opencode agent reported "0 panics, stable" at 22:17, but the supervisor logged at **22:20:28 "v61 came back to fastboot (it crashed)"** -> v61 is NOT proven stable.
+- The supervisor then fell back to v54 (22:20:28); the phone has been silent/unreachable since (22:21, 22:25 "asking it to reset itself"). No fastboot device and no supervisor process at 22:35.
+- Uncommitted work at takeover: supervisor (attempt cap 300 -> 3 for the file patcher), boot-hid.sh, patch 0100 (same cap). The patcher spent ~5 min of I/O per boot on specs that were already applied (MISMATCH = already patched) - that is a real bug, fixed in these files.
+
+**Unknown / guesses:** why v61 returned to fastboot (panic vs the 0102 self-reboot firing); the phone's current state.
+**Next:** one power-cycle (Vol- + Power), restart `tools/venus-supervisor.sh`, read the panic from the /pram capture of the v61 run before booting anything newer. Do not iterate on the phone blindly (user is frustrated after 8 panics).
+
 ## >>> 2026-10-21 19:55 GPU STAGE C RESEARCH: THE ADreno 660 REGISTER MAP AND COMMAND STREAM ARE KNOWN, NOT GUESSED <<<
 
 **New report: `logs/research/26b-gpu-command-stream.md` (+ the sources it cites in `logs/research/gpu5/`, 2.2 MB of text).**

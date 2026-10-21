@@ -25,7 +25,7 @@ IMG_DIR=${IMG_DIR:-shim/out}
 LOG=${LOG:-logs/venus-live-20261021l.txt}
 TG=${TG:-/Users/matviy/.venus-tg/send.sh}
 STALE=${STALE:-180}           # seconds of console silence before we act
-CHECK=${CHECK:-8}            # poll interval
+CHECK=${CHECK:-3}            # poll interval
 HEARTBEAT=${HEARTBEAT:-600}  # telegram heartbeat
 PHONE_IP=${PHONE_IP:-192.168.7.2}
 REBOOT=${REBOOT:-1}
@@ -65,6 +65,7 @@ last_stale=0
 booted_img=""
 last_booted=""
 last_boot_ts=0
+boots_same=0
 while :; do
 	# 1. the console listener must be alive
 	if ! pgrep -f 'venus-udplog.py' >/dev/null 2>&1; then
@@ -76,24 +77,45 @@ while :; do
 	# 2. phone in fastboot -> boot the newest image
 	if in_fastboot && [ "$BOOT" = "1" ]; then
 		img=$(newest_image)
-		if [ -n "$img" ] && [ "$img" = "$last_booted" ] && [ $(( $(date +%s) - last_boot_ts )) -lt 900 ]; then
-			# we already booted this exact image less than 15 minutes ago and it
-			# came back to fastboot on its own -> it crashed.  Do not loop.
-			log "$img already booted $(( $(date +%s) - last_boot_ts ))s ago and it returned to fastboot -> NOT rebooting it again (crash loop guard)"
-			tg "venus-sweet: образ $(basename "$img") впав і сам повернувся у fastboot -> не перезавантажую його повторно (захист від циклу). Потрібен нший образ."
-			sleep 60
-		elif [ -n "$img" ]; then
+		# An image that came back to fastboot within 10 minutes of being
+		# booted is BAD (it crashed).  Walk down the list to the next image
+		# instead of looping on the same one - that way one power-cycle can
+		# test several images in a row.
+		if [ -n "$img" ] && [ "$img" = "$last_booted" ] && [ $(( $(date +%s) - last_boot_ts )) -lt 600 ]; then
+			next=$(ls -t "$IMG_DIR"/shim-boot-venus-*.img 2>/dev/null | awk -v b="$(basename "$img")" 'p==1{print; exit} $0 ~ b"$"{p=1}')
+			log "$(basename "$img") came back to fastboot (it crashed) -> trying $(basename "${next:-none}")"
+			tg "venus-sweet: образ $(basename "$img") впав -> пробую $(basename "${next:-none}")"
+			img="$next"
+		fi
+		if [ -n "$img" ]; then
 			log "fastboot detected -> booting $img"
 			tg "venus-sweet: телефон у fastboot -> завантажую $(basename "$img")"
 			# The ABL wedges after a long standby: a fastboot command can hang
 			# forever.  Bound it, and if the phone does not answer afterwards,
 			# tell the user that a power-cycle is needed.
-			( fastboot boot "$img" >/tmp/venus-fb.log 2>&1 ) & fbp=$!
-			( sleep 90; kill -9 $fbp 2>/dev/null ) & wd=$!
-			wait $fbp 2>/dev/null
-			kill $wd 2>/dev/null
+			# The ABL wedges after it has been sitting in fastboot for a
+			# while ("usb_write failed with status e00002c0"), so retry a
+			# couple of times: a fresh ABL answers.
+			ok=0
+			for try in 1 2 3; do
+				( fastboot boot "$img" >/tmp/venus-fb.log 2>&1 ) & fbp=$!
+				( sleep 40; kill -9 $fbp 2>/dev/null ) & wd=$!
+				wait $fbp 2>/dev/null
+				kill $wd 2>/dev/null
+				if grep -q "Booting.*OKAY" /tmp/venus-fb.log 2>/dev/null; then
+					ok=1; break
+				fi
+				log "fastboot boot attempt $try failed: $(tail -1 /tmp/venus-fb.log 2>/dev/null)"
+				sleep 5
+			done
 			tail -2 /tmp/venus-fb.log 2>/dev/null | sed 's/^/    fastboot: /'
+			[ "$ok" = "0" ] && log "could not boot $img even after 3 attempts"
 			booted_img="$img"
+			if [ "$img" = "$last_booted" ]; then
+				boots_same=$(( boots_same + 1 ))
+			else
+				boots_same=1
+			fi
 			last_booted="$img"
 			last_boot_ts=$(date +%s)
 			sleep 5
