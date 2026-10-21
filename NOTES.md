@@ -1,5 +1,15 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> v18b-act BOOT RESULT + NEXT (2026-10-21 08:40) <<<
+
+- First v18b attempt was dead (no USB/display): I wrapped `shim/out/Image.gz` (7 KB, bare shim) instead of the real kernel blob (811 016 B shim+venus DTB). Fixed: `shim/out/kernel-blob-venus-v18.bin` cut from the working `-act.img`; rebuilt `shim-boot-venus-v18b-act.img` (17 430 528 B, same header as the working image). Always reuse that blob.
+- Booted OK (log `logs/venus-live-20261020o.txt`): reaches `exec Setup`. `SWEET KEYS: ... pon-apid=83 pon=0x10/1` = PMK8350 PON read works, BUT several Power presses produced NO `key=0 down=1`. `gpio-ok=0` is just the withheld volume key. Unverified whether 0x1310 bit0/1 is the Power key.
+- `|mobileactivation|` tee (0091) stayed EMPTY. Binary imports raw `open`+`write` (no stdio), log path `/private/var/mobile/Library/Logs/mobileactivationd`, data ark `/private/var/mobile/Library/mad/data_ark.plist`, records `.../mad/activation_records`. Hypothesis: those directories do not exist in the rootfs so open() fails => no log, and "Failed to create data ark" => boot-init abort (the reason it was patched out). Also 50x `hfs_mark_inconsistent ... iosroot` seen: root FS corruption at runtime, look at it separately.
+- Web search for local activation handling: nothing useful. The project's own route (ADT /chosen security flags -> Hactivation branch; sweet-root-tweaks data_ark) is already in place.
+- **Written, NOT pushed/built:** `0092-sweet-open-fail-tee.patch` (named processes via sweetteewrite: log every failed open() with path+errno; applies to xnu-8796.121.2 and .141.3) and `0093-venus-keys-raw-diag.patch` (logs every change of raw PMIC bytes PON_HLOS 0x1308/130a/1310/1311 and PBS 0x808/809/810/811, to see what a Power press flips). Next: git push, Run workflow, new payload with same cmdline, boot, read `|mobileactivation| open(...) -> errno` and `SWEET KEYS DBG`.
+- Likely fix once the failing open is known: create the missing directories (Logs, mad, container) in the rootfs via sweet-root-tweaks.py, or the same via a userdata reflash.
+
+
 ## >>> VENUS: v18b-act BUILT, READY TO BOOT (2026-10-20 ~18:00) <<<
 
 - CI run #11 (commit ae8e8dd, main) built the kernel with patches 0087 (venus PON_HLOS power key) + 0091 (sweetteewrite console tee), SHA256 `acfd874...e45d04` verified against the artifact's own SHA256SUMS, kernel pulled to the Mac as `xnu/out-ae8e8dd/kernel.development.sweet`.
