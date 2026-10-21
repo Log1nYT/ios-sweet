@@ -1,3 +1,12 @@
+## >>> VENUS: FIRST GPU MEASUREMENT (v63, 2026-10-21 23:05, from a photo of the screen) <<<
+
+v63 = new all-driver kernel + `sweetgpu=1 sweetgpuprobe=1 sweetpaniclast=1`. The probe runs without a panic now (the alignment fix worked). Read off the screen (observations):
+- `probe start ahb=0x03d00000 gpucc=0x03d90000 chip-id=0x06060001`
+- `gpucc ahb_clk=0x00000000 gmu_clk=0x00006221 gmu_rcg=0x80000000/0x0 hub_rcg=0x0/0x0 gx_gdsc=0x00222001/0x00088400 cx_gdsc=0x00222001 cx_hw=0x00005ff4 gx_domain=0x003c0011`
+- `ahb[0..15]` = all `0x00000000`; `id bytes[0..7]` = `00 x8`; summary line: `clk_ahb=0 clk_gmu=1 gmu_rcg=0 gmu_dlv=1 gmu_src=0 gx=off cx=off freq=GMU`
+- Meaning: **CX and GX power domains are both off, the AHB clock is gated, and the aperture reads RAZ (zeros, no external abort).** No register in the 256 KiB window can be measured until CX is powered and `gpu_cc_ahb_clk` is on. The a6xx register ladder of report 26b section 8 needs phase 2 (writes: `sweetgpupower=1` from patch 0113, which votes CX and enables clocks with read-back + quiesce).
+- Boot afterwards continued to USB/DWC3/`ue0`; no panic seen on screen. The host side has never received UDP this session: the usbnet script needs the user's sudo password in the Terminal tab (`tools/venus-usbnet-mac.sh logs/venus-live-20261021n.txt`).
+
 ## >>> VENUS: v62 PANIC DECODED = MY BUG IN THE GPU PROBE; v63 READY (2026-10-22 23:00) <<<
 
 - v62 (new all-driver kernel + fixed 8G map + sweetgpu=1) BOOTED fine to userland (2000 FB swaps, xpcproxy, bluetoothd, fairplayd) and then panicked: `Unaligned kernel data abort`, ESR 0x96000021 (DFSC 0x21 = alignment fault), in the middle of the line `SWEET GPU: id bytes[0..7]=00`. Cause: `sweet_gpu.c` read the id bytes with `gpu_rd(base, i)` for i=0..7 = unaligned 32-bit loads from Device memory. Fixed (aligned dword + shift) in sweet_gpu.c and the embedded copy in 0112; commit 8df7b9d.
