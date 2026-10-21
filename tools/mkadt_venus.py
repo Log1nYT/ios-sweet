@@ -155,6 +155,35 @@ CAMERA_GATES = ('camera-rear', 'camera-front', 'has-sphere',
                 'face-detection-support')
 HAPTICS_GATES = ('closed-loop', 'supports-3rd-party-haptics')
 AUDIO_GATES = ('wireless-splitter', 'supports-always-listening')
+# The two audio *control* nodes of the real D21AP tree (report 17 §3.3).
+# Everything that names an Apple bus or an Apple phandle is dropped ('reg',
+# 'interrupts', 'interrupt-parent', the power providers, the 'function-*'
+# dispatch blobs); what is left is the identity of the part and the
+# properties that describe the audio path it provides.
+AUDIO_CODEC_KEEP = ('device_type', 'compatible', 'primary-ASP',
+                    'secondary-ASP', 'primary-InMCLK', 'mikeyBus-ASP',
+                    'clp-ASP', 'firmware-type', 'port-number', 'port-type',
+                    'hawking-adc', 'receiver-pdm', 'actuator-pdm-routing',
+                    'lmic-mic', 'imic-mic', 'smic-mic', 'fmic-mic',
+                    'lmic-micbias', 'imic-micbias', 'smic-micbias',
+                    'fmic-micbias', 'maximum-asp1-drive-strength',
+                    'clp-asp-config', 'routing-source_clp',
+                    'routing-source_clp_asp_tx', 'pollctl')
+# ... and every one of them is a "this audio path exists" claim: they read 0
+# (a flag without a value is dropped instead - that is how iOS spells
+# "not supported").
+AUDIO_CODEC_GATES = ('supports-CLP', 'rx-receiver', 'supports-aop-audio',
+                     'primary-ASP', 'secondary-ASP', 'mikeyBus-ASP',
+                     'primary-InMCLK', 'clp-ASP', 'firmware-type',
+                     'port-number', 'port-type', 'hawking-adc',
+                     'receiver-pdm', 'actuator-pdm-routing', 'lmic-mic',
+                     'imic-mic', 'smic-mic', 'fmic-mic', 'lmic-micbias',
+                     'imic-micbias', 'smic-micbias', 'fmic-micbias',
+                     'maximum-asp1-drive-strength')
+AUDIO_SPEAKER_KEEP = ('device_type', 'compatible', 'channel-number',
+                      'primary-speaker', 'secondary-speaker', 'tdm-config',
+                      'speaker-config')
+AUDIO_SPEAKER_GATES = ('channel-number',)
 
 
 def d21ap_node(path, path_to_file=D21AP_ADT):
@@ -408,6 +437,41 @@ def build(seed=None, qemu=False, highmem=False, features=()):
             # The D21AP (iPhone 8) tree only has 'sep', so this is an alias
             # with the same properties.
             arm_io_children.append(node('pearl-sep', [ph()] + list(sep_props.items())))
+
+    # /arm-io/spi2/audio-codec + /arm-io/i2c2/audio-speaker-top - the two
+    # audio *control* nodes of the real D21AP tree (report 17 §3.3):
+    #   /arm-io/spi2/audio-codec        "audio-control,cs42l75"  (the codec)
+    #   /arm-io/i2c2/audio-speaker-top  "audio-control,cs35l26"  (the speaker)
+    # They describe the iPhone 8's Cirrus parts.  venus has a WCD9385 codec
+    # on SoundWire and two CS35L41 amps on I2C (report 17 §1.2/§1.4) and no
+    # kernel driver for any of them, so every "this audio path exists" flag
+    # reads 0 and the Apple plumbing ('reg', 'interrupts', the power
+    # providers, the 'function-*' dispatch blobs) is dropped: 'reg' would
+    # point at the A11's SPI/I2C controllers, which do not exist here.
+    # The nodes exist so that the iOS path lookups resolve.
+    codec_props = d21ap_props('/arm-io/spi2/audio-codec', AUDIO_CODEC_KEEP)
+    speaker_props = d21ap_props('/arm-io/i2c2/audio-speaker-top', AUDIO_SPEAKER_KEEP)
+    if codec_props:
+        if 'audio' not in features:
+            codec_props = gate_off(codec_props, AUDIO_CODEC_GATES)
+        codec_props['sweet-hardware-present'] = u32(0)
+    if speaker_props:
+        if 'audio' not in features:
+            speaker_props = gate_off(speaker_props, AUDIO_SPEAKER_GATES)
+        speaker_props['sweet-hardware-present'] = u32(0)
+    if codec_props or speaker_props:
+        spi_kids = [node('audio-codec', [ph()] + list(codec_props.items()))] if codec_props else []
+        i2c_kids = [node('audio-speaker-top', [ph()] + list(speaker_props.items()))] if speaker_props else []
+        arm_io_children.append(node('spi2', [
+            ph(),
+            ('device_type', cstr('spi')),
+            ('compatible', cstr('spi-1,samsung')),
+        ], spi_kids))
+        arm_io_children.append(node('i2c2', [
+            ph(),
+            ('device_type', cstr('i2c')),
+            ('compatible', cstr('i2c,t8015') + cstr('i2c,s5l8940x') + cstr('iic,soft')),
+        ], i2c_kids))
 
     arm_io = node('arm-io', [
         ph(),

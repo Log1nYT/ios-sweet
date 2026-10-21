@@ -1,0 +1,404 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 01064b9..735b1b9 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -1,8 +1,34 @@
+ /*
+  * Minimal polled SWEET keys. Call once after the scheduler is running.
+  * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
+- * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+- * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
++ * PMIC access is READ ONLY by default: the sole MMIO write issues
++ * EXT_READL on an observer channel. No PMIC config, IRQ acknowledge or
++ * reset writes exist.  The single exception is the venus volume key path
++ * (patch 0120), which may ask the PMIC for the "input" direction of one
++ * pad (EXT_WRITEL) and only with sweetkeyvol=2; that write is read back
++ * and never drives a pin.
++ *
++ * venus (patch 0120): the Mi 11 volume keys are PMIC GPIOs.  The vendor
++ * device tree says:
++ *   /soc/qcom,spmi@c440000/qcom,pm8350@1/pinctrl@8800  "qcom,pm8350-gpio"
++ *       key_vol_up_default: pins = "gpio6", function = "normal",
++ *                           input-enable, bias-pull-up, power-source = <1>
++ *   /soc/gpio-keys/vol_up: gpios = <&pm8350_gpios 6 GPIO_ACTIVE_LOW>
++ * so the volume-up key is PM8350 GPIO 6, active low.  The 0x4c1
++ * peripheral the sweet board used is that board's PM6150L and does not
++ * exist on venus: its reads never answered, so the direction could
++ * never be confirmed and the key stayed withheld.
++ *
++ * SPMI addressing (logs/research/impl/18-volume-keys-audio-dt.md):
++ *   16 bit SPMI address = peripheral id (bits 15:8) | register (bits 7:0)
++ *   arbiter PPID (12 bit) = (SPMI SID << 8) | peripheral id
++ *   a PMIC GPIO block gives every pin its own 0x100 byte page:
++ *   pm8350 gpio base peripheral 0x88 (DT reg 0x8800), pin N -> 0x88 + N
++ *   -> volume-up (pin 6) = peripheral 0x8e of SID 1 = PPID 0x18e
++ *
++ * The new path is opt-in (boot arg sweetkeyvol=1) and read only: the
++ * direction register is read FIRST, and a pad the PMIC drives (output)
++ * is never touched - the key stays withheld as before.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -32,9 +58,41 @@ static uint8_t keys_pon_mask = 0x01u;
+ #define KEYS_GPIO_RT     0xc110u
+ #define KEYS_NO_APID     0xffffu
+ 
++/* ---- venus PM8350 GPIO: the volume keys (patch 0120) -------------------- */
++/* SPMI SID of the PM8350 (DT: qcom,pm8350@1) */
++#define KEYS_VENUS_SID       1u
++/* peripheral id of the PM8350 GPIO block (DT: pinctrl@8800 -> reg 0x8800) */
++#define KEYS_PMIC_GPIO_BASE  0x88u
++/* register offsets inside one PMIC GPIO page (CAF pinctrl-spmi-gpio.c) */
++#define KEYS_PG_TYPE         0x04u   /* 0x10 = PMIC GPIO block */
++#define KEYS_PG_SUBTYPE      0x05u   /* 0x01/0x05/0x09/0x0d, 0x10/0x11 = LV/MV */
++#define KEYS_PG_RT_STS       0x10u   /* the pin level, bit 0 */
++#define KEYS_PG_MODE         0x40u   /* direction in bits [6:4] */
++#define KEYS_PG_PULL         0x42u   /* pull up/down */
++#define KEYS_PG_EN           0x46u   /* bit 7 = pad enable */
++#define KEYS_PG_TYPE_PMIC    0x10u
++#define KEYS_DIR_INPUT       0u      /* digital input */
++#define KEYS_DIR_OUTPUT      1u      /* digital output: the PMIC drives it */
++#define KEYS_DIR_INOUT       2u      /* input/output */
++#define KEYS_DIR_ANALOG      3u      /* analog pass-through */
++#define KEYS_VOLUP_PIN       6u      /* DT: gpio-keys/vol_up = pm8350 gpio6 */
++#define KEYS_VK_UP           0
++#define KEYS_VK_DOWN         1
++#define KEYS_VK_COUNT        2
++
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
+ static uint32_t keys_version, keys_last_status;
++/* 0 = off (today's behaviour), 1 = read only, 2 = read + "input" write */
++static int keys_vol_mode;
++static uint32_t keys_count;   /* APIDs in the arbiter table */
++static struct {
++	uint16_t apid;   /* observer channel of the pin's page */
++	uint8_t pin;    /* PM8350 GPIO index */
++	uint8_t state;  /* published state (1 = pressed) */
++	uint8_t last;   /* last raw level */
++	uint8_t stable; /* debounce counter */
++} keys_vkey[KEYS_VK_COUNT];
+ 
+ /* DIAG: log every change of these raw PMIC bytes (find which bit a Power press flips) */
+ static uint16_t keys_dbg_apid[2] = {KEYS_NO_APID, KEYS_NO_APID};
+@@ -97,6 +155,154 @@ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ 	return false;
+ }
+ 
++/*
++ * Write one byte of a PMIC register (EXT_WRITEL).  The command word is
++ * the read command with the read bit cleared and the data byte in bits
++ * 23:16.  It is ONLY used to ask the PMIC for the "input" direction of
++ * a pad: the pin is never driven, and the caller reads the register back
++ * and compares before it trusts the result.
++ */
++static bool
++keys_write(uint16_t apid, uint16_t addr, uint8_t val)
++{
++	uint32_t off = 0x80u * apid;
++	uint32_t cmd = ((uint32_t)val << 16) | ((uint32_t)(addr & 0xffu) << 4);
++
++	if (apid == KEYS_NO_APID) {
++		return false;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_WRITEL, one byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = keys_rd(keys_obs, off + 0x08u);
++		if (status & 1u) {
++			return (status & 0x0eu) == 0;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/*
++ * The direction of a PMIC GPIO pad out of its MODE register.  The LV/MV
++ * pads (subtype 0x10/0x11) keep it in the low two bits, the digital pads
++ * in bits [6:4].
++ */
++static uint8_t
++keys_pmic_dir(uint8_t subtype, uint8_t mode)
++{
++	return (subtype >= 0x10u && subtype <= 0x13u) ? (uint8_t)(mode & 0x3u) :
++	    (uint8_t)((mode >> 4) & 0x7u);
++}
++
++/*
++ * Read the type, the subtype and the direction of one PMIC GPIO page.
++ * The type register (0x10 for a PMIC GPIO block) is the proof that the
++ * peripheral we talk to really is the GPIO block of the PMIC.
++ */
++static bool
++keys_pmic_page(uint16_t apid, uint8_t *subtype, uint8_t *mode)
++{
++	uint8_t type = 0, sub = 0, m = 0;
++
++	if (!keys_read(apid, KEYS_PG_TYPE, &type)) {
++		printf("SWEET KEYS: PMIC GPIO page does not answer (type)\n");
++		return false;
++	}
++	if (type != KEYS_PG_TYPE_PMIC) {
++		printf("SWEET KEYS: PMIC GPIO page type=%#x (expected %#x)\n",
++		    type, KEYS_PG_TYPE_PMIC);
++		return false;
++	}
++	if (!keys_read(apid, KEYS_PG_SUBTYPE, &sub) ||
++	    !keys_read(apid, KEYS_PG_MODE, &m)) {
++		printf("SWEET KEYS: PMIC GPIO page does not answer (subtype/mode)\n");
++		return false;
++	}
++	*subtype = sub;
++	*mode = m;
++	return true;
++}
++
++/*
++ * Open one PMIC GPIO pad as a key.  The direction is read BEFORE the
++ * value: a pad the PMIC drives (output) is never touched and the key
++ * stays withheld, exactly as before.  Only a pad that reads back as
++ * "input" is used.
++ */
++static bool
++keys_vol_open(int idx, uint8_t pin)
++{
++	uint16_t periph = (uint16_t)(KEYS_PMIC_GPIO_BASE + pin);
++	uint16_t ppid = (uint16_t)((KEYS_VENUS_SID << 8) | periph);
++	uint16_t apid = keys_find_apid(ppid, keys_count);
++	uint8_t sub = 0, mode = 0, dir = 0, en = 0, pull = 0, raw = 0;
++	const char *name = (idx == KEYS_VK_UP) ? "up" : "down";
++
++	keys_vkey[idx].apid = KEYS_NO_APID;
++	keys_vkey[idx].pin = pin;
++	if (apid == KEYS_NO_APID) {
++		printf("SWEET KEYS: PM8350 GPIO%u (peripheral %#x, PPID %#x) is not in the SPMI table\n",
++		    pin, periph, ppid);
++		return false;
++	}
++	if (!keys_pmic_page(apid, &sub, &mode)) {
++		printf("SWEET KEYS: PM8350 GPIO%u: no direction; volume-%s withheld\n",
++		    pin, name);
++		return false;
++	}
++	dir = keys_pmic_dir(sub, mode);
++	(void)keys_read(apid, KEYS_PG_EN, &en);
++	(void)keys_read(apid, KEYS_PG_PULL, &pull);
++	if (dir == KEYS_DIR_OUTPUT) {
++		printf("SWEET KEYS: PM8350 GPIO%u is an OUTPUT (the PMIC drives the pin); volume-%s withheld, PMIC unchanged\n",
++		    pin, name);
++		return false;
++	}
++	if (dir != KEYS_DIR_INPUT) {
++		/*
++		 * Not provably an input.  Only sweetkeyvol=2 may ask the
++		 * PMIC for the input direction; even then the write only
++		 * ever asks for "input" (never a driven pin) and the
++		 * result is read back before it is used.
++		 */
++		uint8_t after = 0;
++
++		if (keys_vol_mode < 2) {
++			printf("SWEET KEYS: PM8350 GPIO%u direction %u is not 'input'; volume-%s withheld\n",
++			    pin, dir, name);
++			return false;
++		}
++		if (!keys_write(apid, KEYS_PG_MODE, 0x00u)) {
++			printf("SWEET KEYS: PM8350 GPIO%u: the direction write did not complete; volume-%s withheld\n",
++			    pin, name);
++			return false;
++		}
++		if (!keys_read(apid, KEYS_PG_MODE, &after) ||
++		    keys_pmic_dir(sub, after) != KEYS_DIR_INPUT) {
++			printf("SWEET KEYS: PM8350 GPIO%u: the direction write did not read back as 'input' (%#x); volume-%s withheld\n",
++			    pin, after, name);
++			return false;
++		}
++		printf("SWEET KEYS: PM8350 GPIO%u: mode %#x -> %#x (input), read back verified\n",
++		    pin, mode, after);
++		dir = KEYS_DIR_INPUT;
++	}
++	if (!keys_read(apid, KEYS_PG_RT_STS, &raw)) {
++		printf("SWEET KEYS: PM8350 GPIO%u: the level register does not answer; volume-%s withheld\n",
++		    pin, name);
++		return false;
++	}
++	keys_vkey[idx].apid = apid;
++	keys_vkey[idx].state = (raw & 1u) ? 0u : 1u;
++	keys_vkey[idx].last = keys_vkey[idx].state;
++	keys_vkey[idx].stable = 0;
++	printf("SWEET KEYS: PM8350 GPIO%u page %#x PPID %#x APID %u subtype %#x mode %#x dir %u en %#x pull %#x level %#x -> volume-%s live\n",
++	    pin, periph, ppid, apid, sub, mode, dir, en, pull, raw, name);
++	return true;
++}
++
+ static void
+ keys_wait(void)
+ {
+@@ -110,7 +316,7 @@ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+ 	int state[3] = {0, 0, 0};
+-	unsigned errors = 0;
++	unsigned errors = 0, volerr = 0;
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+@@ -134,7 +340,7 @@ keys_thread(void *arg, wait_result_t result)
+ 			}
+ 		}
+ 		int now[3] = {!!(pon & keys_pon_mask), !(gpio & 1u), !!(pon & 2u)};
+-		if (!pok || !gok) {
++		if (!pok || (!gok && keys_vol_mode == 0)) {
+ 			if ((errors++ % 250u) == 0) {
+ 				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+ 				    pok, gok, keys_last_status);
+@@ -150,6 +356,43 @@ keys_thread(void *arg, wait_result_t result)
+ 				sweet_keyevents_key(k, state[k]);
+ 			}
+ 		}
++		/*
++		 * venus volume keys (patch 0120): the PM8350 GPIO pads.
++		 * The raw level must be seen twice before it is published
++		 * (the PMIC key state bounces for a few ms around a press).
++		 */
++		for (int v = 0; v < KEYS_VK_COUNT; ++v) {
++			uint8_t raw = 0, level;
++
++			if (keys_vkey[v].apid == KEYS_NO_APID) {
++				continue;
++			}
++			if (!keys_read(keys_vkey[v].apid, KEYS_PG_RT_STS, &raw)) {
++				if ((volerr++ % 250u) == 0) {
++					printf("SWEET KEYS: volume-%s read failed (status %#x)\n",
++					    v == KEYS_VK_UP ? "up" : "down",
++					    keys_last_status);
++				}
++				continue;
++			}
++			level = (raw & 1u) ? 0u : 1u;  /* active low */
++			if (level != keys_vkey[v].last) {
++				keys_vkey[v].last = level;
++				keys_vkey[v].stable = 0;
++				continue;
++			}
++			if (++keys_vkey[v].stable < 2) {
++				continue;
++			}
++			if (level != keys_vkey[v].state) {
++				keys_vkey[v].state = level;
++				printf("SWEET KEYS: volume-%s down=%d rt=%#x\n",
++				    v == KEYS_VK_UP ? "up" : "down", level, raw);
++				sweet_keyevents_key(v == KEYS_VK_UP ?
++				    SWEET_KEY_VOLUME_UP : SWEET_KEY_VOLUME_DOWN,
++				    level);
++			}
++		}
+ 		keys_wait();
+ 	}
+ }
+@@ -158,6 +401,10 @@ void
+ sweet_keys_init(void)
+ {
+ 	int enabled = 1;
++	int vdn = -1;
++	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
++	bool pok, gok, mok, eok, sok;
++	unsigned dir;
+ 	thread_t thread;
+ 	if (keys_started) {
+ 		return;
+@@ -180,6 +427,20 @@ sweet_keys_init(void)
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+ 	}
++	/*
++	 * venus volume keys (patch 0120).
++	 *   sweetkeyvol=0  today's behaviour: the sweet board's PM6150L
++	 *                  peripheral (0x4c1) is probed; it does not exist
++	 *                  on venus, so the volume key stays withheld.
++	 *   sweetkeyvol=1  read the PM8350 GPIO pad the vendor device tree
++	 *                  names (gpio6, active low).  Read only.
++	 *   sweetkeyvol=2  as 1, and the driver may ask the PMIC for the
++	 *                  "input" direction of the pad (read back, never
++	 *                  a driven pin).
++	 *   sweetkeyvdn=N  the PM8350 GPIO index of the volume-down key
++	 *                  (the device tree only names volume-up).
++	 */
++	(void)PE_parse_boot_argn("sweetkeyvol", &keys_vol_mode, sizeof(keys_vol_mode));
+ 	/*
+ 	 * The key state machine (debounce, long press) sits between this
+ 	 * driver and the HID layer; with sweetkeyevents=0 it passes the
+@@ -201,6 +462,7 @@ sweet_keys_init(void)
+ 		    keys_version, count);
+ 		return;
+ 	}
++	keys_count = count;
+ 	int venus = 0;
+ 	if (PE_parse_boot_argn("venus", &venus, sizeof(venus)) && venus) {
+ 		keys_pon_ppid = 0x013;
+@@ -208,27 +470,44 @@ sweet_keys_init(void)
+ 		keys_pon_mask = 0x80u;
+ 	}
+ 	keys_pon_apid = keys_find_apid(keys_pon_ppid, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
+ 	keys_dbg_apid[0] = keys_find_apid(0x013, count);
+ 	keys_dbg_apid[1] = keys_find_apid(0x008, count);
+-	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+-	bool pok = keys_read(keys_pon_apid, keys_pon_rt, &pon);
+-	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_apid,
+-	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+-	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+-	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+-	    mode & 3u : (mode >> 4) & 7u;
+-	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+-		keys_gpio_apid = KEYS_NO_APID;
+-	}
+-	if (!pok && !gok) {
+-		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
++	pok = keys_read(keys_pon_apid, keys_pon_rt, &pon);
++	if (keys_vol_mode > 0) {
++		/*
++		 * venus volume keys: the PM8350 GPIO block (patch 0120).
++		 * The direction of every pad is read first; a pad the PMIC
++		 * drives is never touched.
++		 */
++		(void)PE_parse_boot_argn("sweetkeyvdn", &vdn, sizeof(vdn));
++		printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u pon=%#x/%d; volume keys from the PM8350 GPIO block (mode %d)\n",
++		    keys_version, count, keys_pon_apid, pon, pok, keys_vol_mode);
++		(void)keys_vol_open(KEYS_VK_UP, KEYS_VOLUP_PIN);
++		if (vdn >= 0 && vdn < 16) {
++			(void)keys_vol_open(KEYS_VK_DOWN, (uint8_t)vdn);
++		} else if (vdn >= 0) {
++			printf("SWEET KEYS: sweetkeyvdn=%d is not a PM8350 GPIO index; volume-down withheld\n",
++			    vdn);
++		}
++	} else {
++		keys_gpio_apid = keys_find_apid(0x4c1, count);
++		gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++		mok = keys_read(keys_gpio_apid, 0xc140, &mode);
++		eok = keys_read(keys_gpio_apid, 0xc146, &en);
++		sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
++		printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
++		    keys_version, count, keys_pon_apid, keys_gpio_apid,
++		    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
++		/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
++		dir = subtype >= 0x10u && subtype <= 0x13u ?
++		    mode & 3u : (mode >> 4) & 7u;
++		if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
++			printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
++			keys_gpio_apid = KEYS_NO_APID;
++		}
++		if (!pok && !gok) {
++			printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
++		}
+ 	}
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
