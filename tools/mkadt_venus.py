@@ -6,10 +6,18 @@ VENUS variant: Xiaomi Mi 11 (venus, Qualcomm SM8350), iPhone 8 identity
 (venus.dtb):
   - all QCom reserved-memory carve-outs lie in 0x80000000..0xE4E00000
   - /memory = <0x80000000 +0x39700000>, <0xC0000000 +0x1C0000000> (7.9GB)
-  - free window above the carve-outs: 0xE6000000 .. 0x2C0000000
+  - free window above the carve-outs: 0xE6000000 .. 0x280000000 (real DRAM)
   - splash_region (ABL framebuffer) 0xE2A00000 +0x2300000, 1440x3200
   - GICD 0x17a00000, GICR 0x17a60000 (same as sweet!), vtimer PPI 11 -> 27
+The top 1 MiB of the window is carved out for XNU's embedded panic log
+(/pram + /chosen/embedded-panic-log-size), so the allocator cannot use it.
 Usage:  mkadt_venus.py OUT.adt [--dump] [--qemu] [--highmem]
+                             [--camera] [--sep] [--haptics] [--audio] [--backlight]
+
+The feature switches turn the REAL iPhone-8 values of the matching
+device-tree nodes on; by default the nodes exist (so the iOS path lookups
+resolve) but every "hardware present" flag reads 0 - venus has none of that
+hardware.  See logs/research/impl/08-adt-nodes.md.
 """
 import hashlib, os, struct, sys
 
@@ -24,10 +32,29 @@ import adt  # noqa: E402
 # 0xe5000000 was) skews every VA->PA translation by the sub-block offset
 # (observed +0x1000000) -> first fetch after MMU-on hits zeros -> UDEF panic.
 PHYS_BASE = 0xe6000000
-MEM_SIZE = 0x1da000000          # up to the end of /memory bank 2 (0x2c0000000)
+# Real DRAM on venus ends at 0x280000000: the board has 8 GiB and the vendor
+# FDT says /memory = <0x80000000 +0x39700000>, <0xc0000000 +0x1c0000000>, so
+# bank 2 (the last one) ends at 0x280000000.  Publishing more than that
+# hands the allocator pages with no backing behind them (the _bzero external
+# abort at NOTES.md L227: the allocator returned 0x2800c0000, just past the
+# real end), so the window stops at the real end of RAM.
+MEM_SIZE = 0x19a000000          # up to the end of DRAM (0x280000000)
 # --highmem: same window; kept as an alias so the flag stays harmless.
 HIGH_PHYS_BASE = PHYS_BASE
 HIGH_MEM_SIZE = MEM_SIZE
+# XNU's "embedded panic log" buffer.  pexpert/arm/pe_init.c:
+# check_for_panic_log() takes the physical base from the /pram node's reg[0]
+# and the size from /chosen/embedded-panic-log-size, maps the region with
+# ml_io_map_wcomb() and uses it as debug_buf_base (osfmk/kern/debug.c:
+# debug_log_init()).  Without both nodes gPanicBase stays 0, debug_log_init()
+# bails out with "Error!! gPanicBase is still not initialized" and every
+# panic spins forever in SavePanicInfo() (osfmk/arm/model_dep.c:
+# "while (!panic_info || panic_info->eph_panic_log_offset == 0)").
+# 1 MiB = 64 x 16 KiB pages.  The region is carved off the TOP of the DRAM
+# window we publish (like upstream sweet, dipa-studio/ios-sweet PR #6
+# "adt-panic-region"), so the kernel maps it but the allocator can never
+# hand it out.
+PANIC_LOG_SIZE = 0x100000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -68,6 +95,113 @@ def d21ap_product(path=D21AP_ADT):
             return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
     raise SystemExit(f'{path}: no /product node')
 
+
+# ---------------------------------------------------------------------------
+# Device-tree nodes the iOS userland looks up but that our ADT did not have.
+#
+# logs/research/18-iokit-gap-inventory.md item 8: every boot the iOS side
+# did 293 device-tree PATH lookups that returned "none" (the iOS code
+# treats a missing node as "no hardware"):
+#
+#   IODeviceTree:/options           108x  (MobileKeyBag/keybagd, mobileassetd)
+#   IODeviceTree:/product/camera     44x  (MobileGestalt, camera stack)
+#   IODeviceTree:/arm-io/pearl-sep   43x  (SEP stack)
+#   IODeviceTree:/product/haptics    28x  (haptics engine, Setup)
+#   IODeviceTree:/arm-io/sep         25x  (SEP stack)
+#   IODeviceTree:/arm-io/isp          25x  (MobileGestalt, camera stack)
+#   IODeviceTree:/product/audio       24x  (audio stack, VirtualAudio HAL)
+#   IODeviceTree:/backlight           17x  (backboardd, CoreBrightness)
+#
+# The property VALUES below are the real ones from the iPhone-8 (D21AP)
+# device tree (Mu-Silicium/esp-payload/dt.raw) - the tree the iOS 16.7
+# userland was written against.  venus has none of the hardware behind
+# these nodes, so every "hardware present" flag is gated OFF by default
+# and the CLI switches (--camera/--sep/--haptics/--audio/--backlight)
+# put the real values back for a controlled experiment.
+#
+# 'sweet-hardware-present' is OUR marker: 0 = "no sweet driver binds to
+# this node yet".  A future stub (camera/SEP/audio) MUST check it before
+# it touches hardware.  See logs/research/impl/08-adt-nodes.md for the
+# node -> consumer -> value -> risk table.
+# ---------------------------------------------------------------------------
+
+# Properties copied verbatim from the real D21AP tree - only the ones the
+# iOS userland looks up.  Everything else is dropped on purpose: 'reg',
+# 'interrupts', 'interrupt-parent', 'iommu-parent', 'clock-gates' and
+# 'power-gates' are the A11's MMIO/interrupt plumbing and carry PHANDLE
+# values from the Apple tree (they would point at our own nodes!), and the
+# Apple 'function-*' blobs are dispatch tables for Apple kernel drivers.
+ISP_KEEP = ('device_type', 'compatible', 'camera-rear', 'camera-front',
+            'has-sphere', 'face-detection-support', 'sensor-type')
+SEP_KEEP = ('device_type', 'compatible', 'role', 'iop-version', 'sika-support')
+BACKLIGHT_KEEP = ('device_type', 'compatible')
+# The big iPhone-8 backlight calibration tables (milliAmps2DACTablePart1/2,
+# iDAC2MilliAmpsTable, backlight-marketing-table) describe the iPhone 8's
+# LCD PWM backlight; venus is an AMOLED panel, so they are never copied.
+# The same goes for 'backlight-calibration', which is an iBoot placeholder
+# (syscfg/BLCl) in the real tree.
+BACKLIGHT_TABLES = ('milliAmps2DACTablePart1', 'milliAmps2DACTablePart2',
+                    'iDAC2MilliAmpsTable', 'backlight-marketing-table',
+                    'backlight-calibration', 'display-backlight-calibration')
+# The flags that mean "this device HAS the hardware"; they read 0 unless the
+# matching feature switch is given.
+CAMERA_GATES = ('camera-rear', 'camera-front', 'has-sphere',
+                'face-detection-support')
+HAPTICS_GATES = ('closed-loop', 'supports-3rd-party-haptics')
+AUDIO_GATES = ('wireless-splitter', 'supports-always-listening')
+
+
+def d21ap_node(path, path_to_file=D21AP_ADT):
+    """The node at `path` ('/product/camera') of the real D21AP tree."""
+    if not os.path.exists(path_to_file):
+        return None
+    root, _ = adt.parse(adt.load(path_to_file))
+    cur = root
+    for part in [p for p in path.split('/') if p]:
+        nxt = None
+        for c in cur.children:
+            if c.name == part:
+                nxt = c
+                break
+        if nxt is None:
+            return None
+        cur = nxt
+    return cur
+
+
+def d21ap_props(path, keep=None, path_to_file=D21AP_ADT):
+    """{name: bytes} of the real D21AP node at `path`.
+
+    'name'/'AAPL,phandle' are dropped (we assign our own phandles), so are
+    the iBoot-filled placeholders (syscfg/*), and `keep` restricts the set
+    to the properties the iOS userland actually looks up."""
+    n = d21ap_node(path, path_to_file)
+    if n is None:
+        return {}
+    out = {}
+    for name, flags, val in n.props:
+        if name in ('name', 'AAPL,phandle') or flags:
+            continue
+        if keep is not None and name not in keep:
+            continue
+        out[name] = val
+    return out
+
+
+def gate_off(props, names):
+    """Turn the named u32 "hardware present" flags off (0).  Properties with
+    another width are dropped instead: an absent property is how iOS spells
+    "not supported"."""
+    out = {}
+    for k, v in props.items():
+        if k in names:
+            if len(v) == 4:
+                out[k] = u32(0)
+        else:
+            out[k] = v
+    return out
+
+
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
@@ -80,9 +214,22 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+def build(seed=None, qemu=False, highmem=False, features=()):
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
+
+    features: subset of ('camera', 'sep', 'haptics', 'audio', 'backlight').
+    Each switch turns the REAL iPhone-8 values of the matching device-tree
+    nodes on; without them the nodes exist (so the iOS path lookups
+    resolve) but every "hardware present" flag reads 0.  See
+    logs/research/impl/08-adt-nodes.md."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    # Carve the panic log off the top of the DRAM window we publish, so the
+    # kernel's allocator can never allocate into it.  The region is real
+    # DRAM (0x27ff00000..0x280000000), just above the window we hand to
+    # XNU (which now ends at 0x27ff00000 instead of at the real end of RAM,
+    # 0x280000000).
+    panic_base = phys_base + mem_size - PANIC_LOG_SIZE
+    mem_size -= PANIC_LOG_SIZE
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -94,6 +241,11 @@ def build(seed=None, qemu=False, highmem=False):
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
+        # Size (bytes) of the embedded panic log buffer.  The physical base
+        # comes from the /pram node below; XNU maps the region with
+        # ml_io_map_wcomb() and writes the panic log into it.  The region is
+        # above the DRAM window we publish, so nothing else uses it.
+        ('embedded-panic-log-size', u32(PANIC_LOG_SIZE)),
         ('firmware-version', cstr('sweet-shim')),
         ('system-firmware-version', cstr('sweet-shim')),
         # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
@@ -123,6 +275,16 @@ def build(seed=None, qemu=False, highmem=False):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
+        # Hactivation gate (theapplewiki.com/wiki/Hactivation).  Upstream
+        # sweet only sets the four security-status properties above, but
+        # mobileactivationd also looks for "allow-hactivation" and
+        # "ShouldHactivate" (both strings are in the 20H392 binary) and for
+        # "disable-hactivation-ma".  Put all of them in /chosen (where the
+        # other security status lives) so the daemon finds them whichever
+        # node it reads.
+        ('allow-hactivation', u32(1)),
+        ('ShouldHactivate', u32(1)),
+        ('disable-hactivation-ma', u32(0)),
     ], [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
@@ -171,14 +333,7 @@ def build(seed=None, qemu=False, highmem=False):
         ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),  # 27 = venus PPI 11
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
     ])
-    arm_io = node('arm-io', [
-        ph(),
-        ('device_type', cstr('sweet-io')),
-        ('compatible', cstr('sweet-io') + cstr('arm-io')),
-        ('#address-cells', u32(2)),
-        ('#size-cells', u32(2)),
-        ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
-    ], [gic,
+    arm_io_children = [gic,
         # No hardware: watchdogd checks IODeviceTree:/arm-io/wdt for no-pmu and
         # otherwise crashes trying to set the PMU boot stage (customer builds
         # ignore the -wdt_no_pmu boot-arg).
@@ -193,7 +348,51 @@ def build(seed=None, qemu=False, highmem=False):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1440)),  # 750x1334 -> no swaps on the 1440x3200 panel
             ('canvas-height', u32(3200)),
-        ])])
+        ])]
+
+    # /arm-io/isp - the camera ISP node (25x "path IODeviceTree:/arm-io/isp
+    # -> none" per boot).  MobileGestalt probes it next to /product/camera
+    # (report 08 §3.3).  The MMIO/interrupt plumbing of the real A11 node
+    # is NOT copied (see ISP_KEEP): 'reg' would point at the A11 ISP at
+    # 0x0f000000, which does not exist on venus, and 'interrupts' /
+    # 'clock-gates' carry Apple phandles.  The camera-present flags
+    # (camera-rear / camera-front) are the feature gate: they read 0
+    # unless --camera is given, so no subsystem goes looking for a camera
+    # that is not there.
+    isp_props = d21ap_props('/arm-io/isp', ISP_KEEP)
+    if isp_props:
+        if 'camera' not in features:
+            isp_props = gate_off(isp_props, CAMERA_GATES)
+        isp_props['sweet-hardware-present'] = u32(0)
+        arm_io_children.append(node('isp', [ph()] + list(isp_props.items())))
+
+    # /arm-io/sep + /arm-io/pearl-sep - the SEP (secure enclave) coprocessor.
+    # NOT in the default tree on purpose: there is no SEP on venus
+    # (report 21) and a SEP node would be a false positive that can push
+    # the activation / FairPlay path down its SEP branch - the activation
+    # path is exactly what the current byte patches work around.  The
+    # nodes exist in the tool (--sep) so the experiment can be run; the
+    # real D21AP values are device_type='sep', role='SEP', iop-version=1,
+    # sika-support=1 (the SafePlay/FairPlay gate).
+    if 'sep' in features:
+        sep_props = d21ap_props('/arm-io/sep', SEP_KEEP)
+        if sep_props:
+            sep_props['sweet-hardware-present'] = u32(0)
+            arm_io_children.append(node('sep', [ph()] + list(sep_props.items())))
+            # 'pearl-sep' is the A13+ spelling of the same coprocessor; the
+            # iOS 16.7 userland probes both names (43x + 25x per boot).
+            # The D21AP (iPhone 8) tree only has 'sep', so this is an alias
+            # with the same properties.
+            arm_io_children.append(node('pearl-sep', [ph()] + list(sep_props.items())))
+
+    arm_io = node('arm-io', [
+        ph(),
+        ('device_type', cstr('sweet-io')),
+        ('compatible', cstr('sweet-io') + cstr('arm-io')),
+        ('#address-cells', u32(2)),
+        ('#size-cells', u32(2)),
+        ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
+    ], arm_io_children)
 
     fbcon = node('sweet-fbcon', [
         ph(),
@@ -230,7 +429,82 @@ def build(seed=None, qemu=False, highmem=False):
     # Hactivation gate (theapplewiki.com/wiki/Hactivation): needs allow-hactivation in /product + a development kernel
     if product_props is not None:
         product_props = [(k, v) for k, v in product_props if k != 'allow-hactivation'] + [('allow-hactivation', u32(1))]
-    product = [node('product', [ph()] + product_props)] if product_props else []
+
+    # /product/camera, /product/haptics, /product/audio - the child nodes
+    # of /product the iOS userland looks up (44x / 28x / 24x "-> none" per
+    # boot).  d21ap_product() copies only the *properties* of the real
+    # /product node, so its children were missing.
+    product_children = []
+    # /product/camera - the camera capability node MobileGestalt reads next
+    # to /arm-io/isp (report 08 §3.3).  Every flag is a "this device HAS
+    # this camera feature" claim; they read 0 unless --camera is given.
+    camera_props = d21ap_props('/product/camera')
+    if camera_props:
+        if 'camera' not in features:
+            # every /product/camera property is a "this device HAS this
+            # camera feature" claim (auto-focus, flash, 4K fps, ...), so all
+            # of them read 0 until --camera is given.
+            camera_props = gate_off(camera_props, tuple(camera_props))
+        product_children.append(node('camera', [ph()] + list(camera_props.items())))
+    # /product/haptics - 'closed-loop' (Taptic Engine) and
+    # 'supports-3rd-party-haptics' (Core Haptics).  venus has an AW8697
+    # LRA on I2C (report 09 §2.4) but no AOP haptic engine, so both read
+    # 0 unless --haptics is given.
+    haptics_props = d21ap_props('/product/haptics')
+    if haptics_props:
+        if 'haptics' not in features:
+            haptics_props = gate_off(haptics_props, HAPTICS_GATES)
+        product_children.append(node('haptics', [ph()] + list(haptics_props.items())))
+    # /product/audio - 'wireless-splitter' (AirPlay 2) and
+    # 'supports-always-listening' (Siri always-on mic).  The node itself is
+    # what report 17 §A0 asks for (VirtualAudio has no device without it);
+    # the flags stay 0 until --audio.
+    audio_props = d21ap_props('/product/audio')
+    if audio_props:
+        if 'audio' not in features:
+            audio_props = gate_off(audio_props, AUDIO_GATES)
+        product_children.append(node('audio', [ph()] + list(audio_props.items())))
+
+    product = [node('product', [ph()] + product_props, product_children)] if product_props else []
+
+    # /options - the iOS "options" device-tree node (108x "-> none" per
+    # boot).  MobileKeyBag prints "MKB_INIT: Could not get options entry
+    # from the device tree" because of it and MADAnalyticsManager reads
+    # IODeviceTree:/options for its event-submission overrides.  On the real
+    # iPhone 8 the node is EMPTY (report 21 §3.2) - only the phandle - and
+    # that is what is copied here: the node exists so the lookups resolve.
+    #
+    # NOTE: this node is in SweetPlatformExpert::excludeList(), so no nub
+    # is created for it and IODTPlatformExpert::publishNVRAM() (which would
+    # assert on a non-IOPlatformExpertDevice provider) is never called.
+    options = node('options', [ph()])
+
+    # /backlight - the display backlight node (17x "-> none" per boot).
+    # venus is an AMOLED panel: there is NO backlight PWM on the board
+    # (report 09 §2.5), so by default only the identity of the node is
+    # published.  With --backlight the real iPhone-8 scalars are added
+    # (the big calibration tables are never copied - they describe the
+    # iPhone 8's LCD PWM backlight).  The brightness slider route is the
+    # 'backlight-control' property on the AppleCLCD service (report 18
+    # §5.3), not this node.
+    if 'backlight' in features:
+        backlight_props = d21ap_props('/backlight')
+        for drop in BACKLIGHT_TABLES:
+            backlight_props.pop(drop, None)
+    else:
+        backlight_props = d21ap_props('/backlight', BACKLIGHT_KEEP)
+    if backlight_props:
+        backlight_props['sweet-hardware-present'] = u32(0)
+        backlight = node('backlight', [ph()] + list(backlight_props.items()))
+    else:
+        backlight = node('backlight', [ph(), ('sweet-hardware-present', u32(0))])
+
+    # Panic log region.  XNU's pe_init.c check_for_panic_log() looks up this
+    # node by name and takes reg[0] as the physical address of the region
+    # (reg[1], iBoot's kMemoryRegion_Panic size, is ignored); the size comes
+    # from /chosen/embedded-panic-log-size.  The region sits just above the
+    # dram-size we expose, so XNU maps it but never allocates into it.
+    pram = node('pram', [ph(), ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
 
     # Identity of the iPhone 8 whose userland runs here: compatible[0] is
     # hw.model/hw.target (D21AP), model is hw.machine/hw.product
@@ -247,13 +521,23 @@ def build(seed=None, qemu=False, highmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram, options,
+         backlight] + product + ([] if qemu else [ufs]))
 
+
+# The feature switches: each one turns the REAL iPhone-8 values of one
+# device-tree node on.  Default = "the node exists, the hardware-present
+# flags read 0" (the truth on venus).
+FEATURES = ('camera', 'sep', 'haptics', 'audio', 'backlight')
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    argv = sys.argv[1:]
+    feats = tuple(f for f in FEATURES if '--' + f in argv)
+    root = build(qemu='--qemu' in argv, highmem='--highmem' in argv, features=feats)
     blob = adt.serialize(root)
-    open(sys.argv[1], 'wb').write(blob)
-    if '--dump' in sys.argv:
+    open(argv[0], 'wb').write(blob)
+    if '--dump' in argv:
         adt.dump(adt.parse(blob)[0])
-    print(f'{sys.argv[1]}: {len(blob)} bytes', file=sys.stderr)
+    print(f'{argv[0]}: {len(blob)} bytes', file=sys.stderr)
+    print(f'features enabled: {", ".join(feats) if feats else "(none - all hardware flags off)"}',
+          file=sys.stderr)
