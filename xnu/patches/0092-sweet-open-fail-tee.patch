@@ -1,13 +1,13 @@
 --- a/bsd/vfs/vfs_syscalls.c
 +++ b/bsd/vfs/vfs_syscalls.c
-@@ -5027,6 +5027,57 @@
+@@ -5027,6 +5027,59 @@
  	           uap->class, uap->dpflags, AT_FDCWD, AUTH_OPEN_NOAUTHFD, UIO_USERSPACE, retval);
  }
  
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +/*
 + * SWEET: boot-arg sweetteewrite=name,name (shared with 0091). Logs every open()
-+ * by a named process as "|name| open(path) flags=.. -> errno" (failures only),
++ * by a named process as "|name| open(path) flags=.. -> errno" (failures only unless sweetteeopenok=1),
 + * so a daemon's missing directories/containers show up in the live USB log.
 + */
 +static void
@@ -15,17 +15,19 @@
 +{
 +	static char names[128];
 +	static int parsed;
++	static int okmode;
 +	char name[32];
 +	char p[160];
 +	size_t plen = 0;
 +
-+	if (error == 0) {
-+		return;
-+	}
 +	if (!parsed) {
 +		names[0] = '\0';
 +		(void)PE_parse_boot_argn("sweetteewrite", names, sizeof(names));
++		(void)PE_parse_boot_argn("sweetteeopenok", &okmode, sizeof(okmode));
 +		parsed = 1;
++	}
++	if (error == 0 && !okmode) {
++		return;
 +	}
 +	if (names[0] == '\0') {
 +		return;
@@ -51,19 +53,19 @@
 +	if (copyinstr(path, p, sizeof(p), &plen) != 0) {
 +		strlcpy(p, "?", sizeof(p));
 +	}
-+	printf("|%s| open(%s) flags=%#x -> errno %d\n", name, p, flags, error);
++	printf("|%s| open(%s) flags=%#x -> %s errno %d\n", name, p, flags, error ? "FAIL" : "ok", error);
 +}
 +#endif
 +
  static int
  openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
      int fd, enum uio_seg segflg, int *retval)
-@@ -5054,6 +5105,11 @@
+@@ -5054,6 +5107,11 @@
  	    segflg, path, ctx);
  
  	error = open1at(ctx, ndp, flags, vap, NULL, NULL, retval, fd, AUTH_OPEN_NOAUTHFD);
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+	if (error != 0 && segflg == UIO_USERSPACE) {
++	if (segflg == UIO_USERSPACE) {
 +		sweet_open_tee(path, flags, error);
 +	}
 +#endif

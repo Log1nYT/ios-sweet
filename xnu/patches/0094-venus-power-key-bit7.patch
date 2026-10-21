@@ -1,0 +1,30 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index a1691fd..0cd6c12 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -22,6 +22,8 @@ void sweet_keys_init(void);
+ #define KEYS_CNFG_PA     0x0c40a000u
+ /* sweet PM6150 PON 0x0800; venus PMK8350 PON_HLOS 0x1300 (KPDPWR bit 0, RESIN bit 1) */
+ static uint16_t keys_pon_ppid = 0x008, keys_pon_rt = 0x0810u;
++/* Power key bit in the PON RT byte: sweet bit0; venus PMK8350 bit7 (measured: each press flips 0x10<->0x90) */
++static uint8_t keys_pon_mask = 0x01u;
+ #define KEYS_GPIO_RT     0xc110u
+ #define KEYS_NO_APID     0xffffu
+ 
+@@ -126,7 +128,7 @@ keys_thread(void *arg, wait_result_t result)
+ 				}
+ 			}
+ 		}
+-		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
++		int now[3] = {!!(pon & keys_pon_mask), !(gpio & 1u), !!(pon & 2u)};
+ 		if (!pok || !gok) {
+ 			if ((errors++ % 250u) == 0) {
+ 				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+@@ -180,6 +182,7 @@ sweet_keys_init(void)
+ 	if (PE_parse_boot_argn("venus", &venus, sizeof(venus)) && venus) {
+ 		keys_pon_ppid = 0x013;
+ 		keys_pon_rt = 0x1310u;
++		keys_pon_mask = 0x80u;
+ 	}
+ 	keys_pon_apid = keys_find_apid(keys_pon_ppid, count);
+ 	keys_gpio_apid = keys_find_apid(0x4c1, count);

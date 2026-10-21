@@ -1,5 +1,13 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> 2026-10-21 09:10 POWER KEY FOUND, GESTURES, ACTIVATION STILL OPEN <<<
+
+- **Gestures work:** ADT `/buttons home-button-type = 2` (v18e, `shim/out/venus-v18-8g-1440-gest.adt`, now also in tools/mkadt_venus.py). Home indicator + gestures appear, identity stays iPhone10,1. The small battery icon = fake IOPMPowerSource from 0062 (real battery = later).
+- **POWER KEY = PON_HLOS (PPID 0x013) RT_STS 0x1310 BIT 7** (measured with 0093: 2 presses = exactly 2 cycles 0x10<->0x90; bit0 is not the key, bit6 pulses are something else). Patch `0094-venus-power-key-bit7.patch` (mask 0x80 on venus) written, applies after 0093, NOT yet built.
+- **Activation:** with 0092 (failed-open tee) mobileactivationd shows NO failed opens and NO text writes: on the patched userdata binary it does nothing observable. Setup's failed opens are all optional files (errno 2), notably the MobileGestalt cache plist is missing. 0092 now also supports `sweetteeopenok=1` (log successful opens too) to see which container / data_ark path the daemon really uses. Hypothesis: the seeded `Library/internal/data_ark.plist` (sweet-root-tweaks) is not in the container containermanagerd hands to the daemon, so ActivationState is never read.
+- Next CI run builds 0092(v2)+0093+0094. Boot with cmdline `... sweetteewrite=mobileactivation,Setup sweetteeopenok=1`.
+
+
 ## >>> v18b-act BOOT RESULT + NEXT (2026-10-21 08:40) <<<
 
 - First v18b attempt was dead (no USB/display): I wrapped `shim/out/Image.gz` (7 KB, bare shim) instead of the real kernel blob (811 016 B shim+venus DTB). Fixed: `shim/out/kernel-blob-venus-v18.bin` cut from the working `-act.img`; rebuilt `shim-boot-venus-v18b-act.img` (17 430 528 B, same header as the working image). Always reuse that blob.
