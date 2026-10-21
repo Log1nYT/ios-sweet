@@ -1,5 +1,13 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> 2026-10-21 10:40 NEW HYPOTHESIS: boot-init fails on kern.bootsessionuuid (patch 0096) <<<
+
+- Static (mobileactivationd `main`, 0x4f4ec..0x5056c; its messages are CFStrings, found via __cfstring xrefs): after the startup banner (should_hactivate, is_devfused_undemoted ...) and the OVERRIDE (UCRT/DCRT/PCRT) steps come two steps that touch NO files: "Failed to retrieve boot session UUID." (cf at 0x100050254) and "Failed to query legacy UIK support." (0x1000502a8). Either one failing would make boot-init return false => the (patched-out) fatal at 0x50670, with zero open() calls. That matches the observation.
+- `kern.bootsessionuuid` is a RD sysctl on `bootsessionuuid_string`; in open XNU only `IOPMrootDomain::initializeBootSessionUUID()` fills it (symbol present in our kernel). Unknown whether it runs on this platform.
+- **Patch `0096-venus-bootsessionuuid.patch`:** in sweet_keys_init (early, rootdev init) fill it with a random UUID if empty and print `SWEET: kern.bootsessionuuid was empty, set ...` (good signal: if that line appears, the sysctl WAS empty). Applies after 0094. NOT built yet (CI needed together with 0095). Compile risk: `<uuid/uuid.h>` (bsd/uuid/uuid.h, same include as kern_sysctl.c).
+- If this is not it: the other file-less step is the "legacy UIK" query; then the boot-time kernel file patcher idea (0097) remains the fallback to seed/patch userland without reflash.
+
+
 ## >>> 2026-10-21 10:10 v18h RESULT: allow-hactivation DID NOT HELP; where the real blocker sits <<<
 
 - v18h = v18g + ADT `/product allow-hactivation=1` (documented Hactivation gate, theapplewiki; now also in tools/mkadt_venus.py) + tee of `cfprefsd`. Setup STILL shows Wi-Fi / connect-to-computer. `mobileactivation` still makes ZERO open() calls.

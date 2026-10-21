@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 0cd6c12..796dfad 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -12,6 +12,9 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <uuid/uuid.h>
++
++extern uuid_string_t bootsessionuuid_string;
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -158,6 +161,18 @@ sweet_keys_init(void)
+ 		return;
+ 	}
+ 	keys_started = true;
++	/*
++	 * kern.bootsessionuuid must be a UUID: mobileactivationd ("Failed to
++	 * retrieve boot session UUID.") and others read it. Normally
++	 * IOPMrootDomain::initializeBootSessionUUID fills it; make sure it is
++	 * never left empty on this platform.
++	 */
++	if (bootsessionuuid_string[0] == '\0') {
++		uuid_t u;
++		uuid_generate_random(u);
++		uuid_unparse_upper(u, bootsessionuuid_string);
++		printf("SWEET: kern.bootsessionuuid was empty, set %s\n", bootsessionuuid_string);
++	}
+ 	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
