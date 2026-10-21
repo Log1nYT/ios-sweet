@@ -1,0 +1,692 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_venus_touch.c		standard
+ bsd/dev/sweet_file_patch.c		standard
++bsd/dev/sweet_reboot.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_reboot.c
+@@ -0,0 +1,578 @@
++/*
++ * sweet: the phone reboots itself into the Qualcomm fastboot.
++ *
++ * A panic used to leave the phone in the panic screen until somebody
++ * power-cycled it by hand.  This driver lets the kernel do it: it writes
++ * the "reboot reason" cookie that the Qualcomm ABL bootloader looks at and
++ * then resets the SoC with PSCI SYSTEM_RESET.  The bootloader comes up in
++ * fastboot, where the Mac-side supervisor (tools/venus-supervisor.sh)
++ * boots the newest iOS image again.
++ *
++ * The mechanism on SM8350 ("venus", Xiaomi Mi 11):
++ *
++ *  - the PMK8350 PMIC keeps a "restart reason" byte in its SDAM block
++ *    (SPMI peripheral 0x71, register 0x48).  The vendor device tree
++ *    describes it as the "restart_reason" nvmem cell:
++ *      reboot_reason { compatible = "qcom,reboot-reason";
++ *                      nvmem-cells = <0x584>;
++ *                      nvmem-cell-names = "restart_reason"; }
++ *      sdam@7100 { compatible = "qcom,spmi-sdam"; reg = <0x7100>;
++ *                  restart@48 { reg = <0x48 0x01>; bits = <0x01 0x07>; } }
++ *    The reason itself lives in bits [7:1] of that byte.
++ *  - the ABL bootloader (QcomModulePkg LinuxLoader) reads the reason and
++ *    switches on it: 1 = FASTBOOT_MODE, 2 = RECOVERY_MODE, ...  Linux
++ *    writes exactly that for "reboot bootloader": the magic 1 shifted by
++ *    one bit, i.e. the byte 0x02.
++ *  - a warm reset (PSCI SYSTEM_RESET) leaves the PMIC alive, so the cookie
++ *    survives and the next boot starts in fastboot.
++ *
++ * The SPMI write encoding of the observer protocol is not documented for
++ * this block, so every attempt is verified by reading the byte back and a
++ * rejected command leaves the PMIC alone.  sweetrebootcmd= selects the
++ * encoding, so the value can be fixed without a new kernel build.
++ *
++ * Nothing here runs unless it is asked for:
++ *
++ *  boot arg  sweetreboot=<seconds>  reboot into fastboot every N seconds
++ *                                  (watchdog; absent or 0 = off, default)
++ *  boot arg  sweetrebootmode=plain  the automatic resets are plain reboots
++ *  boot arg  sweetrebootreason=<n>  raw byte for the restart reason
++ *                                  (default 2 = bootloader/fastboot)
++ *  boot arg  sweetrebootcmd=<0..3>  which SPMI command encoding to use
++ *  boot arg  sweetrebootpanic=0     do not reset the phone on a panic
++ *  boot arg  sweetrebootudp=0       do not listen for the magic UDP packet
++ *  sysctl    kern.sweet_reboot      write 1 = reboot into fastboot now,
++ *                                  write 2 = plain reboot, read = state
++ *  UDP       port 5141               a datagram with the text "reboot"
++ *                                  (or "reboot-plain") does the same; the
++ *                                  Mac-side supervisor uses it over the
++ *                                  USB-ECM link (192.168.7.2:5141).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <sys/socket.h>
++#include <sys/kpi_socket.h>
++#include <netinet/in.h>
++#include <libkern/libkern.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++void sweet_reboot_init(void);
++void sweet_reboot_panic(void);
++void sweet_reboot_panic_log(const char *fmt, va_list *args);
++void sweet_reboot_request(void);
++
++/* SPMI arbiter and observer windows (the same ones sweet_keys.c uses). */
++#define SR_SPMI_CORE_PA 0x0c440000u
++#define SR_SPMI_OBS_PA  0x0e600000u
++#define SR_SPMI_CNFG_PA 0x0c40a000u
++
++/*
++ * The arbiter's read/write channel window: one 64 KiB window per APID.  A
++ * write goes there (the observer window is for reads), the command type
++ * sits in bits [29:27] (1 = read, 2 = write) and the data byte in the
++ * WDATA register of the window.
++ */
++#define SR_SPMI_CHNL_PA     0x0c600000u
++#define SR_SPMI_CHNL_STRIDE 0x10000u
++#define SR_SPMI_CHNL_SIZE   0x10000u
++#define SR_SPMI_CMD         0x00u
++#define SR_SPMI_STATUS      0x08u
++#define SR_SPMI_WDATA0      0x10u
++#define SR_SPMI_RDATA0      0x18u
++
++/* The PMK8350 "SDAM" block: SPMI peripheral 0x71 (venus device tree). */
++#define SR_SDAM_PPID    0x071u
++#define SR_REASON_REG   0x48u
++#define SR_NO_APID      0xffffu
++
++/* The bootloader reads the reason from bits [7:1] of that byte. */
++#define SR_REASON_FASTBOOT 0x02u
++
++/* What kern.sweet_reboot and the magic UDP packet ask for. */
++#define SR_REQ_FASTBOOT 1
++#define SR_REQ_PLAIN    2
++
++/* The magic UDP port of the Mac-side supervisor. */
++#define SR_UDP_PORT     5141
++
++static vm_offset_t sr_core, sr_obs, sr_cnfg, sr_chnl;
++static uint16_t sr_apid = SR_NO_APID;
++static uint32_t sr_owner = 0xffffffffu;
++static uint32_t sr_status;
++static bool sr_spmi_ready;
++static int sr_state;              /* the last requested action */
++static int sr_reason = SR_REASON_FASTBOOT;
++static int sr_cmd;                /* SPMI command encoding to use */
++static int sr_watchdog_period;    /* seconds; 0 = off */
++static int sr_mode = SR_REQ_FASTBOOT; /* what the automatic resets do */
++static bool sr_panic_enabled = true;
++static bool sr_udp_enabled = true;
++static int sr_sleep_chan;
++
++static uint32_t
++sr_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* The v5 arbiter can map one PPID twice; prefer the apps-owned entry. */
++static uint16_t
++sr_find_apid(uint16_t ppid, uint32_t count)
++{
++	uint16_t found = SR_NO_APID;
++	uint32_t i;
++
++	for (i = 0; i < count; ++i) {
++		uint32_t map = sr_rd(sr_core, 0x900u + 4u * i);
++		uint32_t owner;
++
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		owner = sr_rd(sr_cnfg, 0x700u + 4u * i) & 7u;
++		if (found == SR_NO_APID || owner == 0) {
++			found = (uint16_t)i;
++		}
++	}
++	return found;
++}
++
++/* One EXT_READL on the observer channel of the PMIC (see sweet_keys.c). */
++static bool
++sr_spmi_read(uint16_t apid, uint16_t reg, uint8_t *out)
++{
++	uint32_t off, wcmd;
++	unsigned i;
++
++	if (apid == SR_NO_APID) {
++		return false;
++	}
++	off = 0x80u * apid;            /* obs + EE(0) * 0x10000 */
++	wcmd = (1u << 27) | ((uint32_t)(reg & 0xffu) << 4); /* EXT_READ, BC=0 */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(sr_obs + off + SR_SPMI_CMD) = wcmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (i = 0; i < 1000; ++i) {
++		sr_status = sr_rd(sr_obs, off + SR_SPMI_STATUS);
++		if (sr_status & 1u) {
++			if (sr_status & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)sr_rd(sr_obs, off + SR_SPMI_RDATA0);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/*
++ * The write command words differ in the command bits and in the window
++ * they are issued through.  The data byte goes into the WDATA register of
++ * the window, the command word into its command register; a rejected
++ * command shows up in the status register and changes nothing in the PMIC.
++ */
++static bool
++sr_spmi_write(uint16_t apid, uint16_t reg, uint8_t val)
++{
++	static const struct {
++		bool chnl;      /* the read/write channel window (not the observer) */
++		uint32_t cmd;   /* the command bits */
++	} forms[5] = {
++		{ true,  (2u << 27) },              /* EXT_WRITE in the channel window */
++		{ false, (2u << 27) },              /* EXT_WRITE in the observer window */
++		{ false, (1u << 27) | (1u << 26) },
++		{ false, (1u << 27) | (0x01u << 16) },
++		{ false, (1u << 27) | (1u << 26) | (0x01u << 16) },
++	};
++	vm_offset_t win;
++	uint32_t off, wcmd;
++	unsigned i;
++	bool done = false;
++	uint8_t back = 0;
++
++	if (apid == SR_NO_APID || sr_cmd < 0 ||
++	    sr_cmd >= (int)(sizeof(forms) / sizeof(forms[0]))) {
++		return false;
++	}
++	if (sr_owner != 0) {
++		/* Another master (the ADSP?) owns this APID: writing it would
++		 * race with that master, so the cookie is not written at all. */
++		printf("SWEET REBOOT: SDAM APID %u is not APPS owned (%u); no write\n",
++		    apid, sr_owner);
++		return false;
++	}
++	if (forms[sr_cmd].chnl) {
++		if (sr_chnl == 0) {
++			sr_chnl = ml_io_map(SR_SPMI_CHNL_PA +
++			    SR_SPMI_CHNL_STRIDE * apid, SR_SPMI_CHNL_SIZE);
++			if (!sr_chnl) {
++				printf("SWEET REBOOT: no SPMI channel window\n");
++				return false;
++			}
++		}
++		win = sr_chnl;
++		off = 0;
++	} else {
++		win = sr_obs;
++		off = 0x80u * apid;
++	}
++	wcmd = forms[sr_cmd].cmd | ((uint32_t)(reg & 0xffu) << 4);
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(win + off + SR_SPMI_WDATA0) = val;
++	*(volatile uint32_t *)(win + off + SR_SPMI_CMD) = wcmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (i = 0; i < 1000; ++i) {
++		sr_status = sr_rd(win, off + SR_SPMI_STATUS);
++		if (sr_status & 1u) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || (sr_status & 0x0eu)) {
++		printf("SWEET REBOOT: SPMI write form %d rejected (status %#x)\n",
++		    sr_cmd, sr_status);
++		return false;
++	}
++	if (sr_spmi_read(apid, reg, &back) && back == val) {
++		return true;
++	}
++	printf("SWEET REBOOT: SPMI write form %d did not stick (%#x)\n",
++	    sr_cmd, back);
++	return false;
++}
++
++static void
++sr_spmi_init(void)
++{
++	uint32_t arb_version, apid_count;
++	uint8_t reason = 0;
++	bool ok;
++
++	if (sr_spmi_ready) {
++		return;
++	}
++	sr_core = ml_io_map(SR_SPMI_CORE_PA, 0x2000);
++	sr_cnfg = ml_io_map(SR_SPMI_CNFG_PA, 0x1000);
++	sr_obs = ml_io_map(SR_SPMI_OBS_PA, 0x10000);
++	if (!sr_core || !sr_cnfg || !sr_obs) {
++		printf("SWEET REBOOT: SPMI mapping failed\n");
++		return;
++	}
++	arb_version = sr_rd(sr_core, 0);
++	apid_count = sr_rd(sr_core, 4) & 0x7ffu;
++	if (arb_version < 0x50000000u || arb_version >= 0x70000000u ||
++	    apid_count == 0 || apid_count > 512) {
++		printf("SWEET REBOOT: unsupported SPMI arbiter %#x (%u APIDs)\n",
++		    arb_version, apid_count);
++		return;
++	}
++	sr_apid = sr_find_apid(SR_SDAM_PPID, apid_count);
++	ok = sr_spmi_read(sr_apid, SR_REASON_REG, &reason);
++	sr_owner = (sr_apid == SR_NO_APID) ? 0xffffffffu :
++	    (sr_rd(sr_cnfg, 0x700u + 4u * sr_apid) & 7u);
++	printf("SWEET REBOOT: SPMI arb=%#x apids=%u sdam-apid=%u owner=%u reason=%#x (%s)\n",
++	    arb_version, apid_count, sr_apid, sr_owner, reason,
++	    ok ? "readable" : "unreadable");
++	sr_spmi_ready = true;
++}
++
++/*
++ * Put the "boot into the bootloader" cookie into the PMIC.  Bit 0 of the
++ * byte belongs to the PMIC, so it is preserved.
++ */
++static bool
++sr_set_fastboot_cookie(void)
++{
++	uint8_t before = 0, after = 0, want;
++
++	sr_spmi_init();
++	if (sr_apid == SR_NO_APID) {
++		printf("SWEET REBOOT: no SDAM APID; no fastboot cookie\n");
++		return false;
++	}
++	if (!sr_spmi_read(sr_apid, SR_REASON_REG, &before)) {
++		printf("SWEET REBOOT: restart reason unreadable; no cookie\n");
++		return false;
++	}
++	want = (uint8_t)((before & 0x01u) | (uint8_t)sr_reason);
++	if (!sr_spmi_write(sr_apid, SR_REASON_REG, want)) {
++		printf("SWEET REBOOT: could not write the restart reason\n");
++		return false;
++	}
++	if (!sr_spmi_read(sr_apid, SR_REASON_REG, &after) || after != want) {
++		printf("SWEET REBOOT: restart reason is %#x, wanted %#x\n",
++		    after, want);
++		return false;
++	}
++	printf("SWEET REBOOT: restart reason %#x -> %#x (fastboot cookie set)\n",
++	    before, after);
++	return true;
++}
++
++/* PSCI SYSTEM_RESET (SMCCC 0xC4000009): a warm reset of the SoC. */
++static void
++sr_psci_reset(void)
++{
++	register uint64_t x0 __asm__("x0") = 0xC4000009ULL;
++	register uint64_t x1 __asm__("x1") = 0ULL;   /* reset type: system reset */
++
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1) :
++	    : "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++	    "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++}
++
++/*
++ * Reset the phone.  With SR_REQ_FASTBOOT the bootloader cookie is set
++ * first, so the next boot starts in fastboot; SR_REQ_PLAIN is a plain
++ * warm reset.  Never returns.
++ */
++__attribute__((noreturn))
++static void
++sr_reboot(int request, const char *why)
++{
++	unsigned i;
++
++	printf("SWEET REBOOT: %s -> %s\n", why,
++	    request == SR_REQ_FASTBOOT ? "fastboot" : "plain reset");
++	if (request == SR_REQ_FASTBOOT) {
++		(void)sr_set_fastboot_cookie();
++	}
++	/* Let the console log (USB) flush before the SoC goes down. */
++	for (i = 0; i < 300; ++i) {
++		delay(1000);
++	}
++	printf("SWEET REBOOT: PSCI SYSTEM_RESET\n");
++	__asm__ volatile("dsb sy" ::: "memory");
++	sr_psci_reset();
++	/* The firmware did not take the reset: spin instead of returning. */
++	for (;;) {
++		delay(1000);
++	}
++}
++
++/* Called from the panic path: a panic must not leave the phone hanging. */
++void
++sweet_reboot_panic(void)
++{
++	if (!sr_panic_enabled) {
++		return;
++	}
++	sr_reboot(SR_REQ_FASTBOOT, "panic");
++}
++
++/*
++ * The panic text goes to the framebuffer console, but not into the USB
++ * log, so it is copied here before the phone resets.
++ */
++void
++sweet_reboot_panic_log(const char *fmt, va_list *args)
++{
++	va_list copy;
++
++	printf("SWEET PANIC: ");
++	va_copy(copy, *args);
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wformat-nonliteral"
++	vprintf(fmt, copy);
++#pragma clang diagnostic pop
++	va_end(copy);
++	printf("\n");
++}
++
++/* Called from the normal reboot path (host_reboot -> halt_all_cpus). */
++__attribute__((noreturn))
++void
++sweet_reboot_request(void)
++{
++	sr_reboot(sr_mode, "reboot request");
++}
++
++static int
++sr_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = sr_state;
++	int error;
++
++	error = sysctl_io_number(req, value, sizeof(int), &value, NULL);
++	if (error != 0) {
++		return error;
++	}
++	if (!req->newptr) {
++		return 0;   /* the value was copied out already */
++	}
++	if (value != SR_REQ_FASTBOOT && value != SR_REQ_PLAIN) {
++		return EINVAL;
++	}
++	sr_state = value;
++	printf("SWEET REBOOT: kern.sweet_reboot=%d\n", value);
++	sr_reboot(value, "sysctl");
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_reboot,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0,                          /* pointer argument (arg1) */
++    0,                          /* integer argument (arg2) */
++    sr_sysctl,                  /* handler */
++    "I",                        /* int */
++    "sweet: 1 = reboot into fastboot, 2 = plain reboot");
++
++static void
++sr_sleep(uint32_t seconds)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(seconds, (uint32_t)NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&sr_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* The watchdog: reboot into fastboot every N seconds. */
++__attribute__((noreturn))
++static void
++sr_watchdog_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		sr_sleep((uint32_t)sr_watchdog_period);
++		sr_reboot(sr_mode, "watchdog");
++	}
++}
++
++/*
++ * The magic UDP packet: the Mac-side supervisor cannot open a shell on the
++ * phone, so it sends "reboot" to the USB-ECM address and the kernel does
++ * the reset.  Only the exact words are accepted.
++ */
++__attribute__((noreturn))
++static void
++sr_udp_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	socket_t so = NULL;
++	struct sockaddr_in sin;
++	struct iovec iov;
++	struct msghdr msg;
++	char buf[64];
++	size_t len, i;
++
++	for (;;) {
++		if (so == NULL) {
++			if (sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL,
++			    &so) != 0) {
++				so = NULL;
++				sr_sleep(1);
++				continue;
++			}
++			bzero(&sin, sizeof(sin));
++			sin.sin_len = sizeof(sin);
++			sin.sin_family = AF_INET;
++			sin.sin_port = htons(SR_UDP_PORT);
++			sin.sin_addr.s_addr = htonl(INADDR_ANY);
++			if (sock_bind(so, (struct sockaddr *)&sin) != 0) {
++				printf("SWEET REBOOT: cannot bind UDP port %d\n",
++				    SR_UDP_PORT);
++				sock_close(so);
++				so = NULL;
++				sr_sleep(1);
++				continue;
++			}
++			printf("SWEET REBOOT: listening on UDP port %d\n",
++			    SR_UDP_PORT);
++		}
++		iov.iov_base = buf;
++		iov.iov_len = sizeof(buf);
++		bzero(&msg, sizeof(msg));
++		msg.msg_iov = &iov;
++		msg.msg_iovlen = 1;
++		len = 0;
++		if (sock_receive(so, &msg, 0, &len) != 0) {
++			sr_sleep(1);
++			continue;
++		}
++		if (len >= sizeof(buf)) {
++			len = sizeof(buf) - 1;
++		}
++		buf[len] = '\0';
++		for (i = 0; i < len; i++) {
++			if (buf[i] == '\n' || buf[i] == '\r') {
++				buf[i] = '\0';
++				break;
++			}
++		}
++		printf("SWEET REBOOT: UDP packet \"%s\"\n", buf);
++		if (strcmp(buf, "reboot") == 0) {
++			sr_state = SR_REQ_FASTBOOT;
++			sr_reboot(SR_REQ_FASTBOOT, "udp");
++		} else if (strcmp(buf, "reboot-plain") == 0) {
++			sr_state = SR_REQ_PLAIN;
++			sr_reboot(SR_REQ_PLAIN, "udp");
++		}
++	}
++}
++
++void
++sweet_reboot_init(void)
++{
++	int value;
++	char mode[16];
++	thread_t thread;
++
++	if (PE_parse_boot_argn("sweetreboot", &value, sizeof(value)) && value > 0) {
++		sr_watchdog_period = value;
++	}
++	if (PE_parse_boot_argn("sweetrebootreason", &value, sizeof(value)) &&
++	    value >= 0 && value <= 0xff) {
++		sr_reason = value;
++	}
++	if (PE_parse_boot_argn("sweetrebootcmd", &value, sizeof(value)) &&
++	    value >= 0 && value <= 4) {
++		sr_cmd = value;
++	}
++	if (PE_parse_boot_argn("sweetrebootpanic", &value, sizeof(value)) &&
++	    value == 0) {
++		sr_panic_enabled = false;
++	}
++	if (PE_parse_boot_argn("sweetrebootudp", &value, sizeof(value)) &&
++	    value == 0) {
++		sr_udp_enabled = false;
++	}
++	if (PE_parse_boot_argn("sweetrebootmode", mode, sizeof(mode))) {
++		sr_mode = (strcmp(mode, "plain") == 0) ? SR_REQ_PLAIN :
++		    SR_REQ_FASTBOOT;
++	}
++	printf("SWEET REBOOT: reason=%#x cmd=%d panic=%d udp=%d watchdog=%ds mode=%s\n",
++	    (unsigned)sr_reason, sr_cmd, sr_panic_enabled, sr_udp_enabled,
++	    sr_watchdog_period, sr_mode == SR_REQ_PLAIN ? "plain" : "fastboot");
++
++	if (sr_watchdog_period > 0) {
++		if (kernel_thread_start(sr_watchdog_thread, NULL, &thread) ==
++		    KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("SWEET REBOOT: watchdog thread start failed\n");
++		}
++	}
++	if (sr_udp_enabled) {
++		if (kernel_thread_start(sr_udp_thread, NULL, &thread) ==
++		    KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("SWEET REBOOT: udp thread start failed\n");
++		}
++	}
++	/* Read the cookie once, so the log shows what the last boot left. */
++	sr_spmi_init();
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_filepatch_init(void);
++extern void sweet_reboot_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -664,6 +665,7 @@ sweet_ufs_init(void)
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+ 	sweet_filepatch_init();
++	sweet_reboot_init();
+ 	return 0;
+ }
+ 
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -64,6 +64,11 @@
+ #include <IOKit/IOHibernatePrivate.h>
+ #endif /* HIBERNATION */
+ 
++#if defined(SWEET)
++/* bsd/dev/sweet_reboot.c: reset the phone through the bootloader cookie */
++extern void sweet_reboot_request(void);
++#endif
++
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+ #include <arm64/amcc_rorgn.h>
+ #endif
+@@ -748,6 +753,14 @@ halt_all_cpus(boolean_t reboot)
+ {
+ 	if (reboot) {
+ 		printf("MACH Reboot\n");
++#if defined(SWEET)
++		/*
++		 * There is no platform reset on this board, so PEHaltRestart()
++		 * returns without doing anything and the phone would hang.
++		 * Reset it through the bootloader cookie instead.
++		 */
++		sweet_reboot_request();
++#endif
+ 		PEHaltRestart(kPERestartCPU);
+ 	} else {
+ 		printf("CPU halted\n");
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -87,6 +87,11 @@
+ #if defined(__arm64__)
+ #include <arm64/sweet_early.h>
+ #endif
++#if defined(SWEET)
++/* bsd/dev/sweet_reboot.c: reset the phone into the bootloader on a panic */
++extern void sweet_reboot_panic(void);
++extern void sweet_reboot_panic_log(const char *fmt, va_list *args);
++#endif
+ #include <IOKit/IOBSD.h>
+ 
+ #if !(MACH_KDP && CONFIG_KDP_INTERACTIVE_DEBUGGING)
+@@ -1075,6 +1080,11 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ #if defined(SWEET)
+ 	/* No CPU/thread/debugger state is required for this first panic copy. */
+ 	sweet_early_panic(panic_format_str, panic_args);
++	/*
++	 * The panic text goes to the framebuffer console but not into the
++	 * USB log, so copy it there before the phone resets itself.
++	 */
++	sweet_reboot_panic_log(panic_format_str, panic_args);
+ #endif
+ 
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+@@ -1171,6 +1181,15 @@ panic_spin_forever(void)
+ static void
+ kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags)
+ {
++#if defined(SWEET)
++	/*
++	 * There is no platform reset on this board: PEHaltRestart() returns
++	 * without doing anything and the phone would sit in the panic screen
++	 * until a human power-cycles it.  Reset into the bootloader instead
++	 * (the Mac side boots the iOS image again from fastboot).
++	 */
++	sweet_reboot_panic();
++#endif
+ 	if ((type == kPEPanicRestartCPU) && (debugger_flags & DEBUGGER_OPTION_SKIP_PANICEND_CALLOUTS)) {
+ 		PEHaltRestart(kPEPanicRestartCPUNoCallouts);
+ 	} else {
+@@ -1459,6 +1478,11 @@ debugger_collect_diagnostics(unsigned int exception, unsigned int code, unsigned
+ 		kdp_machine_reboot_type(kPEPanicRestartCPU, debugger_panic_options);
+ 	}
+ 
++#if defined(SWEET)
++	/* The panic did not reach the reset path: do it here. */
++	sweet_reboot_panic();
++#endif
++
+ 	paniclog_append_noflush("\nPlease go to https://panic.apple.com to report this panic\n");
+ 	panic_spin_forever();
+ }
