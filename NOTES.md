@@ -1,5 +1,15 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> 2026-10-21 10:10 v18h RESULT: allow-hactivation DID NOT HELP; where the real blocker sits <<<
+
+- v18h = v18g + ADT `/product allow-hactivation=1` (documented Hactivation gate, theapplewiki; now also in tools/mkadt_venus.py) + tee of `cfprefsd`. Setup STILL shows Wi-Fi / connect-to-computer. `mobileactivation` still makes ZERO open() calls.
+- `cfprefsd` DOES open `com.apple.purplebuddy.plist` (ok in some dirs), so the SetupDone prefs are read; the activation gate is the daemon's answer, not the prefs.
+- Deep research report (Ukrainian) in this chat: Hactivation = `allow-hactivation` in /product + development kernel; lockdownd and mobileactivationd each check `ShouldHactivate`; best precedent eShard QEMU iOS14 = patch mobileactivationd + pre-written purplebuddy plist; no public source on data_ark/containermanagerd. Sandbox op 4 = container_path_for_pid (Levin HITB2016), special host port 25 = containerd port (host_set_special_port can return KERN_NO_ACCESS via csr/mac hook - cheap thing to check).
+- Static (mobileactivationd 20H392, file offset == mh offset): state strings are an ObjC global table at 0x100215a08 `[Unactivated, Activated, FactoryActivated]` and key `kActivationState` at 0x100215b60 (decoded from __cfstring + chained-fixup rebase pointers). ~100 code xrefs (ldr from adrp page 0x100215000). Function at 0x10002100c = "initialise data ark defaults" (writes ActivationState=Unactivated, called from boot init). The function that decides Activated/Hactivated is not yet identified; needs Ghidra or stub-name resolution (lief indirect symbols).
+- **Structural limitation:** the iOS root image is gone from the Mac (old /tmp image lost), so every userland change currently needs a kernel-side mechanism. Idea: patch `0096` = boot-time kernel file patcher/seeder (vnode_open + vn_rdwr after rootmount; boot-arg `sweetfilepatch=path:off:hex`, plus seeding data_ark/prefs/dirs) so userland binaries/plists can be changed without reflashing 9 GB.
+- Pending CI: 0092v2+0093+0094 built (xnu/out-0094). 0095 (sandbox op trace) committed, NOT built yet.
+
+
 ## >>> 2026-10-21 09:45 POWER KEY WORKS; ACTIVATION = CONTAINER PROBLEM (hypothesis) <<<
 
 - **Power key CONFIRMED** (v18f/g, kernel `xnu/out-0094`, CI = 0092v2+0093+0094): each press gives `SWEET KEYS: key=0 down=1 pon=0x90` / `down=0 pon=0x10`; display on/off works (the off animation is slow = CPU renderer, no GPU). Gestures work (`home-button-type=2`). Boot helper now points at `shim-boot-venus-v18g.img` (cmdline: sweetteewrite=Setup,mobileactivation,containermanager sweetteeopenok=1, sweetsample += mobileactivation,Setup, sweethidtest=0). The kernel-blob for mkbootimg is ALWAYS `shim/out/kernel-blob-venus-v18.bin` (811016 B, from the working image), never `Image.gz`.
