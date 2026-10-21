@@ -38,12 +38,17 @@ Boot args: sweetperf=1 (enable), sweetperfint=<s> (sampler period, default
 driver keeps its behaviour).
 
 diff --git a/bsd/conf/files b/bsd/conf/files
+# The line is added at the end of the bsd/dev group on purpose: the sweet_*.c
+# lines in the middle of that group are the anchor of the hunks of 0112, 0113,
+# 0115, 0116, 0119, 0122 and 0124, and an insertion in the middle of them
+# breaks their context (the CI skips a patch whose hunk does not apply).
+
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -110,2 +110,3 @@
- bsd/dev/sweet_keys.c			standard
+@@ -129,2 +129,3 @@
+ bsd/dev/dev_perfmon.c optional config_perfmon
 +bsd/dev/sweet_perf.c		standard
- bsd/dev/sweet_touch.c			standard
+ 
 diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
 new file mode 100644
 index 0000000..075551a

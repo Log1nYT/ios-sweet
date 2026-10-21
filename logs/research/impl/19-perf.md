@@ -19,6 +19,16 @@ thread, prints nothing and changes no behaviour.
 are needed there are written out in section 5 below so that whoever owns
 that file can apply them without a conflict.
 
+**Why the `bsd/conf/files` line is at the end of the `bsd/dev` group.**
+`bsd/conf/files` is being patched by ~30 agents at the same time and the CI
+*skips* a patch whose hunk does not apply (`git apply --check` -> warning,
+the feature is then silently missing).  Every `sweet_*.c` line in the middle
+of the `bsd/dev` group is the anchor of somebody else's hunk (0112, 0113,
+0115, 0116, 0119, 0122, 0124), so an insertion there breaks their context.
+The line is therefore added after `bsd/dev/dev_perfmon.c`, at the end of the
+group, where no hunk of any other patch has its context.  The order of the
+files in the list does not matter for the build.
+
 ## 1. The measured baseline (report 22, all numbers measured on venus)
 
 | fact | number | source |
