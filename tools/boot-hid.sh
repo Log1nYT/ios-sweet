@@ -4,5 +4,5 @@ set -e
 cd "$(dirname "$0")/.."
 sudo pkill -f 'nc -ukl 5140' || true
 sudo pkill -f 'venus-usbnet-mac.sh' || true
-sudo bash tools/venus-usbnet-mac.sh logs/venus-live-20261021a.txt &
-fastboot boot shim/out/shim-boot-venus-v18c.img
+sudo bash tools/venus-usbnet-mac.sh logs/venus-live-20261021c.txt &
+fastboot boot shim/out/shim-boot-venus-v18e.img

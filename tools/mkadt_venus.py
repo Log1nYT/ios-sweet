@@ -222,6 +222,8 @@ def build(seed=None, qemu=False, highmem=False):
         ph(),
         ('button-names', cstr('volup') + cstr('voldown') + cstr('hold')),
         ('opposed-power-vol-buttons', u32(1)),
+        # 2 = no Home button (iPhone X class gestures), as in tools/mkadt.py
+        ('home-button-type', u32(2)),
     ])
 
     product_props = d21ap_product()
