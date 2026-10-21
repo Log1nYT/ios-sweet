@@ -333,5 +333,13 @@ the baseline both are compared against.
 | `xnu/patches/SweetGPU.cpp` | standalone copy of the new source, for the local single-file compile loop (same convention as `xnu/patches/sweet_file_patch.c`) |
 | `logs/research/impl/12-gpu-iokit.md` | this report |
 
-The working copy used for the compile checks is `logs/gpu3/xnu` (a copy of
-`logs/bt3/xnu`); `logs/bt3/xnu` was not modified.
+The compile checks were done in a scratch copy of the patched tree,
+`logs/gpu3/xnu` (a copy of `logs/bt3/xnu` + the patch applied); it was
+removed again afterwards, so the only lasting artefacts are the three files
+above.  `logs/bt3/xnu` was **not** modified.
+
+`xnu/patches/SweetGPU.cpp` is also the file `tools/research/compile-one.sh`
+installs into a build tree when the source is new (`install_source()` looks
+for `xnu/patches/<basename>` first) - note that it *writes* into the build
+tree it is pointed at, so use a scratch copy (or `logs/gpu3`) and not
+`logs/bt3/xnu`.
