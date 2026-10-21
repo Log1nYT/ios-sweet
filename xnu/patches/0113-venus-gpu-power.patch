@@ -961,7 +961,6 @@ new file mode 100644
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
-new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_power.h
 @@ -0,0 +1,38 @@

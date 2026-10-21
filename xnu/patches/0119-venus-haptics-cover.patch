@@ -1141,7 +1141,7 @@ diff --git a/iokit/Kernel/arm/hid/SweetHaptics.cpp b/iokit/Kernel/arm/hid/SweetH
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/SweetHaptics.cpp
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,141 @@
 +/*
 + * SWEET: the haptic engine service.
 + *
@@ -1166,6 +1166,7 @@ new file mode 100644
 + * GUESS, the userland side of this path is not known (see
 + * logs/research/impl/17-haptics-cover.md).
 + */
++#include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOTimerEventSource.h>
@@ -1286,7 +1287,7 @@ diff --git a/iokit/Kernel/arm/hid/SweetCoverSensor.cpp b/iokit/Kernel/arm/hid/Sw
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/SweetCoverSensor.cpp
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,118 @@
 +/*
 + * SWEET: the cover (hall switch) and headset sensor service.
 + *
@@ -1312,6 +1313,7 @@ new file mode 100644
 + * naming of the HID sensor keys and of the other SWEET services; see
 + * logs/research/impl/17-haptics-cover.md.
 + */
++#include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOService.h>
 +#include <libkern/c++/OSArray.h>
@@ -1353,13 +1355,13 @@ new file mode 100644
 +		return false;
 +	}
 +	/* Initial state: unknown. */
-+	setProperty("CoverClosed", kOSBooleanFalse);
-+	setProperty("LidClosed", kOSBooleanFalse);
-+	setProperty("HallSwitchState", 0, 32);
-+	setProperty("CoverState", 0, 32);		/* 0 = open, 1 = closed */
-+	setProperty("SmartCoverAttached", kOSBooleanFalse);
-+	setProperty("HeadphonesConnected", kOSBooleanFalse);
-+	setProperty("SensorPropertySupported", 0x3ull, 32);
++	setProperty("CoverClosed", (OSObject *)kOSBooleanFalse);
++	setProperty("LidClosed", (OSObject *)kOSBooleanFalse);
++	setProperty("HallSwitchState", (OSNumber *)OSNumber::withNumber((unsigned long long)0, 32));
++	setProperty("CoverState", (OSNumber *)OSNumber::withNumber((unsigned long long)0, 32));		/* 0 = open, 1 = closed */
++	setProperty("SmartCoverAttached", (OSObject *)kOSBooleanFalse);
++	setProperty("HeadphonesConnected", (OSObject *)kOSBooleanFalse);
++	setProperty("SensorPropertySupported", (OSNumber *)OSNumber::withNumber((unsigned long long)0x3, 32));
 +	gSweetCover = this;
 +	registerService();
 +	IOLog("SWEET HID: cover/headset sensor registered (hall switch)\n");

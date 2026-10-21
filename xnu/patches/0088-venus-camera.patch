@@ -21,7 +21,7 @@
      "     'IOClass'         = IOPanicPlatform;"
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetCamera.cpp
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,96 @@
 +/*
 + * Stub AppleH10CamIn for venus (research stub, NOT a camera driver).
 + *

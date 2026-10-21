@@ -1,0 +1,96 @@
+/*
+ * Stub AppleH10CamIn for venus (research stub, NOT a camera driver).
+ *
+ * Camera pipeline (iOS 16): Camera.app -> AVFoundation -> mediaserverd /
+ * cameracaptured (CMCapture) -> IOServiceMatching("AppleH10CamIn") on the
+ * iPhone 8 (the ADT /arm-io/isp nub) -> IOServiceOpen -> external methods
+ * (power, firmware, stream config, buffer pools). This service exists only
+ * to (a) make that lookup/open succeed and (b) log every selector the
+ * callers use, so the real list is measured instead of guessed. Every call
+ * returns success with zeroed outputs. No sensor, CCI, CSIPHY or ISP is
+ * touched, so there are no frames: expect black preview at best, and
+ * CMCapture may still reject the device. Enabled only with boot-arg
+ * venuscam=1 (default: not published, behaviour unchanged).
+ */
+#include <pexpert/arm64/board_config.h>
+
+#if defined(SWEET)
+#include <IOKit/IOService.h>
+#include <IOKit/IOKitKeys.h>
+#include <IOKit/IOUserClient.h>
+#include <IOKit/IOLib.h>
+#include <IOKit/IOMemoryDescriptor.h>
+#include <pexpert/pexpert.h>
+#include <sys/proc.h>
+
+class AppleH10CamIn : public IOService {
+	OSDeclareDefaultStructors(AppleH10CamIn);
+
+public:
+	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+};
+
+OSDefineMetaClassAndStructors(AppleH10CamIn, IOService);
+
+bool
+AppleH10CamIn::start(IOService *provider)
+{
+	uint32_t on = 0;
+	if (!PE_parse_boot_argn("venuscam", &on, sizeof(on)) || !on) {
+		return false;
+	}
+	if (!IOService::start(provider)) {
+		return false;
+	}
+	setProperty(kIOUserClientClassKey, "AppleH10CamInUserClient");
+	setProperty("IOClass", "AppleH10CamIn");
+	registerService();
+	IOLog("SWEET CAM: stub AppleH10CamIn registered (no hardware)\n");
+	return true;
+}
+
+class AppleH10CamInUserClient : public IOUserClient {
+	OSDeclareDefaultStructors(AppleH10CamInUserClient);
+
+public:
+	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+	    IOExternalMethodDispatch *dispatch, OSObject *target,
+	    void *reference) APPLE_KEXT_OVERRIDE;
+};
+
+OSDefineMetaClassAndStructors(AppleH10CamInUserClient, IOUserClient);
+
+IOReturn
+AppleH10CamInUserClient::clientClose(void)
+{
+	terminate();
+	return kIOReturnSuccess;
+}
+
+static uint64_t sweet_cam_logged;       /* selectors already logged (< 64) */
+
+IOReturn
+AppleH10CamInUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+    __unused void *reference)
+{
+	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+		args->scalarOutput[i] = 0;
+	}
+	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+		bzero(args->structureOutput, args->structureOutputSize);
+	}
+	if (selector >= 64 || !(sweet_cam_logged & (1ULL << selector))) {
+		if (selector < 64) {
+			sweet_cam_logged |= 1ULL << selector;
+		}
+		char name[32];
+		proc_selfname(name, sizeof(name));
+		IOLog("SWEET CAM: %s sel %u in %u/%u out %u/%u -> ok\n", name, selector,
+		    args->scalarInputCount, args->structureInputSize,
+		    args->scalarOutputCount, args->structureOutputSize);
+	}
+	return kIOReturnSuccess;
+}
+#endif /* SWEET */
