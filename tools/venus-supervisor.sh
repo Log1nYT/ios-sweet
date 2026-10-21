@@ -38,7 +38,16 @@ tg()  { [ -x "$TG" ] && bash "$TG" "$1" >/dev/null 2>&1; }
 last_size()  { stat -f '%z' "$LOG" 2>/dev/null || echo 0; }
 last_mtime() { stat -f '%m' "$LOG" 2>/dev/null || echo 0; }
 in_fastboot() { fastboot devices 2>/dev/null | grep -q 'fastboot'; }
-newest_image() { ls -t "$IMG_DIR"/shim-boot-venus-*.img 2>/dev/null | head -1; }
+newest_image() {
+	# A pinned image wins: shim/out/CURRENT holds a file name.  That way we
+	# can switch between a good and an experimental image without a rebuild
+	# and without the crash-loop guard tripping.
+	if [ -f "$IMG_DIR/CURRENT" ]; then
+		local pinned="$IMG_DIR/$(cat "$IMG_DIR/CURRENT")"
+		[ -f "$pinned" ] && { echo "$pinned"; return; }
+	fi
+	ls -t "$IMG_DIR"/shim-boot-venus-*.img 2>/dev/null | head -1
+}
 
 # The kernel (patch 0102) listens on UDP 5141: the payload "reboot" resets the
 # phone into the Qualcomm fastboot, so the supervisor can boot a new image

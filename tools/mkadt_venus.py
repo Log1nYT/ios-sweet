@@ -609,7 +609,12 @@ def build(seed=None, qemu=False, highmem=False, features=()):
     # (reg[1], iBoot's kMemoryRegion_Panic size, is ignored); the size comes
     # from /chosen/embedded-panic-log-size.  The region sits just above the
     # dram-size we expose, so XNU maps it but never allocates into it.
-    pram = node('pram', [ph(), ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
+    # pexpert/arm/pe_init.c: check_for_panic_log() takes the physical BASE
+    # from the /pram node's reg[0] and the size from
+    # /chosen/embedded-panic-log-size, then maps it with ml_io_map_wcomb().
+    # reg[1] is the size of iBoot's panic region (not used by XNU) but the
+    # real tree has it, so we publish it too.
+    pram = node('pram', [ph(), ('reg', u64(panic_base, PANIC_LOG_SIZE))])
 
     # Identity of the iPhone 8 whose userland runs here: compatible[0] is
     # hw.model/hw.target (D21AP), model is hw.machine/hw.product
