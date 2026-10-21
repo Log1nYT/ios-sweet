@@ -1,0 +1,311 @@
+sweet: mount the root volume with its journal, even if fsck rewrote the header
+
+A volume created with "mkfs.hfsplus -J" / "newfs_hfs -J" keeps its journal
+(journal info block + embedded journal) even when "fsck.hfsplus -f -y" rewrites
+the volume header and loses the "the last mounter was journal aware" marker
+(vhp->lastMountedVersion != kHFSJMountVersion).  Apple's driver then never
+opens the journal: every metadata update goes straight to the disk (no
+transaction, no atomicity, no replay), hfs_start_transaction() takes the
+global HFS lock exclusively (the create path deadlocks against it) and a
+hard power-off leaves the volume inconsistent.
+
+This patch detects the journal physically (the journal info block at
+vhp->journalInfoBlock has to be readable and has to describe an embedded
+journal inside the volume) and mounts the volume with the journal enabled
+anyway.  A volume without a journal is not touched at all.  A journal that
+was used by a mount that was not journal aware is discarded instead of
+replayed (the same thing hfs_late_journal_init() does), so a stale journal
+can never be replayed over a volume that was written behind our back.
+
+Boot arg "sweetfsjournal=0" turns the detection off again (comparison boot).
+
+--- a/bsd/sweet_hfs/core/hfs.h
++++ b/bsd/sweet_hfs/core/hfs.h
+@@ -979,6 +979,11 @@ extern int     hfs_early_journal_init(struct hfsmount *hfsmp, HFSPlusVolumeHeade
+ 			   void *_args, off_t embeddedOffset, daddr64_t mdb_offset,
+ 			   HFSMasterDirectoryBlock *mdbp, kauth_cred_t cred);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern int     hfs_sweet_journal_detect(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
++			   off_t embeddedOffset, kauth_cred_t cred, int *used);
++#endif
++
+ extern int  hfs_virtualmetafile(struct cnode *);
+ 
+ extern int hfs_start_transaction(struct hfsmount *hfsmp);
+--- a/bsd/sweet_hfs/core/hfs_vfsops.c
++++ b/bsd/sweet_hfs/core/hfs_vfsops.c
+@@ -1417,6 +1417,12 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 		HFSPlusVolumeHeader *vhp;
+ 		off_t embeddedOffset;
+ 		int   jnl_disable = 0;
++		int   jnl_wanted = 0;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		int   sweet_journal = 0;		/* the volume physically has a journal */
++		int   sweet_journal_used = 0;	/* ... and it has been used before */
++		int   sweet_journal_ok = 1;		/* sweetfsjournal=0 turns it off */
++#endif
+ 	
+ 		/* Get the embedded Volume Header */
+ 		if (SWAP_BE16(mdbp->drEmbedSigWord) == kHFSPlusSigWord) {
+@@ -1570,7 +1576,62 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 		    args->journal_disable) {
+ 		    jnl_disable = 1;
+ 		}
+-				
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * SWEET: a volume header can lose the "the last mounter was
++		 * journal aware" marker (vhp->lastMountedVersion !=
++		 * kHFSJMountVersion) - "fsck.hfsplus -f -y" rewrites the
++		 * volume header and does exactly that.  The journal itself is
++		 * still on the volume (the journal info block points at it),
++		 * so look for it and mount the volume with the journal
++		 * enabled anyway.  Without a journal every metadata update
++		 * goes straight to the disk (no transaction, no atomicity,
++		 * no replay) and a hard power-off leaves the volume
++		 * inconsistent.
++		 *
++		 * Boot arg "sweetfsjournal=0" turns this off again (for a
++		 * comparison boot); any other value (or none at all) leaves
++		 * it on.
++		 */
++		{
++			uint32_t sweetfsjournal = 1;
++
++			if (PE_parse_boot_argn("sweetfsjournal", &sweetfsjournal, sizeof(sweetfsjournal))) {
++				if (sweetfsjournal == 0)
++					sweet_journal_ok = 0;
++			}
++		}
++
++		printf("hfs: SWEET: volume header: attributes 0x%08x lastMountedVersion 0x%08x journalInfoBlock %u\n",
++		       SWAP_BE32(vhp->attributes),
++		       SWAP_BE32(vhp->lastMountedVersion),
++		       SWAP_BE32(vhp->journalInfoBlock));
++
++		if (sweet_journal_ok && !jnl_disable &&
++		    !((SWAP_BE32(vhp->lastMountedVersion) == kHFSJMountVersion) &&
++		      (SWAP_BE32(vhp->attributes) & kHFSVolumeJournaledMask))) {
++			sweet_journal = hfs_sweet_journal_detect(hfsmp, vhp, embeddedOffset, cred, &sweet_journal_used);
++			if (sweet_journal) {
++				if (sweet_journal_used &&
++				    (SWAP_BE32(vhp->lastMountedVersion) != kHFSJMountVersion)) {
++					/*
++					 * The journal was used by a mount that was not
++					 * journal aware, so it may be out of date: it
++					 * has to be discarded instead of replayed over
++					 * the volume.
++					 */
++					hfsmp->hfs_flags |= HFS_NEED_JNL_RESET;
++					printf("hfs: SWEET: the volume has a stale journal, resetting it (no replay)\n");
++				} else {
++					printf("hfs: SWEET: the volume has a journal, mounting it journaled\n");
++				}
++			} else {
++				printf("hfs: SWEET: no journal on this volume, mounting it without one\n");
++			}
++		}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ 		//
+ 		// We only initialize the journal here if the last person
+ 		// to mount this volume was journaling aware.  Otherwise
+@@ -1580,9 +1641,25 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 		// (so we need to go find the .journal file, make sure it's
+ 		// the right size, re-sync up if it was moved, etc).
+ 		//
+-		if (   (SWAP_BE32(vhp->lastMountedVersion) == kHFSJMountVersion)
+-			&& (SWAP_BE32(vhp->attributes) & kHFSVolumeJournaledMask)
+-			&& !jnl_disable) {
++		// SWEET: also initialize it when the volume physically has a
++		// journal (see hfs_sweet_journal_detect() above) - that is the
++		// path the journal was designed for, and it makes the driver
++		// write lastMountedVersion = kHFSJMountVersion so that every
++		// later mount (and every replay after a crash) uses it too.
++		//
++		if (!jnl_disable) {
++			if ((SWAP_BE32(vhp->lastMountedVersion) == kHFSJMountVersion) &&
++			    (SWAP_BE32(vhp->attributes) & kHFSVolumeJournaledMask)) {
++				jnl_wanted = 1;
++			}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			else {
++				jnl_wanted = sweet_journal;
++			}
++#endif
++		}
++
++		if (jnl_wanted) {
+ 			
+ 			// if we're able to init the journal, mark the mount
+ 			// point as journaled.
+@@ -1590,6 +1667,8 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 			if ((retval = hfs_early_journal_init(hfsmp, vhp, args, embeddedOffset, mdb_offset, mdbp, cred)) == 0) {
+ 				if (mp)
+ 					vfs_setflags(mp, (u_int64_t)((unsigned int)MNT_JOURNALED));
++				/* the journal is open: the reset (if any) is done */
++				hfsmp->hfs_flags &= ~HFS_NEED_JNL_RESET;
+ 			} else {
+ 				if (retval == EROFS) {
+ 					// EROFS is a special error code that means the volume has an external
+--- a/bsd/sweet_hfs/core/hfs_vfsutils.c
++++ b/bsd/sweet_hfs/core/hfs_vfsutils.c
+@@ -264,6 +264,18 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 	vcb->vcbJinfoBlock = SWAP_BE32(vhp->journalInfoBlock);
+ 	vcb->vcbLsMod	= to_bsd_time(SWAP_BE32(vhp->modifyDate));
+ 	vcb->vcbAtrb	= SWAP_BE32(vhp->attributes);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET: we may have opened a journal on a volume whose header did
++	 * not advertise one (the "journaled" attribute or the
++	 * lastMountedVersion marker was lost, e.g. by "fsck.hfsplus -f -y").
++	 * Keep the header in sync so that the next mount takes the normal
++	 * (Apple) path and the journal is replayed after a crash.
++	 */
++	if (hfsmp->jnl) {
++		vcb->vcbAtrb |= kHFSVolumeJournaledMask;
++	}
++#endif
+ 	vcb->vcbClpSiz	= SWAP_BE32(vhp->rsrcClumpSize);
+ 	vcb->vcbNxtCNID	= SWAP_BE32(vhp->nextCatalogID);
+ 	vcb->vcbVolBkUp	= to_bsd_time(SWAP_BE32(vhp->backupDate));
+@@ -2469,6 +2481,116 @@ void hfs_close_jvp(hfsmount_t *hfsmp)
+ 	hfsmp->jvp = NULL;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: find out whether the volume physically has a journal.
++ *
++ * A journaled HFS+ volume keeps a "journal info block" (JIB) at the block
++ * number the volume header points to (vhp->journalInfoBlock).  The JIB
++ * describes where the journal itself lives (byte offset + size inside the
++ * volume) and whether it still has to be initialized.
++ *
++ * Apple's driver only opens the journal when the last mounter was journal
++ * aware (vhp->lastMountedVersion == kHFSJMountVersion).  A volume that was
++ * created with "mkfs.hfsplus -J" / "newfs_hfs -J" and afterwards repaired
++ * with "fsck.hfsplus -f -y" keeps its journal but loses that marker, so the
++ * journal is never opened: every metadata update then goes straight to the
++ * disk (no transaction, no atomicity, no replay).
++ *
++ * We detect the journal physically: the JIB has to be readable and it has to
++ * describe an embedded (in-volume) journal of a plausible size that lies
++ * inside the volume.  Nothing else is touched, so a volume without a journal
++ * behaves exactly as before.
++ *
++ * Returns 1 if the volume has a journal, 0 if it does not.
++ *
++ * *used is set to 1 when the journal has been used before (the JIB has no
++ * "need init" flag).  The caller decides what to do with it: if the last
++ * mounter was not journal aware (fsck, a non-journaled HFS driver), the
++ * volume may have been changed behind our back, so the journal must NOT be
++ * replayed over it - it has to be reset (discarded) instead, exactly like
++ * hfs_late_journal_init() does.
++ */
++int
++hfs_sweet_journal_detect(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
++			 off_t embeddedOffset, kauth_cred_t cred, int *used)
++{
++	JournalInfoBlock *jibp;
++	struct buf       *jinfo_bp;
++	int               sectors_per_fsblock;
++	int               retval;
++	uint32_t          blksize = hfsmp->hfs_logical_block_size;
++	uint32_t          blockSize = SWAP_BE32(vhp->blockSize);
++	uint32_t          jib_blkno;
++	uint32_t          jib_flags;
++	uint64_t          jib_offset;
++	uint64_t          jib_size;
++
++	*used = 0;
++
++	if (blockSize == 0 || blksize == 0)
++		return 0;
++
++	jib_blkno = SWAP_BE32(vhp->journalInfoBlock);
++	if (jib_blkno == 0)
++		return 0;
++
++	sectors_per_fsblock = blockSize / blksize;
++	if (sectors_per_fsblock == 0)
++		return 0;
++
++	jinfo_bp = NULL;
++	retval = (int)buf_meta_bread(hfsmp->hfs_devvp,
++			(daddr64_t)((embeddedOffset / blksize) +
++			            ((u_int64_t)jib_blkno * sectors_per_fsblock)),
++			hfsmp->hfs_physical_block_size, cred, &jinfo_bp);
++	if (retval) {
++		if (jinfo_bp)
++			buf_brelse(jinfo_bp);
++		return 0;
++	}
++
++	jibp = (JournalInfoBlock *)buf_dataptr(jinfo_bp);
++	jib_flags  = SWAP_BE32(jibp->flags);
++	jib_offset = SWAP_BE64(jibp->offset);
++	jib_size   = SWAP_BE64(jibp->size);
++
++	/*
++	 * Only an embedded journal is safe to enable here: an external
++	 * journal lives on another device and needs its own discovery.
++	 */
++	if (!(jib_flags & kJIJournalInFSMask)) {
++		buf_brelse(jinfo_bp);
++		return 0;
++	}
++
++	/*
++	 * The journal has to be inside the volume, aligned to an allocation
++	 * block, of a plausible size (the same limits journal_open() uses)
++	 * and it must not overlap the volume header.
++	 */
++	if (jib_offset == 0 ||
++	    (jib_offset % (uint64_t)blockSize) != 0 ||
++	    jib_size < (uint64_t)(256*1024) ||
++	    jib_size > (uint64_t)(1024*1024*1024) ||
++	    (jib_offset + jib_size) > hfsmp->hfs_logical_bytes ||
++	    jib_offset < (uint64_t)(2 * blockSize)) {
++		buf_brelse(jinfo_bp);
++		return 0;
++	}
++
++	/*
++	 * A journal without the "need init" flag has been used before: the
++	 * caller has to decide whether it may be replayed.
++	 */
++	if (!(jib_flags & kJIJournalNeedInitMask))
++		*used = 1;
++
++	buf_brelse(jinfo_bp);
++	return 1;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ int
+ hfs_early_journal_init(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 					   void *_args, off_t embeddedOffset, daddr64_t mdb_offset,
+@@ -2605,6 +2727,20 @@ hfs_early_journal_init(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 		//	   jib_offset + embeddedOffset,
+ 		//	   jib_size, SWAP_BE32(vhp->blockSize));
+ 				
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * SWEET: the journal was used by a mount that was not journal
++		 * aware (fsck.hfsplus rewrote the volume header), so its
++		 * contents may be out of date.  Discard it instead of replaying
++		 * it over the volume - this is what hfs_late_journal_init()
++		 * does in exactly the same situation.
++		 */
++		if (hfsmp->hfs_flags & HFS_NEED_JNL_RESET) {
++			arg_flags |= JOURNAL_RESET;
++			printf("hfs: SWEET: the journal is stale, resetting it (no replay)\n");
++		}
++#endif
++
+ 		hfsmp->jnl = journal_open(hfsmp->jvp,
+ 								  jib_offset + embeddedOffset,
+ 								  jib_size,

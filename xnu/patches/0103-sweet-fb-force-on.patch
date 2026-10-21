@@ -1,0 +1,84 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -20,6 +20,11 @@
+  *      button / auto-lock), else on. Off fades the panel out over a few
+  *      vsyncs (halving each pixel) and keeps it black until on again;
+  *      the panel itself stays powered (AMOLED black pixels are off).
++ *      Boot-arg sweetfb_force_on=1 ignores the "off" request (bring-up
++ *      switch, the nabu equivalent is nabufb_force_on=1): backboardd
++ *      switches the display off right after it comes up, and while the
++ *      panel is off every swap is dropped, so the phone shows a black
++ *      screen although SpringBoard is alive and renders.
+  *   18 IsMainDisplay,
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+  * Everything else is accepted and logged once.
+@@ -116,6 +121,7 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	bool          fForceOn;       /* sweetfb_force_on=1: ignore the off request */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -197,6 +203,22 @@
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
++	/*
++	 * sweetfb_force_on=1: backboardd asks for the display to be turned
++	 * off (auto-lock, the power button, and once right after the panel
++	 * comes up).  While the panel is off the vsync handler drops every
++	 * swap and the fade blanks the framebuffer, so the phone shows a
++	 * black screen although SpringBoard is alive and rendering.  With
++	 * this switch the "off" request is ignored and the display keeps
++	 * presenting.  Default off, so the two behaviours can be compared.
++	 */
++	int force_on = 0;
++	PE_parse_boot_argn("sweetfb_force_on", &force_on, sizeof(force_on));
++	fForceOn = (force_on != 0);
++	if (fForceOn) {
++		IOLog("SWEET FB: sweetfb_force_on=1, RequestPowerChange(0) is ignored\n");
++	}
++
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+@@ -224,7 +246,7 @@
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+-	if (fb->fPowerOff) {
++	if (fb->fPowerOff && !fb->fForceOn) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+ 		if (step <= 6) {
+@@ -535,14 +557,27 @@
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
++			bool ignored = false;
+ 			IOLockLock(fFB->fLock);
+-			if (off != fFB->fPowerOff) {
++			if (off && fFB->fForceOn) {
++				/* sweetfb_force_on=1: the panel stays on. */
++				ignored = true;
++				if (fFB->fPowerOff) {
++					fFB->fPowerOff = false;
++					fFB->fFadeStep = 0;
++				}
++				fFB->fDirty = true;     /* redraw the latest frame */
++			} else if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+-			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			if (ignored) {
++				IOLog("SWEET FB: display off ignored (sweetfb_force_on)\n");
++			} else {
++				IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			}
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
