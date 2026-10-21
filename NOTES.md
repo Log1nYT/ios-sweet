@@ -1,5 +1,14 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> 2026-10-21 09:45 POWER KEY WORKS; ACTIVATION = CONTAINER PROBLEM (hypothesis) <<<
+
+- **Power key CONFIRMED** (v18f/g, kernel `xnu/out-0094`, CI = 0092v2+0093+0094): each press gives `SWEET KEYS: key=0 down=1 pon=0x90` / `down=0 pon=0x10`; display on/off works (the off animation is slow = CPU renderer, no GPU). Gestures work (`home-button-type=2`). Boot helper now points at `shim-boot-venus-v18g.img` (cmdline: sweetteewrite=Setup,mobileactivation,containermanager sweetteeopenok=1, sweetsample += mobileactivation,Setup, sweethidtest=0). The kernel-blob for mkbootimg is ALWAYS `shim/out/kernel-blob-venus-v18.bin` (811016 B, from the working image), never `Image.gz`.
+- **open() tee control run (log 20261021e):** `Setup` 101 opens logged (tee works); `mobileactivation` and `containermanager` log ZERO opens (even with sweetteeopenok=1). Process samples (`SMP mobileactivation`): main thread idle in CFRunLoop (return into main at mh+0x50524), t1 worker; so the daemon is up and answering XPC but never opened its log, data ark or anything.
+- **Static (logs/mobileactivationd-20H392.bin):** main = 0x4f744..0x5056c (file offset == mh offset); failure blocks at 0x50618..0x50670 each `bl` a "report and brk" helper; the patched one is 0x50670 (reached via `tbz w19,#0 -> 0x50668` after the 0x3f1f0 / 0x1b8f0 boot-init calls at 0x50430/0x50440). Strings are not resolvable with adrp+add alone (CFString/ObjC), need Ghidra or chained-fixup decoding for the next step.
+- **Hypothesis:** boot-init fails before touching any file because the daemon cannot get its SYSTEM CONTAINER: libsystem_containers asks containermanagerd (XPC) and the sandbox stand-in (0050) returns ENOENT for sandbox op 4 (container path). Same symptom elsewhere: Setup cannot open `/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/...` (group container never created). So containermanagerd is not creating/looking up containers => likely root cause for several daemons, not only activation.
+- **Next experiment (cheap, no new kernel):** add `containermanager` to sweetsample and check that it is alive/idle; **then** patch 0095 = tee failed mkdir/openat_dprotected/rename + sandbox op 4/0x43 callers for named processes, or implement sandbox op 4 (container path for pid) properly: return the real container path instead of ENOENT for mobileactivationd (its container dir already exists in the image: `/private/var/containers/Data/System/D90C94C4-.../`).
+
+
 ## >>> 2026-10-21 09:10 POWER KEY FOUND, GESTURES, ACTIVATION STILL OPEN <<<
 
 - **Gestures work:** ADT `/buttons home-button-type = 2` (v18e, `shim/out/venus-v18-8g-1440-gest.adt`, now also in tools/mkadt_venus.py). Home indicator + gestures appear, identity stays iPhone10,1. The small battery icon = fake IOPMPowerSource from 0062 (real battery = later).
