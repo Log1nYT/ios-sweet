@@ -489,10 +489,16 @@ sfp_thread(void *arg, wait_result_t result)
 		 * need to see whether the writes worked.
 		 */
 		if (PE_parse_boot_argn("sweetsetupfix", &fix, sizeof(fix)) && fix) {
-			delay(20 * 1000 * 1000);
+			/*
+			 * Write right away (UserManagerDaemon reads the
+			 * preferences early), then keep rewriting for a
+			 * while: cfprefsd replaces the file during the
+			 * boot, and the console log only comes up later, so
+			 * the status is repeated as well.
+			 */
 			sfp_setupfix_run();
-			for (int r = 0; r < 6; r++) {
-				delay(5 * 1000 * 1000);
+			for (int r = 0; r < 20; r++) {
+				delay(2 * 1000 * 1000);
 				sfp_setupfix_run();
 				sfp_setupfix_report();
 			}
