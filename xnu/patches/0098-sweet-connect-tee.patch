@@ -1,0 +1,89 @@
+--- a/bsd/kern/uipc_syscalls.c
++++ b/bsd/kern/uipc_syscalls.c
+@@ -110,6 +110,10 @@
+ #if CONFIG_MACF_SOCKET_SUBSET
+ #include <security/mac_framework.h>
+ #endif /* MAC_SOCKET_SUBSET */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/pexpert.h>
++#include <sys/proc_internal.h>
++#endif
+ 
+ #define f_flag fp_glob->fg_flag
+ #define f_ops fp_glob->fg_ops
+@@ -732,6 +736,65 @@
+ 	           retval);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: boot-arg sweetteeconnect=name,name (comma separated, default off)
++ * logs connect(2)/connectx(2) attempts by the named processes: destination
++ * IPv4/IPv6 address+port and the resulting errno. Used to see where a
++ * process's outbound network attempt actually fails (DNS already resolved
++ * by this point; this is after that, at the TCP/UDP connect step).
++ */
++static char sweet_tc_names[128];
++static int sweet_tc_parsed;
++
++static bool
++sweet_tee_name_listed(const char *list, const char *name, size_t nl)
++{
++	for (const char *t = list; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == nl && nl > 0 && strncmp(t, name, nl) == 0) {
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++
++static void
++sweet_connect_tee(sockaddr_ref_t sa, int error)
++{
++	char name[32];
++
++	if (!sweet_tc_parsed) {
++		sweet_tc_names[0] = '\0';
++		(void)PE_parse_boot_argn("sweetteeconnect", sweet_tc_names, sizeof(sweet_tc_names));
++		sweet_tc_parsed = 1;
++	}
++	if (sweet_tc_names[0] == '\0' || sa == NULL) {
++		return;
++	}
++	proc_selfname(name, (int)sizeof(name));
++	if (!sweet_tee_name_listed(sweet_tc_names, name, strlen(name))) {
++		return;
++	}
++	if (sa->sa_family == AF_INET) {
++		struct sockaddr_in *sin = (struct sockaddr_in *)(void *)sa;
++		uint32_t a = ntohl(sin->sin_addr.s_addr);
++		printf("SWEET CONNECT: |%s| -> %u.%u.%u.%u:%u err=%d\n", name,
++		    (a >> 24) & 0xff, (a >> 16) & 0xff, (a >> 8) & 0xff, a & 0xff,
++		    ntohs(sin->sin_port), error);
++	} else {
++		/* IPv6 and anything else: just the family, to avoid pulling in
++		 * netinet6/in6.h here. */
++		printf("SWEET CONNECT: |%s| -> family=%d err=%d\n", name, sa->sa_family, error);
++	}
++}
++#endif
++
+ int
+ connect_nocancel(proc_t p, struct connect_nocancel_args *uap, int32_ref_t retval)
+ {
+@@ -773,6 +836,9 @@
+ 	}
+ 
+ 	error = connectit(so, sa);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_connect_tee(sa, error);
++#endif
+ 
+ 	if (sa != NULL && sa != SA(&ss)) {
+ 		free_sockaddr(sa);
