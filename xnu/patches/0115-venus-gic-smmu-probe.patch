@@ -1,0 +1,828 @@
+venus 0115: read only GICv3 distributor and SMMU v5 capability probes
+
+The GPU plan (logs/research/07-gpu-plan.md, Stage B) needs two things the
+tree does not have: a GICv3 distributor driver for the GPU interrupt, and
+an SMMU for the GPU address space.  Both are too big to guess at, and both
+punish a wrong guess: a stray write into GICD_CTLR wedges the interrupt
+path of the whole system, and a stray write into the SMMU can lock the GPU
+out of memory (or leave a half programmed translation table that the
+secure world then has to clean up).
+
+So this patch adds the honest first step: two read only probes.
+
+bsd/dev/sweet_gic.c maps the GICv3 distributor frame (0x17a00000, 64 KiB)
+and the redistributor region (0x17a60000, 1 MiB, eight 128 KiB PE frames -
+the addresses and the stride come from the live device tree) and prints
+the type register, the number of implemented interrupts, the security
+state, the LPI support, the number of real redistributor frames, the wake
+state of every PE, the enable and pending state of the GPU (SPI 300) and
+SMMU (SPI 672..681) interrupts, and the SGI/PPI state of the PE the probe
+runs on.  It does not write a single GIC register, and it does not touch
+ICC_* - the kernel keeps the Group 1 non secure path that pe_fiq.c sets
+up.
+
+bsd/dev/sweet_smmu.c maps the QSMMU v5 ("qcom,qsmmu-v500") global register
+window (0x3da0000, 128 KiB), the TCU (0x3dc2000) and the two TBU debug
+windows (0x3dc5000, 0x3dc9000) with the two TBU status registers
+(0x3dc2200, 0x3dc2208), and prints the revision, the configuration and
+identification registers, the number of stream match registers and context
+banks, the page table geometry, the fault registers and the TBU state.  It
+programs no page table, no stream match register and no context bank: the
+device tree says "qcom,skip-init", so the SMMU belongs to the bootloader
+and the secure world until there is a real client for it.
+
+Both are off by default:
+
+  sweetgic=1        the GICv3 distributor probe
+  sweetgiclpi=1     also read the LPI pending table (maps a RAM page)
+  sweet_smmu=1      the SMMU v5 capability probe
+  sweet_smmudump=1  also print the stream match registers
+
+The register map, the evidence for every address, what the probes prove
+and what a real GICv3 distributor driver and a real SMMU client would
+still need are in logs/research/impl/13-gic-smmu-probe.md.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ea7cfe1..d094fd1 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,2 +117,4 @@ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_gic.c		standard
++bsd/dev/sweet_smmu.c		standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/sweet_gic.c b/bsd/dev/sweet_gic.c
+new file mode 100644
+index 0000000..0252606
+--- /dev/null
++++ b/bsd/dev/sweet_gic.c
+@@ -0,0 +1,387 @@
++/*
++ * SWEET GICv3 distributor probe - venus (Xiaomi Mi 11, SM8350, Cortex-A78).
++ *
++ * WHAT THIS IS: a read only probe of the GICv3 distributor and of the
++ * redistributor frames.  It maps the distributor frame (0x17a00000, 64 KiB)
++ * and the redistributor region (0x17a60000, 1 MiB, eight 128 KiB PE frames)
++ * - both the addresses and the stride come from the live device tree
++ * (/soc/interrupt-controller@17a00000 of venus.dtb) - and it prints what the
++ * GIC says about itself: the type register, the number of implemented
++ * interrupts, whether the GIC has two security states, whether LPIs exist,
++ * how many redistributor frames are real, and whether the distributor has
++ * the Group 1 (non secure) interrupts enabled.
++ *
++ * WHAT THIS IS NOT: a GIC driver.  It does not enable, disable, route,
++ * mask, acknowledge or EOI a single interrupt, it does not program an LPI
++ * property or pending table, and it does not touch ICC_*.  The kernel keeps
++ * using the Group 1 NS path that pe_fiq.c set up (GICR_IGROUPR0,
++ * GICR_ISENABLER0, ICC_IGRPEN1_EL1, sleh_irq -> ICC_IAR1_EL1).
++ *
++ * READ ONLY BY DESIGN.  There is not a single store into any GIC register
++ * in this file.  A stray write to GICD_CTLR can wedge the interrupt path
++ * of the whole system (the distributor stops accepting the group enable
++ * bits and the CPU never sees another interrupt again), and a write to
++ * GICD_IGROUPR or GICD_IGRPMODR can silently move an interrupt into the
++ * secure world, where this kernel can never acknowledge it.  Both are
++ * unrecoverable without a reboot, so this probe only ever reads.
++ *
++ * Boot args (all optional):
++ *   sweetgic=1     enable the probe (default: off)
++ *   sweetgiclpi=1  also map the LPI pending table and count the pending
++ *                  LPIs (default: off - it maps a RAM page that the
++ *                  bootloader owns, so it waits for an explicit request)
++ *
++ * Evidence for every address and every register offset used here is in
++ * logs/research/impl/13-gic-smmu-probe.md.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++/*
++ * Live device tree: /soc/interrupt-controller@17a00000
++ *   compatible = "arm,gic-v3";
++ *   reg = <0x17a00000 0x10000 0x17a60000 0x100000>;
++ *   redistributor-stride = <0x00 0x20000>;
++ *   #redistributor-regions = <0x01>;
++ */
++#define GIC_GICD_PA       0x17a00000u
++#define GIC_GICD_SIZE     0x00010000u
++#define GIC_GICR_PA       0x17a60000u
++#define GIC_GICR_SIZE     0x00100000u
++#define GIC_GICR_PE_SIZE  0x00020000u   /* redistributor-stride */
++#define GIC_MAX_PES       8u            /* 1 MiB / 128 KiB */
++
++/*
++ * Distributor register offsets.  Arm IHI 0069 (GICv3), as implemented by
++ * Linux (include/linux/irqchip/arm-gic-v3.h) and by QEMU
++ * (hw/intc/gicv3_internal.h); the two agree on every offset used here.
++ * GICD_CTLR, GICR_TYPER, GICR_WAKER and the GICR frame offsets come from
++ * the board configuration (pexpert/pexpert/arm64/SWEET.h) that pe_fiq.c
++ * uses, so the probe and the kernel cannot drift apart.
++ */
++#if !defined(GICD_CTLR) || !defined(GICR_TYPER) || !defined(GICR_WAKER)
++#error "the SWEET board config must define the GICv3 registers"
++#endif
++#define GICD_TYPER        0x0004u
++#define GICD_IIDR         0x0008u
++#define GICD_TYPER2       0x000cu
++#define GICD_STATUSR      0x0010u
++#define GICD_IGROUPR      0x0080u
++#define GICD_ISENABLER    0x0100u
++#define GICD_ISPENDR      0x0200u
++#define GICD_IGRMODR      0x0d00u
++
++/* GICD_CTLR bits (non secure view, DS == 0). */
++#define GICD_CTLR_ENABLE_G1    GICD_CTLR_ENABLEGRP1
++#define GICD_CTLR_ENABLE_G1A   GICD_CTLR_ENABLEGRP1A
++#define GICD_CTLR_DS           0x00000040u
++
++/* GICD_TYPER fields. */
++#define GICD_TYPER_NMI         0x00000200u  /* bit 9  */
++#define GICD_TYPER_SECURITY    0x00000400u  /* bit 10, SecurityExtn */
++#define GICD_TYPER_ESPI        0x00000100u  /* bit 8  */
++#define GICD_TYPER_LPI_IDBITS(t) (((((t) >> 11) & 0x1fu) + 1u))
++#define GICD_TYPER_MBIS        0x00010000u  /* bit 16 */
++#define GICD_TYPER_LPIS        0x00020000u  /* bit 17 */
++#define GICD_TYPER_ID_BITS(t)  (((((t) >> 19) & 0x1fu) + 1u))
++#define GICD_TYPER_INTIDS(t)   (((((t) & 0x1fu) + 1u) * 32u))
++
++/*
++ * Redistributor register offsets (Arm IHI 0069, chapter 3.4).  A PE frame
++ * is 128 KiB: the redistributor registers live in the first 64 KiB, the SGI
++ * (and, in GICv4, the VLPI) frame in the second one.  pe_fiq.c and the
++ * bare metal shim both use the same SGI frame offset.
++ */
++#define GICR_CTLR         0x0000u
++#define GICR_IIDR         0x0004u
++#define GICR_STATUSR      0x0010u
++#define GICR_PROPBASER    0x0070u
++#define GICR_PENDBASER    0x0078u
++
++/* GICR_CTLR bits. */
++#define GICR_CTLR_ENABLE_LPIS   0x00000001u
++#define GICR_CTLR_CES           0x00000002u
++#define GICR_CTLR_IR            0x00000004u
++#define GICR_CTLR_RWP           0x00000008u
++
++/* GICR_TYPER fields. */
++#define GICR_TYPER_PLPIS        0x0000000000000001ull
++#define GICR_TYPER_VLPIS        0x0000000000000002ull
++#define GICR_TYPER_DIRECT_LPIS  0x0000000000000008ull
++#define GICR_TYPER_AFFINITY     0xffffffff00000000ull
++
++/* GICR_WAKER bits. */
++#define GICR_WAKER_SLEEP        0x00000002u
++#define GICR_WAKER_CHILDREN     0x00000004u
++
++/* GICR_PROPBASER / GICR_PENDBASER fields. */
++#define GICR_BASER_IDBITS       0x0000001fu
++#define GICR_PROPBASER_ADDR     0x000ffffffffff000ull
++#define GICR_PENDBASER_ADDR     0x000fffffffff0000ull
++
++/* The two interrupts the GPU work needs (venus.dtb). */
++#define GIC_INTID_GPU           300u   /* qcom,kgsl-3d0 interrupts */
++#define GIC_INTID_SMMU_FIRST    672u   /* kgsl-smmu interrupts[0] */
++#define GIC_INTID_SMMU_LAST     681u   /* kgsl-smmu interrupts[9] */
++
++/* The virtual timer of venus (arm,armv8-timer: virtual = PPI 11). */
++#define GIC_INTID_VTIMER        27u
++#define GIC_INTID_SGI           1u    /* SWEET_IPI_SGI */
++
++/* The prototype of the entry point, so the file compiles without warnings. */
++void sweet_gic_init(void);
++
++static vm_offset_t gicd_base;
++static vm_offset_t gicr_base;
++
++/* One 32 bit read of a GIC register, ordered after the previous access. */
++static uint32_t
++gic_rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* One 64 bit read (GICR_TYPER, GICR_PROPBASER, ...). */
++static uint64_t
++gic_rd64(vm_offset_t base, uint32_t off)
++{
++	uint64_t v = *(volatile uint64_t *)(base + off);
++
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* The enable and the pending bit of one interrupt ID, read only. */
++static unsigned
++gic_irq_state(uint32_t intid, uint32_t reg, uint32_t *value)
++{
++	uint32_t word, bit, v;
++
++	if (intid < 32u) {
++		/* SGIs and PPIs live in the redistributor, not here. */
++		return 0;
++	}
++	word = (intid - 32u) / 32u;
++	bit = (intid - 32u) % 32u;
++	v = gic_rd32(gicd_base, reg + 4u * word);
++	if (value) {
++		*value = v;
++	}
++	return (v >> bit) & 1u;
++}
++
++/*
++ * The LPI pending table lives in RAM, not in the GIC registers: GICR_PENDBASER
++ * points at it.  Its first byte is the "LPI pending group" field, the pending
++ * bits start at byte 8 (one bit per LPI, LPI n at bit n % 8 of byte
++ * 8 + n / 8).  Reading it is optional and off by default.
++ */
++static void
++gic_lpi_pending(uint64_t pendbaser, unsigned idbits)
++{
++	uint64_t addr = pendbaser & GICR_PENDBASER_ADDR;
++	unsigned nlpi, i, pending = 0;
++	vm_offset_t table;
++
++	if (!addr || (addr & 0xffffu) || (addr >> 32) != 0) {
++		printf("SWEET GIC: LPI pending table address 0x%llx is not usable\n",
++		    (uint64_t)addr);
++		return;
++	}
++	nlpi = 1u << idbits;
++	if (nlpi > 65536u) {
++		nlpi = 65536u;
++	}
++	table = ml_io_map((vm_offset_t)addr, 0x10000);
++	if (!table) {
++		printf("SWEET GIC: LPI pending table 0x%llx could not be mapped\n",
++		    (uint64_t)addr);
++		return;
++	}
++	for (i = 0; i < nlpi; ++i) {
++		uint32_t byte = gic_rd32(table, 8u + (i / 8u));
++
++		if ((byte >> (i % 8u)) & 1u) {
++			++pending;
++		}
++	}
++	printf("SWEET GIC: LPI pending table 0x%llx: %u of %u LPIs pending\n",
++	    (uint64_t)addr, pending, nlpi);
++}
++
++void
++sweet_gic_init(void)
++{
++	uint32_t enabled = 0, lpi = 0;
++	uint32_t typer, typer4, typer8, iidr, ctlr, statusr, grp, grpmod;
++	uint64_t typer64, propbaser = 0, pendbaser = 0;
++	uint32_t my_aff;
++	unsigned nr_redis = 0, secure = 0, lpi_count = 0, lpi_idbits = 0;
++	unsigned sleep_pes = 0, awake_pes = 0, unimplemented = 0;
++	unsigned i;
++
++	if (!PE_parse_boot_argn("sweetgic", &enabled, sizeof(enabled)) || !enabled) {
++		/* Default off: the probe must never run unless it is asked for. */
++		return;
++	}
++	if (PE_parse_boot_argn("sweetgiclpi", &lpi, sizeof(lpi))) {
++		lpi = (lpi != 0);
++	} else {
++		lpi = 0;
++	}
++	gicd_base = ml_io_map(GIC_GICD_PA, GIC_GICD_SIZE);
++	gicr_base = ml_io_map(GIC_GICR_PA, GIC_GICR_SIZE);
++	if (!gicd_base || !gicr_base) {
++		printf("SWEET GIC: mapping failed gicd=0x%08x gicr=0x%08x\n",
++		    GIC_GICD_PA, GIC_GICR_PA);
++		return;
++	}
++	/* The affinity of the PE that runs the probe (aff0, aff1, aff2). */
++	my_aff = (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") & 0x00ffffffu);
++	printf("SWEET GIC: probe start gicd=0x%08x gicr=0x%08x stride=0x%x "
++	    "(read only, no GIC register is written)\n",
++	    GIC_GICD_PA, GIC_GICR_PA, GIC_GICR_PE_SIZE);
++
++	/*
++	 * The identity window.  Linux and QEMU put GICD_TYPER at 0x004 and
++	 * GICD_IIDR at 0x008; some older descriptions of the GICv3 map put
++	 * GICD_TYPER at 0x008.  Both words are printed raw and the type
++	 * register is taken from the offset that answers with a sane value
++	 * (a non zero ITLinesNumber that fits the distributor).
++	 */
++	typer4 = gic_rd32(gicd_base, GICD_TYPER);
++	typer8 = gic_rd32(gicd_base, GICD_IIDR);
++	printf("SWEET GIC: ident ctlr=0x%08x type@0x004=0x%08x word@0x008=0x%08x "
++	    "typer2=0x%08x statusr=0x%08x\n",
++	    gic_rd32(gicd_base, GICD_CTLR), typer4, typer8,
++	    gic_rd32(gicd_base, GICD_TYPER2), gic_rd32(gicd_base, GICD_STATUSR));
++	typer = typer4;
++	if (((typer4 & 0x1fu) == 0u || (typer4 & 0x1fu) > 30u) &&
++	    ((typer8 & 0x1fu) != 0u && (typer8 & 0x1fu) <= 30u)) {
++		printf("SWEET GIC: GICD_TYPER answers at 0x008, not at 0x004\n");
++		typer = typer8;
++	}
++	iidr = gic_rd32(gicd_base, GICD_IIDR);
++	ctlr = gic_rd32(gicd_base, GICD_CTLR);
++	statusr = gic_rd32(gicd_base, GICD_STATUSR);
++	secure = (typer & GICD_TYPER_SECURITY) ? 1u : 0u;
++	printf("SWEET GIC: ctlr=0x%08x (ARE_NS=%u EnableGrp1=%u EnableGrp1A=%u "
++	    "DS=%u RWP=%u) iidr=0x%08x statusr=0x%08x\n",
++	    ctlr, (ctlr & GICD_CTLR_ARE_NS) ? 1u : 0u,
++	    (ctlr & GICD_CTLR_ENABLE_G1) ? 1u : 0u,
++	    (ctlr & GICD_CTLR_ENABLE_G1A) ? 1u : 0u,
++	    (ctlr & GICD_CTLR_DS) ? 1u : 0u,
++	    (ctlr & GICD_CTLR_RWP) ? 1u : 0u, iidr, statusr);
++	printf("SWEET GIC: intids=%u idbits=%u lpi_idbits=%u espi=%u mbis=%u "
++	    "nmi=%u\n",
++	    GICD_TYPER_INTIDS(typer), GICD_TYPER_ID_BITS(typer),
++	    (typer & GICD_TYPER_LPIS) ? GICD_TYPER_LPI_IDBITS(typer) : 0u,
++	    (typer & GICD_TYPER_ESPI) ? 1u : 0u,
++	    (typer & GICD_TYPER_MBIS) ? 1u : 0u,
++	    (typer & GICD_TYPER_NMI) ? 1u : 0u);
++
++	/*
++	 * The group of the interrupts.  In the non secure view of a GIC with
++	 * two security states GICD_IGROUPR reads as zero even when the
++	 * interrupts are really Group 1, so the raw words are printed and
++	 * the state is taken from the enable/pending registers instead.
++	 */
++	grp = gic_rd32(gicd_base, GICD_IGROUPR);
++	grpmod = gic_rd32(gicd_base, GICD_IGRMODR);
++	printf("SWEET GIC: igroupr[0]=0x%08x igrmodr[0]=0x%08x (NS view: RAZ is "
++	    "normal, the group is not readable from here)\n", grp, grpmod);
++	for (i = GIC_INTID_GPU; i <= GIC_INTID_SMMU_LAST; i++) {
++		uint32_t en = 0, pend = 0;
++		unsigned en_bit, pend_bit;
++
++		if (i != GIC_INTID_GPU && i != GIC_INTID_SMMU_FIRST &&
++		    i != GIC_INTID_SMMU_LAST) {
++			continue;
++		}
++		en_bit = gic_irq_state(i, GICD_ISENABLER, &en);
++		pend_bit = gic_irq_state(i, GICD_ISPENDR, &pend);
++		printf("SWEET GIC: intid %u enabled=%u pending=%u\n",
++		    i, en_bit, pend_bit);
++	}
++
++	/*
++	 * The redistributor frames.  A frame that is not implemented reads
++	 * back as all ones; the affinity value in GICR_TYPER[63:32] says
++	 * which PE it belongs to.
++	 */
++	for (i = 0; i < GIC_MAX_PES; ++i) {
++		vm_offset_t frame = gicr_base + (vm_offset_t)i * GIC_GICR_PE_SIZE;
++		uint32_t waker, ctlr_r;
++
++		typer64 = gic_rd64(frame, GICR_TYPER);
++		if (typer64 == 0xffffffffffffffffull || typer64 == 0) {
++			++unimplemented;
++			continue;
++		}
++		++nr_redis;
++		waker = gic_rd32(frame, GICR_WAKER);
++		ctlr_r = gic_rd32(frame, GICR_CTLR);
++		if (waker & (GICR_WAKER_SLEEP | GICR_WAKER_CHILDREN)) {
++			++sleep_pes;
++		} else {
++			++awake_pes;
++		}
++		printf("SWEET GIC: redis %u typer=0x%016llx affinity=0x%llx "
++		    "cpunum=%u last=%u plpis=%u vlpis=%u waker=0x%08x "
++		    "(sleep=%u children=%u) ctlr=0x%08x (lpis=%u)\n",
++		    i, (uint64_t)typer64,
++		    (uint64_t)((typer64 & GICR_TYPER_AFFINITY) >> 32),
++		    (unsigned)((typer64 >> 8) & 0xffffu),
++		    (typer64 & GICR_TYPER_LAST) ? 1u : 0u,
++		    (typer64 & GICR_TYPER_PLPIS) ? 1u : 0u,
++		    (typer64 & GICR_TYPER_VLPIS) ? 1u : 0u,
++		    waker, (waker & GICR_WAKER_SLEEP) ? 1u : 0u,
++		    (waker & GICR_WAKER_CHILDREN) ? 1u : 0u,
++		    ctlr_r, (ctlr_r & GICR_CTLR_ENABLE_LPIS) ? 1u : 0u);
++		if (nr_redis == 1) {
++			propbaser = gic_rd64(frame, GICR_PROPBASER);
++			pendbaser = gic_rd64(frame, GICR_PENDBASER);
++			lpi_idbits = (unsigned)(propbaser & GICR_BASER_IDBITS);
++			if ((typer64 & GICR_TYPER_PLPIS) && lpi_idbits <= 16u) {
++				lpi_count = 1u << lpi_idbits;
++			}
++			printf("SWEET GIC: LPI tables prop=0x%llx (idbits=%u) "
++			    "pend=0x%llx (idbits=%u) lpis=%u\n",
++			    (uint64_t)propbaser, lpi_idbits,
++			    (uint64_t)pendbaser,
++			    (unsigned)(pendbaser & GICR_BASER_IDBITS),
++			    lpi_count);
++			if (lpi && (typer64 & GICR_TYPER_PLPIS) && lpi_idbits) {
++				gic_lpi_pending(pendbaser, lpi_idbits);
++			}
++		}
++		/*
++		 * The redistributor of the PE that runs this probe: its SGI
++		 * frame holds the group and the enable state of the SGIs and
++		 * the PPIs, which is what pe_fiq.c programmed (timer and SGI
++		 * enabled, everything Group 1 non secure).
++		 */
++		if (((typer64 >> 32) & 0x00ffffffu) == my_aff) {
++			uint32_t group0 = gic_rd32(frame, GICR_IGROUPR0);
++			uint32_t enable0 = gic_rd32(frame, GICR_ISENABLER0);
++
++			printf("SWEET GIC: this PE igroupr0=0x%08x isenabler0=0x%08x "
++			    "(sgi1=%u vtimer%u=%u)\n",
++			    group0, enable0, (enable0 >> GIC_INTID_SGI) & 1u,
++			    GIC_INTID_VTIMER, (enable0 >> GIC_INTID_VTIMER) & 1u);
++		}
++	}
++	printf("SWEET GIC: type=0x%08x lpi=%u nr_redis=%u secure=%u "
++	    "(frames: %u awake, %u asleep, %u not implemented)\n",
++	    typer, lpi_count, nr_redis, secure, awake_pes, sleep_pes,
++	    unimplemented);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+new file mode 100644
+index 0000000..55740ce
+--- /dev/null
++++ b/bsd/dev/sweet_smmu.c
+@@ -0,0 +1,360 @@
++/*
++ * SWEET SMMU capability probe - venus (Xiaomi Mi 11, SM8350, Adreno 660).
++ *
++ * WHAT THIS IS: a read only probe of the GPU's IOMMU, the Qualcomm
++ * QSMMU v5 ("qcom,qsmmu-v500") that guards the Adreno 660 address space.
++ * It maps the SMMU global register window (0x3da0000, 128 KiB), the TCU
++ * ("client interface", 0x3dc2000), the two TBU debug windows
++ * (0x3dc5000 and 0x3dc9000) and the two TBU status registers
++ * (0x3dc2200 and 0x3dc2208) - every address comes from the live device
++ * tree (/soc/kgsl-smmu@3da0000 of venus.dtb) - and it prints what the
++ * hardware says about itself: the revision, the configuration registers,
++ * the number of stream match registers and context banks, the translation
++ * table geometry and the state of the two TBUs.
++ *
++ * WHAT THIS IS NOT: an SMMU driver.  It programs no page table, no
++ * stream match register, no context bank and no command queue.  The
++ * device tree says "qcom,skip-init": the SMMU is configured by the
++ * bootloader and the secure world, and touching it here would fight
++ * them.  A real GPU driver needs a client: the Adreno has to be a bus
++ * master of the SMMU, and only then can a page table be built for it.
++ *
++ * READ ONLY BY DESIGN.  There is not a single store into any SMMU, TCU or
++ * TBU register in this file.  Writing SMMU_CR0 (enable/disable), the
++ * stream match registers or a context bank control register can lock the
++ * GPU out of memory (or leave a half programmed translation table behind
++ * that the secure world then has to clean up), and the global TLB
++ * invalidation registers (TLBIVMID, TLBIALLH, sTLBGSYNC) are writes that
++ * affect every client of the SMMU.
++ *
++ * Boot args (all optional):
++ *   sweet_smmu=1     enable the probe (default: off)
++ *   sweet_smmudump=1 also print the stream match and context bank
++ *                    registers of the first banks (default: off, they are
++ *                    a lot of numbers)
++ *
++ * Evidence for every address and every register offset used here is in
++ * logs/research/impl/13-gic-smmu-probe.md.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++/*
++ * Live device tree: /soc/kgsl-smmu@3da0000
++ *   compatible = "qcom,qsmmu-v500";
++ *   reg = <0x3da0000 0x20000 0x3dc2000 0x20>;
++ *   reg-names = "base", "tcu-base";
++ *   #global-interrupts = <0x02>;
++ *   interrupts = <0x00 0x2a0 0x04 ... 0x00 0x2af 0x04>;   (SPI 672..681)
++ *   qcom,skip-init; qcom,use-3-lvl-tables; qcom,split-tables;
++ *   gfx_0_tbu@3dc5000: reg = <0x3dc5000 0x1000 0x3dc2200 0x08>
++ *   gfx_1_tbu@3dc9000: reg = <0x3dc9000 0x1000 0x3dc2208 0x08>
++ */
++#define SMMU_BASE_PA        0x03da0000u
++#define SMMU_BASE_SIZE      0x00020000u
++#define SMMU_TCU_PA         0x03dc2000u
++#define SMMU_TCU_SIZE       0x00000020u
++#define SMMU_TBU0_PA        0x03dc5000u
++#define SMMU_TBU0_SIZE      0x00001000u
++#define SMMU_TBU1_PA        0x03dc9000u
++#define SMMU_TBU1_SIZE      0x00001000u
++#define SMMU_TBU_STAT0_PA   0x03dc2200u
++#define SMMU_TBU_STAT1_PA   0x03dc2208u
++#define SMMU_TBU_STAT_SIZE  0x00000008u
++
++/*
++ * The QSMMU v5 is driven by the ARM SMMU v2 (MMU-500/600) driver: CAF's
++ * arm-smmu.c carries the qsmmuv500_* code and upstream Linux drives it
++ * with drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c ("SMMU-500 TRM").  The
++ * global register map is therefore the SMMU v2 one:
++ *   0x000 CR0   0x004 CR1   0x008 CR2   0x00c CR3   0x010 ACR
++ *   0x020 ID0   0x024 ID1   0x028 ID2   ...  0x03c ID7  (version)
++ *   0x048 GFSR  0x050 GFSYNR0 0x054 GFSYNR1 0x058 GFSYNR2
++ *   0x064 TLBIVMID 0x068 TLBIALLNSNH 0x06c TLBIALLH 0x070 sTLBGSYNC
++ *   0x074 sTLBGSTATUS
++ *   0x800 + 4n SMRn        0xc00 + 4n S2CRn
++ * The SMMU v3 map (used by the SMMUv3 driver) has its ID registers at
++ * 0x000 and its CR0 at 0x020; the probe prints both candidates and the
++ * identification registers decide which one is real.
++ */
++#define SMMU_CR0            0x000u
++#define SMMU_CR1            0x004u
++#define SMMU_CR2            0x008u
++#define SMMU_CR3            0x00cu
++#define SMMU_ACR            0x010u
++#define SMMU_ID0            0x020u
++#define SMMU_ID1            0x024u
++#define SMMU_ID2            0x028u
++#define SMMU_ID3            0x02cu
++#define SMMU_ID4            0x030u
++#define SMMU_ID5            0x034u
++#define SMMU_ID6            0x038u
++#define SMMU_ID7            0x03cu   /* version: MAJOR[7:4], MINOR[3:0] */
++#define SMMU_GFSR           0x048u
++#define SMMU_GFSYNR0        0x050u
++#define SMMU_GFSYNR1        0x054u
++#define SMMU_GFSYNR2        0x058u
++#define SMMU_TLBGSTATUS     0x074u
++#define SMMU_SMR(n)         (0x800u + ((n) << 2))
++#define SMMU_S2CR(n)        (0xc00u + ((n) << 2))
++
++/* The SMMU v3 candidates, printed so the map can be confirmed on the die. */
++#define SMMU_V3_IDR0        0x000u
++#define SMMU_V3_IIDR        0x018u
++#define SMMU_V3_AIDR        0x01cu
++#define SMMU_V3_CR0         0x020u
++
++/* SMMU v2 identification register fields (Linux arm-smmu.h). */
++#define SMMU_ID0_NUMSMRG(t)   ((t) & 0xffu)
++#define SMMU_ID0_NUMSIDB(t)   (((t) >> 9) & 0xfu)
++#define SMMU_ID0_CTTW(t)      (((t) >> 14) & 1u)
++#define SMMU_ID0_NUMIRPT(t)   (((t) >> 16) & 0xffu)
++#define SMMU_ID0_ATOSNS(t)    (((t) >> 26) & 1u)
++#define SMMU_ID0_SMS(t)       (((t) >> 27) & 1u)
++#define SMMU_ID0_NTS(t)       (((t) >> 28) & 1u)
++#define SMMU_ID0_S2TS(t)      (((t) >> 29) & 1u)
++#define SMMU_ID0_S1TS(t)      (((t) >> 30) & 1u)
++#define SMMU_ID1_NUMCB(t)     ((t) & 0xffu)
++#define SMMU_ID1_NUMS2CB(t)   (((t) >> 16) & 0xffu)
++#define SMMU_ID1_PAGESIZE(t)  (((t) >> 31) & 1u)
++#define SMMU_ID2_IAS(t)       ((t) & 0xfu)
++#define SMMU_ID2_OAS(t)       (((t) >> 4) & 0xfu)
++#define SMMU_ID2_UBS(t)       (((t) >> 8) & 0xfu)
++#define SMMU_ID2_PTFS_4K(t)   (((t) >> 12) & 1u)
++#define SMMU_ID2_PTFS_16K(t)  (((t) >> 13) & 1u)
++#define SMMU_ID2_PTFS_64K(t)  (((t) >> 14) & 1u)
++#define SMMU_ID7_MAJOR(t)     (((t) >> 4) & 0xfu)
++#define SMMU_ID7_MINOR(t)     ((t) & 0xfu)
++
++/* SMMU v3 IDR0 fields (Linux arm-smmu-v3.h). */
++#define SMMU_IDR0_S1P(t)      (((t) >> 1) & 1u)
++#define SMMU_IDR0_TTF(t)      (((t) >> 2) & 3u)
++#define SMMU_IDR0_ATS(t)      (((t) >> 10) & 1u)
++#define SMMU_IDR0_PRI(t)      (((t) >> 16) & 1u)
++#define SMMU_IDR0_ST_LVL(t)   (((t) >> 27) & 3u)
++
++/*
++ * The TBU debug registers (upstream Linux arm-smmu-qcom-debug.c).  They
++ * are read only here: DEBUG_SID_HALT_REG is a halt request, writing it
++ * stops the TBU.
++ */
++#define TBU_DEBUG_SID_HALT   0x00u
++#define TBU_DEBUG_VA_ADDR     0x08u
++#define TBU_DEBUG_TXN_TRIGG   0x18u
++#define TBU_DEBUG_SR_HALT_ACK 0x20u
++#define TBU_DEBUG_PAR         0x28u
++#define TBU_DEBUG_AXUSER      0x30u
++
++/*
++ * The ACTLR settings the device tree asks for (qcom,actlr): for every
++ * stream id X with X & ~mask == sid, the client gets this ACTLR value.
++ * Upstream: bit 0 CMTLB, bit 1 CPRE, bit 5 GFX_ACTLR_PRR, bits [9:8] the
++ * prefetch depth.
++ */
++#define ACTLR_CMTLB           0x00000001u
++#define ACTLR_CPRE            0x00000002u
++#define ACTLR_GFX_PRR         0x00000020u
++#define ACTLR_PREFETCH_SHIFT  8
++#define ACTLR_PREFETCH_MASK   0x3u
++
++/* The stream id ranges of the two TBUs (qcom,stream-id-range). */
++#define TBU0_SID_FIRST       0x000u
++#define TBU0_SID_LAST        0x3ffu
++#define TBU1_SID_FIRST       0x400u
++#define TBU1_SID_LAST        0x7ffu
++
++static vm_offset_t smmu_base;
++static vm_offset_t smmu_tcu;
++static vm_offset_t smmu_tbu[2];
++static vm_offset_t smmu_tbu_stat[2];
++
++/* One 32 bit read of an SMMU register, ordered after the previous access. */
++static uint32_t
++smmu_rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* One 64 bit read (the TBU debug registers are 64 bit wide). */
++static uint64_t
++smmu_rd64(vm_offset_t base, uint32_t off)
++{
++	uint64_t v = *(volatile uint64_t *)(base + off);
++
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static const char * const smmu_prefetch_name[4] = {
++	"default", "shallow", "moderate", "deep"
++};
++
++/*
++ * The ACTLR value comes from the device tree, not from a register, so the
++ * bits are decoded at run time (the helper is not inlined on purpose, so
++ * that the compiler does not fold the constant and call the other branch
++ * of the test unreachable).
++ */
++static uint32_t smmu_actlr_bit(uint32_t actlr, uint32_t mask)
++    __attribute__((noinline));
++
++static uint32_t
++smmu_actlr_bit(uint32_t actlr, uint32_t mask)
++{
++	return (actlr & mask) ? 1u : 0u;
++}
++
++static const char *
++smmu_actlr_prefetch(uint32_t actlr)
++{
++	return smmu_prefetch_name[(actlr >> ACTLR_PREFETCH_SHIFT) &
++	    ACTLR_PREFETCH_MASK];
++}
++
++/* The prototype of the entry point, so the file compiles without warnings. */
++void sweet_smmu_init(void);
++
++void
++sweet_smmu_init(void)
++{
++	uint32_t enabled = 0, dump = 0;
++	uint32_t cr0, cr1, cr2, cr3, acr, id0, id1, id2, id7;
++	uint32_t v3_idr0, v3_iidr, v3_aidr;
++	unsigned i, major, minor;
++
++	if (!PE_parse_boot_argn("sweet_smmu", &enabled, sizeof(enabled)) || !enabled) {
++		/* Default off: the probe must never run unless it is asked for. */
++		return;
++	}
++	if (PE_parse_boot_argn("sweet_smmudump", &dump, sizeof(dump))) {
++		dump = (dump != 0);
++	} else {
++		dump = 0;
++	}
++	smmu_base = ml_io_map(SMMU_BASE_PA, SMMU_BASE_SIZE);
++	smmu_tcu = ml_io_map(SMMU_TCU_PA, SMMU_TCU_SIZE);
++	smmu_tbu[0] = ml_io_map(SMMU_TBU0_PA, SMMU_TBU0_SIZE);
++	smmu_tbu[1] = ml_io_map(SMMU_TBU1_PA, SMMU_TBU1_SIZE);
++	smmu_tbu_stat[0] = ml_io_map(SMMU_TBU_STAT0_PA, SMMU_TBU_STAT_SIZE);
++	smmu_tbu_stat[1] = ml_io_map(SMMU_TBU_STAT1_PA, SMMU_TBU_STAT_SIZE);
++	if (!smmu_base || !smmu_tcu || !smmu_tbu[0] || !smmu_tbu[1] ||
++	    !smmu_tbu_stat[0] || !smmu_tbu_stat[1]) {
++		printf("SWEET SMMU: mapping failed base=0x%08x tcu=0x%08x\n",
++		    SMMU_BASE_PA, SMMU_TCU_PA);
++		return;
++	}
++	printf("SWEET SMMU: probe start base=0x%08x tcu=0x%08x tbu0=0x%08x "
++	    "tbu1=0x%08x (read only, no SMMU register is written)\n",
++	    SMMU_BASE_PA, SMMU_TCU_PA, SMMU_TBU0_PA, SMMU_TBU1_PA);
++
++	/*
++	 * The first word of the global register space is the register the
++	 * QSMMU v5 documentation calls SMMU_REVISION.  In the Arm SMMU v2
++	 * map (the one this part is driven with) it is CR0, in the SMMU v3
++	 * map it is IDR0.  Both readings are printed; the identification
++	 * registers below decide which map the silicon uses.
++	 */
++	cr0 = smmu_rd32(smmu_base, SMMU_CR0);
++	cr1 = smmu_rd32(smmu_base, SMMU_CR1);
++	cr2 = smmu_rd32(smmu_base, SMMU_CR2);
++	cr3 = smmu_rd32(smmu_base, SMMU_CR3);
++	acr = smmu_rd32(smmu_base, SMMU_ACR);
++	v3_idr0 = smmu_rd32(smmu_base, SMMU_V3_IDR0);
++	v3_iidr = smmu_rd32(smmu_base, SMMU_V3_IIDR);
++	v3_aidr = smmu_rd32(smmu_base, SMMU_V3_AIDR);
++	id0 = smmu_rd32(smmu_base, SMMU_ID0);
++	id1 = smmu_rd32(smmu_base, SMMU_ID1);
++	id2 = smmu_rd32(smmu_base, SMMU_ID2);
++	id7 = smmu_rd32(smmu_base, SMMU_ID7);
++	major = SMMU_ID7_MAJOR(id7);
++	minor = SMMU_ID7_MINOR(id7);
++	printf("SWEET SMMU: rev-word@0x000=0x%08x (v2 CR0 / v3 IDR0) "
++	    "cr1=0x%08x cr2=0x%08x cr3=0x%08x acr=0x%08x\n",
++	    v3_idr0, cr1, cr2, cr3, acr);
++	printf("SWEET SMMU: v3 candidates idr0=0x%08x (s1p=%u ttf=%u ats=%u pri=%u "
++	    "stlvl=%u) iidr=0x%08x aidr=0x%08x\n",
++	    v3_idr0, SMMU_IDR0_S1P(v3_idr0), SMMU_IDR0_TTF(v3_idr0),
++	    SMMU_IDR0_ATS(v3_idr0), SMMU_IDR0_PRI(v3_idr0),
++	    SMMU_IDR0_ST_LVL(v3_idr0), v3_iidr, v3_aidr);
++	printf("SWEET SMMU: id0=0x%08x id1=0x%08x id2=0x%08x id7=0x%08x "
++	    "(version %u.%u)\n", id0, id1, id2, id7, major, minor);
++	printf("SWEET SMMU: cr0=0x%08x (b0=%u b1=%u; the ARM SMMU v2 non secure "
++	    "map names bit 0 SMMUEN and bit 1 ClientPD) smr=%u sidbits=%u "
++	    "cttw=%u irpt=%u atosns=%u sms=%u\n",
++	    cr0, cr0 & 1u, (cr0 >> 1) & 1u, SMMU_ID0_NUMSMRG(id0),
++	    SMMU_ID0_NUMSIDB(id0), SMMU_ID0_CTTW(id0),
++	    SMMU_ID0_NUMIRPT(id0), SMMU_ID0_ATOSNS(id0), SMMU_ID0_SMS(id0));
++	printf("SWEET SMMU: cb=%u s2cb=%u pagesize64k=%u ias=%u oas=%u ubs=%u "
++	    "ptfs=%s%s%s s1ts=%u s2ts=%u nts=%u\n",
++	    SMMU_ID1_NUMCB(id1), SMMU_ID1_NUMS2CB(id1),
++	    SMMU_ID1_PAGESIZE(id1), SMMU_ID2_IAS(id2), SMMU_ID2_OAS(id2),
++	    SMMU_ID2_UBS(id2),
++	    SMMU_ID2_PTFS_4K(id2) ? "4k" : "",
++	    SMMU_ID2_PTFS_16K(id2) ? "16k" : "",
++	    SMMU_ID2_PTFS_64K(id2) ? "64k" : "",
++	    SMMU_ID0_S1TS(id0), SMMU_ID0_S2TS(id0), SMMU_ID0_NTS(id0));
++	printf("SWEET SMMU: faults gfsr=0x%08x gfsynr=0x%08x/0x%08x/0x%08x "
++	    "tlbgstatus=0x%08x (gsactive=%u)\n",
++	    smmu_rd32(smmu_base, SMMU_GFSR),
++	    smmu_rd32(smmu_base, SMMU_GFSYNR0),
++	    smmu_rd32(smmu_base, SMMU_GFSYNR1),
++	    smmu_rd32(smmu_base, SMMU_GFSYNR2),
++	    smmu_rd32(smmu_base, SMMU_TLBGSTATUS),
++	    smmu_rd32(smmu_base, SMMU_TLBGSTATUS) & 1u);
++
++	/* The TCU (client interface) and the two TBUs. */
++	printf("SWEET SMMU: tcu[0..3]=");
++	for (i = 0; i < 4; ++i) {
++		printf("%s0x%08x", i ? " " : "", smmu_rd32(smmu_tcu, 4u * i));
++	}
++	printf("\n");
++	for (i = 0; i < 2; ++i) {
++		uint32_t stat = smmu_rd32(smmu_tbu_stat[i], 0);
++		uint32_t stat1 = smmu_rd32(smmu_tbu_stat[i], 4);
++
++		printf("SWEET SMMU: tbu%u sid=0x%03x-0x%03x status=0x%08x/0x%08x "
++		    "debug sid_halt=0x%016llx va=0x%016llx trigg=0x%016llx "
++		    "halt_ack=0x%016llx par=0x%016llx axuser=0x%016llx\n",
++		    i, i ? TBU1_SID_FIRST : TBU0_SID_FIRST,
++		    i ? TBU1_SID_LAST : TBU0_SID_LAST, stat, stat1,
++		    (uint64_t)smmu_rd64(smmu_tbu[i], TBU_DEBUG_SID_HALT),
++		    (uint64_t)smmu_rd64(smmu_tbu[i], TBU_DEBUG_VA_ADDR),
++		    (uint64_t)smmu_rd64(smmu_tbu[i], TBU_DEBUG_TXN_TRIGG),
++		    (uint64_t)smmu_rd64(smmu_tbu[i], TBU_DEBUG_SR_HALT_ACK),
++		    (uint64_t)smmu_rd64(smmu_tbu[i], TBU_DEBUG_PAR),
++		    (uint64_t)smmu_rd64(smmu_tbu[i], TBU_DEBUG_AXUSER));
++	}
++
++	/*
++	 * The stream map the bootloader left behind (qcom,skip-init).  The
++	 * ACTLR settings of the device tree are for the stream ids 0, 1, 2,
++	 * 4, 5 and 7 with the mask 0x400: CMTLB, CPRE and the GFX prefetch
++	 * request register, moderate prefetch depth.
++	 */
++	printf("SWEET SMMU: actlr(sid 0,1,2,4,5,7 mask 0x400) = 0x%03x "
++	    "(cmtlb=%u cpre=%u gfx_prr=%u prefetch=%s)\n",
++	    0x32bu, smmu_actlr_bit(0x32bu, ACTLR_CMTLB),
++	    smmu_actlr_bit(0x32bu, ACTLR_CPRE),
++	    smmu_actlr_bit(0x32bu, ACTLR_GFX_PRR),
++	    smmu_actlr_prefetch(0x32bu));
++	if (dump) {
++		for (i = 0; i < 4; ++i) {
++			printf("SWEET SMMU: smr%u=0x%08x s2cr%u=0x%08x\n", i,
++			    smmu_rd32(smmu_base, SMMU_SMR(i)), i,
++			    smmu_rd32(smmu_base, SMMU_S2CR(i)));
++		}
++	}
++	printf("SWEET SMMU: base=0x%08x rev=%u.%u cr0=0x%08x cb=%u smr=%u tbu=2 "
++	    "(probe only: no page table, no stream map, no context bank)\n",
++	    SMMU_BASE_PA, major, minor, cr0, SMMU_ID1_NUMCB(id1),
++	    SMMU_ID0_NUMSMRG(id0));
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 932a24c..8cdd27c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -50,2 +50,5 @@ extern void thread_deallocate(thread_t);
+ extern int hz;
++/* Read only capability probes (GICv3 distributor, SMMU v5); both are off. */
++extern void sweet_gic_init(void);
++extern void sweet_smmu_init(void);
+ static void sweet_log_start(void);
+@@ -670,2 +673,5 @@ sweet_ufs_init(void)
+ 	sweet_reboot_init();
++	/* Read only probes: they print and return, they change nothing. */
++	sweet_gic_init();
++	sweet_smmu_init();
+ 	return 0;
