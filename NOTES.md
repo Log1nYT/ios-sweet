@@ -67,6 +67,46 @@ Local binary edits on the CI kernel (no CI run needed, the kernel image is not s
 2. If v43 reaches the home screen: make it permanent with `tools/venus-persist-boot.sh` (`fastboot flash boot_b` + `set_active b`, slot a untouched) - **needs the user's OK, it is destructive**.
 3. With 0102 in the running kernel the phone can reset itself into fastboot on a UDP datagram to 192.168.7.2:5141 -> from then on the Mac drives the phone with no human in the loop.
 
+## >>> VENUS: THE PANIC IS DECODED (2026-10-21 21:20) <<<
+
+**STATE: the phone reached the HOME SCREEN (v45/v46, `exec Setup` = 0, 34 touches processed). Then a kernel panic killed it - the photo of the panic screen decoded the cause exactly.**
+
+### What the panic photo says
+```
+panic(cpu 0 caller 0xfffffe0007ac8304): kma_alloc(0xfffffe1025a721d0, 33554432, 0x100021): failed with 3 @vm_kern.c:170
+handshake structure not initialized
+SWEET REBOOT: SPMI not ready; no fastboot cookie
+SWEET REBOOT: no fastboot cookie - NOT resetting
+```
+- **33554432 = 32 MiB = the NVRAM bank size of an iPhone 8.** The chain: the `/options` device-tree node -> IOKit creates `IODTNVRAM` -> `IODTNVRAM::initImageFormat()` reads `/chosen/nvram-bank-size` and `IONVRAMCHRPHandler::init()` -> `IONewData(uint8_t, length)` allocates the whole 32 MiB through kmem -> our zone cannot give 32 MiB back-to-back -> **KERN_NO_SPACE (3)** -> panic.
+- The second half of the message is our own self-reboot: the panic happens **before the SPMI driver is up**, so the fastboot cookie could not be written and (correctly, audit defect D1) the phone did NOT reset - it stayed dead on the panic screen until a human power-cycled it.
+
+### Fixes (all in main)
+1. **`/options` removed from the ADT** (still available with `--options`). It is what triggered the NVRAM path.
+2. **The fastboot cookie is now armed at boot** (patch 0102, `sweetrebootarm=1`): `sweet_reboot_arm()` writes the "boot into the bootloader" cookie from `sweet_ufs_init()`, so EVERY later reset (panic, watchdog, thermal trip) lands in the **Qualcomm fastboot** instead of Android or a dead screen. The bootloader clears the cookie on the next boot, so it is re-armed every time.
+3. Patch **0125** (agent): the panic text is copied into the USB console ring (so we see it live) and into the reserved `/pram` panic region, and it prints the PREVIOUS boot's panic at startup (`sweetpaniclast=1`). It also adds a plain-PSCI-reset fallback so the phone always comes back.
+
+### The images of this hour
+| image | kernel | ADT | cmdline | note |
+|---|---|---|---|---|
+| v45 | CI 39634274543 | v33 | 7 activation patches + setupfix + force-on | **home screen reached** (`exec Setup` = 0) |
+| v46 | CI 39631098808 | v33 | zero-write + sweetrebootudp=1 | the first zero-write boot |
+| v48 | CI 39634274543 | v48 (WITH /options) | zero-write + battery | **panicked** (the /options NVRAM path) |
+| v49/v50 | CI 39634274543 | v49 (no /options) | zero-write + battery + native DPI | the panic fix |
+
+### The native-DPI change (asked for by the user)
+`/arm-io/disp0 canvas-width/height` = **1440x3200** (the panel's own pixels) with `/chosen display-scale` = **3** -> **480x1067 points**, a real phone point size at the native pixel density (no upscaling, no blur). Before: 1125x2436 @3x stretched onto the 1440x3200 panel.
+
+### The stability rule for the supervisor (tools/venus-supervisor.sh)
+The old supervisor rebooted the phone in a loop: the console goes quiet when the phone simply sits on the home screen, so "no log" was read as "dead phone". Now: a reboot is requested only when the console is quiet **AND** the phone does not answer a ping, and a crash-loop guard refuses to boot the same image twice within 15 minutes.
+
+### Wave 2 - the driver patches (all in xnu/patches/, all compile)
+GPU: 0112 read-only Adreno 660 probe, 0113 GDSC+clock power path with read-back and quiesce, 0114 `SweetGraphicsAccelerator` IOKit service (deliberately NOT named AGXAccelerator - that freezes CoreAnimation) + an fps counter, 0115 GICv3 + SMMU v5 probes, 0122 GPU_CC clock reader, 0124 SCM helper (the zap-shader PAS authentication is the hard gate for a real GPU driver).
+Battery: 0123 thermal + power probe (SMB5/BCL/temperatures) + an `AppleSmartBattery` service that answers the AKS selectors the iOS power stack really calls.
+Keys: 0116 key state machine + long press, 0117 IOHIDDevice for iOS, 0118 backlight-control, 0119 AW8697 haptics + hall/cover sensor, 0120 volume keys over the PMIC GPIO.
+Other: 0121 boot/runtime profiler, 0125 panic capture.
+**Build-order trap found:** a patch that adds a new file embeds the whole file, so editing the standalone copy in `xnu/patches/<name>.c` does NOT reach the CI - the embedded copy is what gets compiled. `tools/sync-patch-sources.py` now keeps them in sync and recomputes the hunk counts.
+
 ## >>> VENUS: CLIENT NEEDS THE ACTIVATION RECORD, NOT JUST THE STATE (2026-10-21 15:05) <<<
 
 **STATE: patch 0101 (AKS returns an activation record) building in CI 39596537168.**
