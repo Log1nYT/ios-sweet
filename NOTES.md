@@ -1,3 +1,13 @@
+## >>> VENUS: THE ORIGINAL PROJECT'S SOURCES (HackiOS, github.com/oosexgang) CLONED AS A DONOR (2026-10-22 10:05) <<<
+
+- User: "the original project's sources are out, take everything we need". Repos: `hackios-xnu-kernel` (APSL 2.0), `hackios-xnu-userland` (MIT), `hackios-web`. Shallow clones in `/Users/matviy/Documents/hackios-ref/` (outside this repo, nothing copied yet, no script of theirs was run).
+- They run XNU 8796.121.2 on a POCO X5 Pro (redwood, SM7325, Adreno 642L): GPU through Mesa/freedreno (`gpu=1`), Wi-Fi, camera, audio, touch, buttons, battery, cpufreq, APFS root, UEFI loader. Kernel changes: `xnu/redwood.patch` (3235 lines) + 104 new files in `xnu/files/`.
+- `xnu/files/bsd/dev/redwood_adreno.c` (4125 lines) is exactly the missing piece of our GPU work: staged bring-up `adreno=N` (reads before writes): RPMh names from cmd-db (same `0x80860000` we measured), CX GDSC + clocks with a frequency counter, GMU registers/SMMU, TrustZone zap-shader authentication (`a660_zap.mdt`), GMU firmware (`a660_gmu.bin`) + HFI, the 3D core's SQE microcode (`a660_sqe.fw`), first command, a three-colour picture. The GMU firmware votes the GX rail itself, so our "gfx.lvl not voted" blocker disappears. Firmware = the phone's own `/vendor/firmware/a660_*` (the Android vendor image is still on the phone: only userdata was overwritten).
+- Their header says the kernel runs under Qualcomm's hypervisor: an access it dislikes ends the run at once or ~15 s later, often silently. That matches our silent resets and hangs (RSC typo read, GPU_CC/GCC writes in v68, the hang after the volume repair). New working rule: stage every new MMIO access (`read first, one step per boot`), like `adreno=N`.
+- Other donors: `redwood_buttons.c` (583 lines), `redwood_battery.c` + `RedwoodBattery.cpp`, `redwood_cpufreq.c`, `redwood_goodix.c`, `kern_memorystatus` jetsam tweak (sane_size instead of max_mem).
+- Licensing: their kernel changes are APSL 2.0 (derivative of XNU), userland MIT. Keep their headers when porting.
+- Next: pull `a660_*` from the Android `/vendor/firmware` over TWRP (read-only), then port `redwood_adreno.c` to venus step by step (SM8350 addresses: gmu 0x3d6a000?, gpucc 0x3d90000, cmd-db 0x80860000, smmu 0x3da0000).
+
 ## >>> VENUS: REPAIRED VOLUME WRITTEN BACK TO THE PHONE (2026-10-22 09:50) <<<
 
 - After `fsck_hfs -fy` on the pulled copy, `springboard.plist` (garbage after the overlap) was rewritten in the copy with the seeded values at the same length (`hfsplus-tool.py patch`, 1211 B, XML padded with spaces), then `fsck_hfs -n` on the copy: "appears to be OK".
