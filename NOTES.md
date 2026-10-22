@@ -1,3 +1,9 @@
+## >>> VENUS: THE HackiOS LOADER RUNS ON THE Mi 11 (2026-10-22 11:10) <<<
+
+- First milestone of the stack switch reached: `fastboot boot out/venus-boot.img` (UEFI Mu-Silicium + donor loader) shows `== XNULOADER v3 ==  CurrentEL=1 MIDR=412fd050 (Cortex-A55 core 0) CNTFRQ=19.2 MHz`, `display 1440 x 3200 at e2a00000` (my fb_base guess was right, `platform venus` matched), `usb: started`; the Mac sees USB product `xnuloader` and `fastboot getvar version` = 0.5; `fastboot oem memmap` + `oem log` + `get_staged FILE` return the firmware memory map.
+- What it took (all in `uefi-venus/`, patch + README): the old IosLoader DXE driver (halted at `kern.raw`) disabled; the loader hook moved to `PlatformBootManagerPriorityBoot` (no boot options -> Boot Manager menu otherwise); `XNU Payload` 0xF0000000 region added to the venus memory map (UEFI faulted reading the payload); `build_uefi.py` uses patch(1).
+- Memory map seen from the loader: only 3 MB free (type 7). The real DRAM (usable 0xE5000000..0x200000000 per our earlier findings) is not described, so the loader has no RAM window for XNU yet. Next: describe it as conventional memory in `MemoryMapLib.c`, then upload the system image and kernel.
+
 ## >>> VENUS: SWITCHING TO THE HackiOS STACK (UEFI + loader + kernel), PORT STARTED (2026-10-22 10:15) <<<
 
 - User decision: adopt the donor stack and adapt it (and all its drivers) to venus. State + plan: `logs/research/30-venus-hackios-port.md`. Work copy `~/Documents/hackios-venus/` (not in git).
