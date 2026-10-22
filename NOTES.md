@@ -1,3 +1,11 @@
+## >>> VENUS: REPAIRED VOLUME WRITTEN BACK TO THE PHONE (2026-10-22 09:50) <<<
+
+- After `fsck_hfs -fy` on the pulled copy, `springboard.plist` (garbage after the overlap) was rewritten in the copy with the seeded values at the same length (`hfsplus-tool.py patch`, 1211 B, XML padded with spaces), then `fsck_hfs -n` on the copy: "appears to be OK".
+- Wrote back ONLY the changed blocks with the new `tools/research/volume-diff.py` (`diff` read-only, `write`): 279 pulled blocks that differed from the phone + 5074 never-pulled non-zero blocks fsck wrote = 5353 blocks (20.9 MiB) in 173 runs, each run verified by readback. Never-pulled zero blocks were NOT written (holes: the phone may hold real data in blocks the old bitmap called free). The 12.5 GiB prefix was compared with the phone (read-only, 560 s) first.
+- Phone volume header after the write: attributes 0x80000100 (UNMOUNTED, INCONSISTENT cleared), lastMountedVersion 'fsck', freeBlocks 55672339.
+- Activation untouched (verified before the write on the repaired copy): the 7 `mobileactivationd` patch sites, purplebuddy/migration prefs, data_ark in container 164CBCC9-....
+- Next: boot v67 (read-only GPU probe, no new risks) and check the console: expect no `hfs_mark_inconsistent`, frames (`SWEET FB: swap`) and the home screen.
+
 ## >>> VENUS: OFFLINE HFS+ REPAIR OF THE PHONE VOLUME - DONE ON A COPY, NOT WRITTEN BACK (2026-10-22 09:35) <<<
 
 - User rule (memory `feedback-never-touch-activation`): do not touch anything tied to activation. So no reflash; repair in place instead.
