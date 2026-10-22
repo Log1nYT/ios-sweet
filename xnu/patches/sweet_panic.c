@@ -34,6 +34,7 @@
 #include <sys/proc.h>
 #include <kern/clock.h>
 #include <kern/debug.h>
+#include <kern/backtrace.h>
 #include <kern/locks.h>
 #include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
@@ -280,6 +281,28 @@ sweet_panic_capture(int is_panic, const char *fmt, va_list *args,
 	    is_panic ? "SWEET PANIC" : "SWEET DEBUGGER", text,
 	    (unsigned long long)caller);
 	sp_ring(msg);
+
+	/*
+	 * 1b. the call chain of the panicking thread (unslid kernel addresses,
+	 * symbolize with nm -n on the kernel image): "failed with 3" panics
+	 * carry no hint about the caller otherwise.
+	 */
+	{
+		uintptr_t bt[24];
+		backtrace_info_t info = BTI_NONE;
+		unsigned int n = backtrace(bt, 24, NULL, &info), i;
+		char bl[24 * 20 + 32];
+		unsigned int off = 0;
+
+		off += (unsigned int)snprintf(bl + off, sizeof(bl) - off,
+		    "SWEET PANIC: bt");
+		for (i = 0; i < n && off + 20 < sizeof(bl); ++i) {
+			off += (unsigned int)snprintf(bl + off, sizeof(bl) - off,
+			    " 0x%lx", (unsigned long)bt[i]);
+		}
+		(void)snprintf(bl + off, sizeof(bl) - off, "\n");
+		sp_ring(bl);
+	}
 
 	/*
 	 * 2. the console and the XNU panic log.  paniclog_append_noflush() is

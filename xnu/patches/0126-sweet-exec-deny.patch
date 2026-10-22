@@ -1,0 +1,79 @@
+venus 0126: boot-arg sweetdeny=word,word - processes that are not run
+
+The stability notes of the donor project (HackiOS, oosexgang, userland/mkjobs.py
+DENY) say it never starts a list of iOS daemons on a phone without their
+hardware: locationd, homed, routined, duetexpertd, ReportCrash, datamigrator ...
+They crash-loop (locationd 60x, gpsd 22x, homed 8x in our live log) or do large
+kernel allocations, and the 3 MiB kmem_alloc(KMA_NOFAIL) panic of the new
+kernel lands right after duetexpertd/routined/OTACrashCopier start.
+
+A process whose name contains one of the comma separated words of sweetdeny is
+refused at exec (ENOENT, one line "SWEET DENY: name"); nothing on disk changes
+and the default (no boot-arg) is today's behaviour.
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..3d53a0c 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2100,6 +2100,49 @@ struct execsw {
+ };
+ 
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * boot-arg sweetdeny=word,word,...: a process whose name contains one of the
++ * words is not run (execve fails with ENOENT).  The donor project keeps a
++ * list of iOS daemons it never starts (locationd, homed, routined,
++ * duetexpertd, ReportCrash ...: they crash-loop or do large kernel
++ * allocations on a phone without their hardware).  Nothing on disk changes.
++ */
++static char sweet_deny_list[256];
++static int sweet_deny_ready;
++
++static bool
++sweet_exec_denied(const char *name)
++{
++	const char *s;
++
++	if (!sweet_deny_ready) {
++		sweet_deny_ready = 1;
++		if (!PE_parse_boot_arg_str("sweetdeny", sweet_deny_list, sizeof(sweet_deny_list))) {
++			sweet_deny_list[0] = '\0';
++		}
++	}
++	for (s = sweet_deny_list; *s;) {
++		const char *e = s, *h;
++		size_t n;
++
++		while (*e && *e != ',') {
++			e++;
++		}
++		n = (size_t)(e - s);
++		if (n > 0) {
++			for (h = name; *h; ++h) {
++				if (strncmp(h, s, n) == 0) {
++					return true;
++				}
++			}
++		}
++		s = *e ? e + 1 : e;
++	}
++	return false;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /*
+  * exec_activate_image
+  *
+@@ -7414,6 +7457,11 @@ process_signature(proc_t p, struct image_params *imgp)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+ 			printf("exec %s\n", p->p_name);
++			if (sweet_exec_denied(p->p_name)) {
++				printf("SWEET DENY: %s\n", p->p_name);
++				error = ENOENT;
++				goto done;
++			}
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
