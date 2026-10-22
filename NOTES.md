@@ -1,3 +1,10 @@
+## >>> VENUS: DONOR MAP + STABILITY PATCHES FROM HackiOS (2026-10-22 10:25) <<<
+
+- Full map in `logs/research/29-hackios-donor-map.md` (stability lessons + driver table + port order).
+- Real finding about OUR panics: every v67/v68/v67-repaired boot (3 of 3) ends with `SWEET PANIC: kmem_alloc(..., 3145728, 0x100021): failed with 3 @vm_kern.c:178` (KMA_NOFAIL, KERN_NO_SPACE) ~1 min after `duetexpertd`/`routined`/`OTACrashCopier` start. My earlier "v67/v68 have no panic" was WRONG (I grepped only `Kernel data abort|Unaligned`; always grep the generic `SWEET PANIC`).
+- 0125 now prints the backtrace of the panicking thread (`SWEET PANIC: bt 0x... ...`, unslid addresses, symbolize with `nm -n` of the CI kernel). 0126 adds boot-arg `sweetdeny=word,word` (kernel refuses exec of named processes, one `SWEET DENY: name` line; nothing on disk changes), seeded from the donor's launchd DENY list (locationd, homed, routined, duetexpertd, ReportCrash ...). Activation-adjacent jobs (datamigrator, mobileactivationd, lockdown, purplebuddy) are deliberately NOT in the list.
+- CI run 39737564226 -> v69 (`logs/build-v69.sh`): v67 cmdline + `sweetkeyvol=1` + `sweetdeny=routined,duetexpertd,homed,locationd,gpsd,OTACrashCopier,ReportCrash`.
+
 ## >>> VENUS: THE ORIGINAL PROJECT'S SOURCES (HackiOS, github.com/oosexgang) CLONED AS A DONOR (2026-10-22 10:05) <<<
 
 - User: "the original project's sources are out, take everything we need". Repos: `hackios-xnu-kernel` (APSL 2.0), `hackios-xnu-userland` (MIT), `hackios-web`. Shallow clones in `/Users/matviy/Documents/hackios-ref/` (outside this repo, nothing copied yet, no script of theirs was run).
