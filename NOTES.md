@@ -1018,3 +1018,9 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+## >>> VENUS v70: sweetdeny works, no panic, system alive but no desktop (2026-10-22) <<<
+- v69 panicked at `kern_exec.c:7625 signature_failure_reason != OS_REASON_NULL` right after `SWEET DENY: OTACrashCopier`: my 0126 left the reason NULL. Fixed (commit b9d7403): `error = EPERM; signature_failure_reason = os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_SECURITY_POLICY)`.
+- CI run 39773066578 (Log1nYT/ios-sweet) -> `logs/build-v70.sh` -> `shim/out/shim-boot-venus-v70.img` (SHA 5812587a...). Booted via `fastboot boot` 14:58: observations: no SWEET PANIC, DENY lines for routined/OTACrashCopier/ReportCrash/locationd/homed/duetexpertd, SpringBoard + backboardd exec'd, SWEET GPU probe chip-id 0x06060001, phone still answers ping on 192.168.7.2 minutes later. The old `kmem_alloc` 3 MiB panic did not appear in this run (one run, ~2 min log; not proven gone).
+- Screen shows only text logs, no logo/desktop. `IOAcceleratorES 0 found` is EXPECTED (0114: never publish such a class, it freezes the UI), so a stub accelerator is NOT the fix. Open: why SpringBoard draws nothing (watch backboardd/SpringBoard/IOMFB lines, framebuffer ownership with sweetfb_noconsole=1).
+- Donor (HackiOS xl/UEFI) path on venus: loader runs, kernel hangs silently, `logdump` partition stayed all zeros (log not persisted); parked.
