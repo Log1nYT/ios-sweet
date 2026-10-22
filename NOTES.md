@@ -1,3 +1,11 @@
+## >>> VENUS: v67 = GPU POWER PROBE (READ-ONLY) COMPLETE, NO PANIC (2026-10-22 09:05) <<<
+
+- Two bugs of mine in 0113 found and fixed with the live log: (1) `GP_RSC_PA` was 0x01822000 (typo, real 0x18220000) -> first read in `gp_board_guard` reset the SoC silently (v63/v64/v65-with-probe); (2) `gp_cmd_db_dump()` passed the PHYSICAL cmd-db locator address to `gp_rd()` (expects a mapped address) -> `Kernel data abort`, far=0xc3f000c (v66); now it maps the locator page first (commit 39c1205, CI 39729874129 -> `xnu/out-venus-v67kernel`).
+- v67 (`shim/out/shim-boot-venus-v67.img`, SHA 46ce423a...; `sweetgpu=1 sweetgpuprobe=1 sweetpaniclast=1 sweetpanicgrace=300000`, no writes) booted 09:03:30 via `fastboot boot`: no panic, SpringBoard + backboardd up, ping 192.168.7.2 answers. Live log `logs/venus-live-20261022b.txt`.
+- **Measurements (observations):** RSC board id=0x20300 solver=0x4010100 TCS=8 ncpt=16 (the venus signature). CX GDSCR=0x00222001 (collapsed, hw_ctrl pwr_on=0), CX BCR=0 (not in reset), GX GDSCR=0x00222001 (collapsed), GX GDSCR CFG=0x00088400 (pwr_up_complete=0), **GX BCR=1 (GX is held in reset)**, GX clamp=0/aon_reset=0, gpu_cc_ahb_clk=0, cx_gmu_clk=0x80006221, hub_aon_clk=0x1, hub_cx_int_clk=0x80000001. cmd-db: locator 0xc3f000c -> pa=0x80860000 size=0x13f0, version 1, magic 0xc0330db; `cx.lvl` addr=0x30000 slave=3, `gfx.lvl` addr=0x30050 slave=3 (both ARC).
+- Meaning: the CX rail votes exist in cmd-db, but the RPMh ARC request format is NOT implemented (the code only reports), so the GX rail can not be voted yet. `sweetgpupower=1` would raise only the CX GDSC and clocks (writes with read-back and quiesce); `sweetgpugx=1` needs the gfx.lvl vote first.
+- Host side: `nc -ukl 5140` locks onto the first sender's source port and silently drops every later boot (log stayed at 15369 B for two boots). Use `tools/venus-udplog.sh LOG` (python, per-datagram) for the log and `tools/venus-usbnet-ip-mac.sh` (new, one sudo password, keeps 192.168.7.1 on the ECM interface across re-enumerations).
+
 ## >>> VENUS: CLEAN iOS ROOT IMAGE v8 BUILT ON THE MAC, NOT FLASHED (2026-10-22 00:20) <<<
 
 - Why: the root on the phone is damaged (`hfs_mark_inconsistent: Runtime corruption detected on iosroot` spams; v65 reaches SpringBoard but no logo). The old images (/tmp v5-v7, Linux `ios16-root-20H392-v*.img`) are gone from this Mac.
