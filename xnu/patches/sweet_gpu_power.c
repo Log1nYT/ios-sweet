@@ -288,12 +288,19 @@ gp_db_find(vm_offset_t db, uint32_t db_size, const char *name, uint32_t *addr,
 static void
 gp_cmd_db_dump(void)
 {
-	vm_offset_t db = 0;
+	vm_offset_t db = 0, loc;
 	uint32_t db_pa, db_size, db_magic, db_version;
 	uint32_t addr, slave;
 
-	db_pa = gp_rd(GP_CMD_DB_LOCATOR_PA, 0);
-	db_size = gp_rd(GP_CMD_DB_LOCATOR_PA, 4);
+	/* gp_rd() takes a mapped address: map the locator page first (the
+	 * locator itself is not page aligned). */
+	loc = ml_io_map(GP_CMD_DB_LOCATOR_PA & ~0xfffu, 0x1000);
+	if (!loc) {
+		printf("SWEET GPU POWER: cmd-db locator mapping failed\n");
+		return;
+	}
+	db_pa = gp_rd(loc, GP_CMD_DB_LOCATOR_PA & 0xfffu);
+	db_size = gp_rd(loc, (GP_CMD_DB_LOCATOR_PA & 0xfffu) + 4);
 	printf("SWEET GPU POWER: cmd-db locator=%#x pa=%#x size=%#x\n",
 	    (unsigned)GP_CMD_DB_LOCATOR_PA, (unsigned)db_pa, (unsigned)db_size);
 	if (db_pa < 0x80000000u || (db_pa & 3u) || (db_size & 3u) ||
