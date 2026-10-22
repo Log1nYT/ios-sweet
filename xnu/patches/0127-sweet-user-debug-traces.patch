@@ -1,0 +1,444 @@
+venus 0127: user-space bring-up diagnostics from the HackiOS kernel (same xnu-8796 base)
+
+Our kernel could not say WHY a daemon died or what it was refused: SpringBoard
+crash-loops with "sig 11 pc 0" and nothing names the cause.  This patch brings
+four read-only aids of the donor project (APSL 2.0, xnu/redwood.patch), each
+off unless its boot-arg is set:
+
+  systrace=1|2         log failed (2: every) BSD system call; __mac_syscall with
+                       policy name + request, sysctl with its MIB, paths
+  systrace_name=NAME   keep it to one process name
+  systrace (also)      every fatal-looking user exception: registers, shared
+                       cache slide, text at registers, frame-pointer backtrace
+                       (osfmk/arm64/user_exception_trace.c, hooked in exception.c)
+                       and abort() call sites (kern_sig.c)
+  regtrace=1|2         registry properties user space asks for and does not find
+  applog=1             standard output/error of programs launchd points at
+                       /dev/null go to /dev/console (NSLog, uncaught exception)
+
+Left out on purpose: the donor's ustacks sampler (needs the loader's log
+function) and applog=2 (OS_ACTIVITY_DT_MODE injection).
+
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 7fd9be1..0d03525 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -36,6 +36,92 @@
+ #include <security/mac_framework.h>
+ #endif
+ 
++/*
++ * Bring-up aid: boot-arg systrace=1 logs every BSD system call that fails,
++ * systrace=2 logs all of them (to the kernel message buffer). For calls that
++ * take a path, the path is shown. systrace_name=NAME keeps it to the processes
++ * of that name: with a whole system running, everybody's failed calls are
++ * megabytes a minute.
++ */
++static TUNABLE(uint32_t, systrace_level, "systrace", 0);
++static TUNABLE_STR(systrace_name, MAXCOMLEN + 1, "systrace_name", "");
++extern const char *syscallnames[];
++
++static void
++systrace_report(struct proc *proc, unsigned short syscode, struct uthread *uthread, int error)
++{
++	/* system calls whose first (or, for the second list, second) argument is a path */
++	static const unsigned short path_arg0[] = {
++		SYS_open, SYS_link, SYS_unlink, SYS_chdir, SYS_mknod, SYS_chmod, SYS_chown, SYS_access, SYS_readlink,
++		SYS_execve, SYS_chroot, SYS_rename, SYS_mkdir, SYS_rmdir, SYS_pathconf, SYS_getattrlist, SYS_setattrlist,
++		SYS_getxattr, SYS_listxattr, SYS_fsctl, SYS_stat64, SYS_lstat64, SYS_statfs64, SYS_open_nocancel,
++		SYS_open_dprotected_np, SYS_symlink, SYS_unmount, SYS_stat64_extended, SYS_lstat64_extended,
++	};
++	static const unsigned short path_arg1[] = {
++		SYS_mount, SYS_posix_spawn, SYS_openat, SYS_openat_nocancel, SYS_fstatat64, SYS_faccessat, SYS_readlinkat,
++		SYS_getattrlistat, SYS_mkdirat, SYS_unlinkat,
++	};
++	char path[160] = "";
++	/*
++	 * Two calls are worth more than their arguments' addresses, because what they ASK is the whole
++	 * of what they do. __mac_syscall carries the policy's name and the request number: this
++	 * kernel's AMFI stand-in answers only 0x5a and 0x60 and returns ENOPOLICY to anything else
++	 * (bsd/kern/kern_minimac.c), so a daemon refused there is refused in a way nothing in user
++	 * space can see -- and a library of ours cannot watch it either, since the call is made inside
++	 * libsystem and dyld interposing only stands between images. The name matters as much as the
++	 * number: the same call goes to Sandbox as well. And sysctl carries its MIB, which is the only
++	 * thing that says what was asked about.
++	 */
++	char detail[112] = "";
++	size_t done;
++
++	if (systrace_level < 2 && (error == 0 || error == EJUSTRETURN || error == ERESTART)) {
++		return;
++	}
++	if (systrace_name[0] != 0 && strncmp(proc->p_comm, systrace_name, MAXCOMLEN) != 0) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(path_arg0) / sizeof(path_arg0[0]); i++) {
++		if (path_arg0[i] == syscode) {
++			(void)copyinstr((user_addr_t)uthread->uu_arg[0], path, sizeof(path), &done);
++		}
++	}
++	for (unsigned i = 0; i < sizeof(path_arg1) / sizeof(path_arg1[0]); i++) {
++		if (path_arg1[i] == syscode) {
++			(void)copyinstr((user_addr_t)uthread->uu_arg[1], path, sizeof(path), &done);
++		}
++	}
++	path[sizeof(path) - 1] = 0;
++	if (syscode == SYS___mac_syscall) {
++		char policy[32] = "";
++
++		(void)copyinstr((user_addr_t)uthread->uu_arg[0], policy, sizeof(policy), &done);
++		policy[sizeof(policy) - 1] = 0;
++		snprintf(detail, sizeof(detail), " policy \"%s\" request %lld", policy,
++		    (long long)uthread->uu_arg[1]);
++	} else if (syscode == SYS_sysctl) {
++		int mib[6];
++		unsigned count = (unsigned)uthread->uu_arg[1];
++
++		if (count > 6) {
++			count = 6;
++		}
++		if (count > 0 && copyin((user_addr_t)uthread->uu_arg[0], mib, count * sizeof(mib[0])) == 0) {
++			size_t used = (size_t)snprintf(detail, sizeof(detail), " mib");
++
++			for (unsigned i = 0; i < count && used + 12 < sizeof(detail); i++) {
++				used += (size_t)snprintf(detail + used, sizeof(detail) - used, " %d", mib[i]);
++			}
++		}
++	}
++	detail[sizeof(detail) - 1] = 0;
++	printf("systrace: %s[%d] %s(0x%llx, 0x%llx, 0x%llx, 0x%llx)%s%s%s%s = %d\n",
++	    proc->p_comm, proc_getpid(proc), syscallnames[syscode],
++	    (unsigned long long)uthread->uu_arg[0], (unsigned long long)uthread->uu_arg[1],
++	    (unsigned long long)uthread->uu_arg[2], (unsigned long long)uthread->uu_arg[3],
++	    path[0] ? " \"" : "", path, path[0] ? "\"" : "", detail, error);
++}
++
+ #if CONFIG_DTRACE
+ extern int32_t dtrace_systrace_syscall(struct proc *, void *, int *);
+ extern void dtrace_systrace_syscall_return(unsigned short, int, int *);
+@@ -181,6 +267,10 @@ unix_syscall(
+ 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
+ 
++	if (__improbable(systrace_level != 0)) {
++		systrace_report(proc, syscode, uthread, error);
++	}
++
+ #if CONFIG_MACF
+ skip_syscall:
+ #endif /* CONFIG_MACF */
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 953be9f..f95ef3d 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2665,6 +2665,23 @@ done:
+ 	return ret;
+ }
+ 
++/*
++ * Bring-up aid, boot-arg applog=1: what applications and other programs started without a
++ * terminal say is worth reading. Their standard output and error, which launchd opens on
++ * /dev/null, go to the console instead (NSLog, "Terminating app due to uncaught exception").
++ * (From the HackiOS kernel, same xnu-8796 base.)
++ */
++static TUNABLE(uint32_t, exec_applog, "applog", 0);
++
++static const char *
++exec_applog_path(int fd, const char *path)
++{
++	if (exec_applog && (fd == 1 || fd == 2) && strcmp(path, "/dev/null") == 0) {
++		return "/dev/console";
++	}
++	return path;
++}
++
+ /*
+  * exec_handle_file_actions
+  *
+@@ -2734,7 +2751,7 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
+ 			AUDIT_SUBCALL_ENTER(OPEN, p, uthread);
+ 
+ 			NDINIT(ndp, LOOKUP, OP_OPEN, FOLLOW | AUDITVNPATH1, UIO_SYSSPACE,
+-			    CAST_USER_ADDR_T(psfa->psfaa_openargs.psfao_path),
++			    CAST_USER_ADDR_T(exec_applog_path(psfa->psfaa_filedes, psfa->psfaa_openargs.psfao_path)),
+ 			    imgp->ip_vfs_context);
+ 
+ 			error = open1(imgp->ip_vfs_context, ndp,
+diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
+index ca53f9b..78fd8ad 100644
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -1099,6 +1099,14 @@ __pthread_kill(__unused proc_t p, struct __pthread_kill_args *uap,
+ 	thread_t target_act;
+ 	int error = 0;
+ 	int signum = uap->sig;
++
++#if defined(__arm64__)
++	if (signum == SIGABRT) {
++		extern void user_abort_trace(void);
++
++		user_abort_trace();             /* no crash reporter here: this is where an abort() gets recorded */
++	}
++#endif
+ 	struct uthread *uth;
+ 
+ 	target_act = (thread_t)port_name_to_thread(uap->thread_port,
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 163fce1..b720bc0 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -3631,6 +3631,25 @@ IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
+ 	return obj;
+ }
+ 
++/*
++ * Boot-arg regtrace=1: report the registry properties user space asks for and does not
++ * find (regtrace=2: every property asked for). Shows what a daemon expects of a driver.
++ */
++static TUNABLE(uint32_t, regtrace_level, "regtrace", 0);
++
++static void
++regtrace_report(IORegistryEntry * entry, const char * property, bool found)
++{
++	char procname[32] = "?";
++
++	if (regtrace_level == 0 || (found && regtrace_level < 2)) {
++		return;
++	}
++	proc_selfname(procname, sizeof(procname));
++	IOLog("regtrace: %s[%d] %s(%s).%s %s\n", procname, proc_selfpid(), entry->getName(),
++	    entry->getMetaClass()->getClassName(), property, found ? "found" : "MISSING");
++}
++
+ /* Routine io_registry_entry_get_property */
+ kern_return_t
+ is_io_registry_entry_get_property_bytes(
+@@ -3658,6 +3677,7 @@ is_io_registry_entry_get_property_bytes(
+ #endif
+ 
+ 	obj = IOCopyPropertyCompatible(entry, property_name);
++	regtrace_report(entry, property_name, obj != NULL);
+ 	if (!obj) {
+ 		return kIOReturnNoResources;
+ 	}
+@@ -3726,6 +3746,7 @@ is_io_registry_entry_get_property(
+ #endif
+ 
+ 	obj = IOCopyPropertyCompatible(entry, property_name);
++	regtrace_report(entry, property_name, obj != NULL);
+ 	if (!obj) {
+ 		return kIOReturnNotFound;
+ 	}
+@@ -3774,6 +3795,7 @@ is_io_registry_entry_get_property_recursively(
+ 
+ 	obj = entry->copyProperty( property_name,
+ 	    IORegistryEntry::getPlane( plane ), options );
++	regtrace_report(entry, property_name, obj != NULL);
+ 	if (!obj) {
+ 		return kIOReturnNotFound;
+ 	}
+@@ -3968,6 +3990,7 @@ is_io_registry_entry_get_property_bin_buf(
+ 	}
+ 
+ 	err = kIOReturnNotFound;
++	IORegistryEntry * asked = entry;
+ 	if (gIORegistryEntryPropertyKeysKey == sym) {
+ 		obj = entry->copyPropertyKeys();
+ 	} else {
+@@ -4000,6 +4023,7 @@ is_io_registry_entry_get_property_bin_buf(
+ 	}
+ 
+ 	sym->release();
++	regtrace_report(asked, property_name, obj != NULL);
+ 	if (!obj) {
+ 		return err;
+ 	}
+diff --git a/osfmk/arm64/user_exception_trace.c b/osfmk/arm64/user_exception_trace.c
+new file mode 100644
+index 0000000..f440b87
+--- /dev/null
++++ b/osfmk/arm64/user_exception_trace.c
+@@ -0,0 +1,146 @@
++/*
++ * Bring-up aid: with boot-arg systrace set, describe every fatal-looking
++ * exception a user thread takes, before it is delivered. There is no crash
++ * reporter in this system, so this is the only place a crash is recorded.
++ *
++ * Besides the registers it prints the shared cache slide (most crashes are
++ * inside system libraries: subtract the slide and look the address up in
++ * the cache with "ipsw dyld a2s"), any text a register points at (the
++ * library crash helpers leave their message in one) and the return
++ * addresses found by walking the frame pointers.
++ */
++
++#include <arm/thread.h>
++#include <kern/debug.h>
++#include <kern/misc_protos.h>
++#include <kern/startup.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <mach/exception_types.h>
++#include <mach/machine/thread_status.h>
++#include <string.h>
++#include <vm/vm_map.h>
++#include <vm/vm_shared_region.h>
++
++extern char *proc_name_address(struct proc *p);
++
++void user_exception_trace(exception_type_t exception, mach_exception_data_t code, mach_msg_type_number_t count, thread_t thread);
++
++static TUNABLE(uint32_t, user_exception_trace_enabled, "systrace", 0);
++
++static bool
++plausible_user_address(uint64_t address)
++{
++	return address >= 0x100000000ULL && address < MACH_VM_MAX_ADDRESS;
++}
++
++void
++user_exception_trace(exception_type_t exception, mach_exception_data_t code, mach_msg_type_number_t count, thread_t thread)
++{
++	static const unsigned message_registers[] = { 0, 1, 2, 3, 8, 16 };
++	const arm_saved_state_t *state;
++	vm_shared_region_t region;
++	uint64_t frame[2], fp;
++	uint32_t slide = 0;
++	task_t task;
++	struct proc *proc;
++
++	if (!user_exception_trace_enabled || thread != current_thread()) {
++		return;
++	}
++	if (exception != EXC_BAD_ACCESS && exception != EXC_BAD_INSTRUCTION && exception != EXC_ARITHMETIC &&
++	    exception != EXC_BREAKPOINT) {
++		return;
++	}
++	task = get_threadtask(thread);
++	state = get_user_regs(thread);
++	if (task == kernel_task || state == NULL || !is_saved_state64(state)) {
++		return;
++	}
++	region = vm_shared_region_get(task);
++	if (region != NULL) {
++		slide = region->sr_slide;
++		vm_shared_region_deallocate(region);
++	}
++	proc = get_bsdtask_info(task);
++
++	printf("usertrap: %s[%d] exception %d code 0x%llx 0x%llx: pc 0x%llx lr 0x%llx sp 0x%llx, shared cache slide 0x%x\n",
++	    proc ? proc_name_address(proc) : "?", proc ? proc_pid(proc) : -1, exception,
++	    count > 0 ? (unsigned long long)code[0] : 0, count > 1 ? (unsigned long long)code[1] : 0,
++	    (unsigned long long)get_saved_state_pc(state), (unsigned long long)get_saved_state_lr(state),
++	    (unsigned long long)get_saved_state_sp(state), slide);
++
++	for (unsigned i = 0; i < sizeof(message_registers) / sizeof(message_registers[0]); i++) {
++		uint64_t value = (uint64_t)get_saved_state_reg(state, message_registers[i]);
++		char text[128];
++		vm_size_t length = 0;
++		bool printable = true;
++
++		if (!plausible_user_address(value)) {
++			continue;
++		}
++		bzero(text, sizeof(text));
++		(void)copyinstr((user_addr_t)value, text, sizeof(text) - 1, &length);
++		for (unsigned c = 0; c < 6; c++) {
++			printable = printable && text[c] >= 0x20 && text[c] < 0x7f;
++		}
++		if (printable) {
++			printf("usertrap:   x%u -> \"%s\"\n", message_registers[i], text);
++		}
++	}
++
++	fp = (uint64_t)get_saved_state_fp(state);
++	for (int depth = 0; depth < 10 && plausible_user_address(fp) && (fp & 7) == 0; depth++) {
++		if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
++			break;
++		}
++		printf("usertrap:   called from 0x%llx\n", (unsigned long long)frame[1]);
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++}
++
++/*
++ * A program calls abort(): say which, and from where. The reason is usually an exception nobody
++ * caught, or an assertion; the text of it goes to the program's standard error (boot-arg applog=1
++ * puts that on the console), the stack is here.
++ */
++void user_abort_trace(void);
++
++void
++user_abort_trace(void)
++{
++	thread_t thread = current_thread();
++	task_t task = get_threadtask(thread);
++	const arm_saved_state_t *state = get_user_regs(thread);
++	struct proc *proc = get_bsdtask_info(task);
++	vm_shared_region_t region;
++	uint64_t frame[2], fp;
++	uint32_t slide = 0;
++
++	if (task == kernel_task || state == NULL || !is_saved_state64(state)) {
++		return;
++	}
++	region = vm_shared_region_get(task);
++	if (region != NULL) {
++		slide = region->sr_slide;
++		vm_shared_region_deallocate(region);
++	}
++	printf("userabort: %s[%d] aborts, shared cache slide 0x%x; called from:", proc ? proc_name_address(proc) : "?",
++	    proc ? proc_pid(proc) : -1, slide);
++	fp = (uint64_t)get_saved_state_fp(state);
++	for (int depth = 0; depth < 24 && plausible_user_address(fp) && (fp & 7) == 0; depth++) {
++		if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
++			break;
++		}
++		printf(" 0x%llx", (unsigned long long)frame[1]);
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	printf("\n");
++}
++
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index b0dad49..e3e850d 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -105,3 +105,4 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
+ osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
+ 
+ osfmk/arm/counter.c	standard
++osfmk/arm64/user_exception_trace.c	standard
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..2071bfb 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -636,6 +636,11 @@ check_exc_receiver_dependency(
+  *	Returns:
+  *		KERN_SUCCESS if exception is handled by any of the handlers.
+  */
++#if defined(__arm64__)
++extern void user_exception_trace(exception_type_t exception, mach_exception_data_t code,
++    mach_msg_type_number_t count, thread_t thread);
++#endif
++
+ kern_return_t
+ exception_triage_thread(
+ 	exception_type_t        exception,
+@@ -650,6 +655,11 @@ exception_triage_thread(
+ 	struct exception_action *actions;
+ 	kern_return_t   kr = KERN_FAILURE;
+ 
++#if defined(__arm64__)
++	/* bring-up aid, see osfmk/arm64/user_exception_trace.c */
++	user_exception_trace(exception, code, codeCnt, thread);
++#endif
++
+ 	assert(exception != EXC_RPC_ALERT);
+ 
+ 	/*
