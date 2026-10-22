@@ -1,0 +1,29 @@
+venus 0130: the sweetfilepatch alias "mad" expands to /usr/libexec/mobileactivationd
+
+It expanded to /private/usr/libexec/mobileactivationd, which does not exist on the HFS root
+(/usr is a real directory; /private only holds var/): every "mad:" patch logged "NOT PATCHED (err 2)"
+on current kernels, while older kernels found the file.  Only the alias target changes: the patch
+bytes, offsets and the argument format are untouched (OpenCode draft, reviewed by Claude).
+
+diff --git a/bsd/dev/sweet_file_patch.c b/bsd/dev/sweet_file_patch.c
+index dc96e2f..b350225 100644
+--- a/bsd/dev/sweet_file_patch.c
++++ b/bsd/dev/sweet_file_patch.c
+@@ -17,7 +17,7 @@
+  * not contain them we log a mismatch and leave the file alone, so a
+  * different build of the same binary is never corrupted.
+  *
+- * The path alias "mad" expands to /private/usr/libexec/mobileactivationd
++ * The path alias "mad" expands to /usr/libexec/mobileactivationd
+  * to keep the kernel command line short.
+  *
+  * The patch thread starts with the root device driver, long before the
+@@ -66,7 +66,7 @@ static void
+ sfp_expand(const char *path, char *out, int outlen)
+ {
+ 	if (strcmp(path, "mad") == 0) {
+-		strlcpy(out, "/private/usr/libexec/mobileactivationd", outlen);
++		strlcpy(out, "/usr/libexec/mobileactivationd", outlen);
+ 	} else {
+ 		strlcpy(out, path, outlen);
+ 	}
