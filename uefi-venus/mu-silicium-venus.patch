@@ -1,0 +1,242 @@
+diff --git a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
+--- a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
++++ b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
+@@ -26,6 +26,7 @@
+ #include <Configuration/BootDevices.h>
+ 
+ #include "BootManager.h"
++#include "XnuLoader.h"
+ 
+ //
+ // Global Variables
+@@ -276,6 +277,9 @@ PlatformBootManagerPriorityBoot (IN OUT UINT16 **BootNext)
+   // Get Boot Manager Flag
+   BootManagerFlag = EnterBootManager ();
+   if (BootManagerFlag == FALSE) {
++    // No Volume Up: this build has no OS on the phone, start the XNU loader (does not return).
++    // The normal boot flow would drop into the Boot Manager menu when no boot option exists.
++    XnuLoaderMain ();
+     return;
+   }
+ 
+@@ -324,6 +328,9 @@ PlatformBootManagerUnableToBoot ()
+ {
+   EFI_STATUS Status;
+ 
++  // Nothing else to boot: hand over to the XNU loader (does not return)
++  XnuLoaderMain ();
++
+   // Execute Secondary Unable To Boot
+   DeviceBootManagerUnableToBoot ();
+ 
+
+diff --git a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
+--- a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
++++ b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
+@@ -1,50 +1,55 @@
+-##
+-#  Copyright (C) Microsoft Corporation. All rights reserved.
+-#  SPDX-License-Identifier: BSD-2-Clause-Patent
+-##
+-
+-[Defines]
+-  INF_VERSION                    = 0x00010018
+-  BASE_NAME                      = BootManagerLib
+-  FILE_GUID                      = DF8F3324-5448-46BC-872C-BE198ECF2F76
+-  VERSION_STRING                 = 1.0
+-  MODULE_TYPE                    = DXE_DRIVER
+-  UEFI_SPECIFICATION_VERSION     = 2.7
+-  LIBRARY_CLASS                  = PlatformBootManagerLib|DXE_DRIVER
+-
+-[Sources]
+-  BootManager.c
+-  KeyCallback.c
+-
+-[Packages]
+-  MdePkg/MdePkg.dec
+-  PcBdsPkg/PcBdsPkg.dec
+-  MsCorePkg/MsCorePkg.dec
+-  MsGraphicsPkg/MsGraphicsPkg.dec
+-  MdeModulePkg/MdeModulePkg.dec
+-  SiliciumPkg/SiliciumPkg.dec
+-
+-[LibraryClasses]
+-  PcdLib
+-  DebugLib
+-  AcpiTableUpdateLib
+-  DeviceBootManagerLib
+-  UefiRuntimeServicesTableLib
+-  UefiBootServicesTableLib
+-  SecureBootHandlerLib
+-  MemoryAllocationLib
+-  MsBootOptionsLib
+-  BootGraphicsLib
+-  DevicePathLib
+-  PrintLib
+-
+-[Pcd]
+-  gEfiMdePkgTokenSpaceGuid.PcdPlatformBootTimeOut
+-
+-[Guids]
+-  gEfiEndOfDxeEventGroupGuid
+-
+-[Protocols]
+-  gKeypadDeviceProtocolGuid
+-  gEfiGraphicsOutputProtocolGuid
+-  gEfiSimpleTextInputExProtocolGuid
++##
++#  Copyright (C) Microsoft Corporation. All rights reserved.
++#  SPDX-License-Identifier: BSD-2-Clause-Patent
++##
++
++[Defines]
++  INF_VERSION                    = 0x00010018
++  BASE_NAME                      = BootManagerLib
++  FILE_GUID                      = DF8F3324-5448-46BC-872C-BE198ECF2F76
++  VERSION_STRING                 = 1.0
++  MODULE_TYPE                    = DXE_DRIVER
++  UEFI_SPECIFICATION_VERSION     = 2.7
++  LIBRARY_CLASS                  = PlatformBootManagerLib|DXE_DRIVER
++
++[Sources]
++  BootManager.c
++  XnuLoader.c
++  KeyCallback.c
++
++[Packages]
++  MdePkg/MdePkg.dec
++  PcBdsPkg/PcBdsPkg.dec
++  MsCorePkg/MsCorePkg.dec
++  MsGraphicsPkg/MsGraphicsPkg.dec
++  MdeModulePkg/MdeModulePkg.dec
++  SiliciumPkg/SiliciumPkg.dec
++
++[LibraryClasses]
++  PcdLib
++  DebugLib
++  AcpiTableUpdateLib
++  DeviceBootManagerLib
++  UefiRuntimeServicesTableLib
++  UefiBootServicesTableLib
++  SecureBootHandlerLib
++  MemoryAllocationLib
++  MsBootOptionsLib
++  BootGraphicsLib
++  DevicePathLib
++  PrintLib
++  BaseLib
++  BaseMemoryLib
++
++[Pcd]
++  gEfiMdePkgTokenSpaceGuid.PcdPlatformBootTimeOut
++
++[Guids]
++  gEfiEndOfDxeEventGroupGuid
++
++[Protocols]
++  gKeypadDeviceProtocolGuid
++  gEfiGraphicsOutputProtocolGuid
++  gEfiSimpleTextInputExProtocolGuid
++  gEfiBlockIoProtocolGuid
++  gEfiPartitionInfoProtocolGuid
+
+diff --git a/BootShim/BootShim.S b/BootShim/BootShim.S
+--- a/BootShim/BootShim.S
++++ b/BootShim/BootShim.S
+@@ -28,6 +28,27 @@ _CopyLoop:
+   stp   x2, x3, [x5], #16
+   subs  x6, x6, #16
+   b.ne  _CopyLoop
++
++#ifdef PAYLOAD_BASE
++  /* x4 now points just past the FD: an optional "XNUP" payload may follow */
++  ldr   w2, [x4]
++  movz  w3, #0x4E58
++  movk  w3, #0x5055, lsl #16
++  cmp   w2, w3
++  b.ne  _NoPayload
++  ldr   w6, [x4, #4]    /* Payload Size */
++  add   x6, x6, #23     /* Header + Round Up to 16 */
++  and   x6, x6, #~15
++  movz  x5, #(PAYLOAD_BASE >> 16), lsl #16
++
++_PayloadLoop:
++  ldp   x2, x3, [x4], #16
++  stp   x2, x3, [x5], #16
++  subs  x6, x6, #16
++  b.ne  _PayloadLoop
++
++_NoPayload:
++#endif
+   ldr   x5, =FD_BASE
+ 
+ _Entry:
+
+diff --git a/Platforms/Xiaomi/venusPkg/venus.fdf b/Platforms/Xiaomi/venusPkg/venus.fdf
+--- a/Platforms/Xiaomi/venusPkg/venus.fdf
++++ b/Platforms/Xiaomi/venusPkg/venus.fdf
+@@ -114,7 +114,8 @@ READ_LOCK_STATUS   = TRUE
+   #
+   # IosLoader - venus iOS port XNU kernel loader
+   #
+-  INF SiliciumPkg/Applications/IosLoader/IosLoader.inf
++  # (disabled: replaced by the HackiOS XnuLoader hook in BootManagerLib)
++  # INF SiliciumPkg/Applications/IosLoader/IosLoader.inf
+ 
+ [FV.FVMAIN_COMPACT]
+ FvAlignment        = 8
+
+diff --git a/Platforms/Xiaomi/venusPkg/venus.dsc b/Platforms/Xiaomi/venusPkg/venus.dsc
+--- a/Platforms/Xiaomi/venusPkg/venus.dsc
++++ b/Platforms/Xiaomi/venusPkg/venus.dsc
+@@ -121,4 +121,5 @@
+   #
+   # IosLoader - venus iOS port XNU kernel loader
+   #
+-  SiliciumPkg/Applications/IosLoader/IosLoader.inf
++  # (disabled: replaced by the HackiOS XnuLoader hook in BootManagerLib)
++  # SiliciumPkg/Applications/IosLoader/IosLoader.inf
+
+diff --git a/Platforms/Xiaomi/venusPkg/Include/APRIORI.inc b/Platforms/Xiaomi/venusPkg/Include/APRIORI.inc
+--- a/Platforms/Xiaomi/venusPkg/Include/APRIORI.inc
++++ b/Platforms/Xiaomi/venusPkg/Include/APRIORI.inc
+@@ -109,5 +109,6 @@ APRIORI DXE {
+   # plus a ReadyToBoot backup, so the loader runs without BDS boot options
+   # or the ESP/BOOTAA64 chain. Everything it needs (storage stack, display,
+   # console) is dispatched earlier in this list.
+-  INF SiliciumPkg/Applications/IosLoader/IosLoader.inf
++  # (disabled: replaced by the HackiOS XnuLoader hook in BootManagerLib)
++  # INF SiliciumPkg/Applications/IosLoader/IosLoader.inf
+ }
+
+diff --git a/Platforms/Xiaomi/venusPkg/Library/MemoryMapLib/MemoryMapLib.c b/Platforms/Xiaomi/venusPkg/Library/MemoryMapLib/MemoryMapLib.c
+--- a/Platforms/Xiaomi/venusPkg/Library/MemoryMapLib/MemoryMapLib.c
++++ b/Platforms/Xiaomi/venusPkg/Library/MemoryMapLib/MemoryMapLib.c
+@@ -27,6 +27,7 @@ gMemoryDescriptor[] = {
+   {"TZApps",            0xDA000000, 0x06A00000, HobOnlyNoCacheSetting, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
+   {"DBI Dump",          0xE1A00000, 0x00F00000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK_XN},
+   {"Display Reserved",  0xE2A00000, 0x02400000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_THROUGH_XN},
++  {"XNU Payload",       0xF0000000, 0x04000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
+ 
+   // Other Memory Regions
+   {"IMEM Base",         0x14680000, 0x00040000, NoHob,  MMAP_IO, INITIALIZED, Conv,   NS_DEVICE},
+
+diff --git a/build_uefi.py b/build_uefi.py
+--- a/build_uefi.py
++++ b/build_uefi.py
+@@ -155,10 +155,12 @@ def handle_git_patch (submodule_path: Path, patch_name: str, remove: bool) -> bo
+     # Get Absolute Patch Path
+     absolute_patch_path = str (patch_path.resolve ())
+ 
+-    # Set Git Command
++    # Set Patch Command (plain patch(1): this tree has no usable .git, "git apply" fails here)
+     cmd = [
+-        "git",
+-        "apply",
++        "patch",
++        "-p1",
++        "-s",
++        "-i",
+         absolute_patch_path
+     ]
+ 
