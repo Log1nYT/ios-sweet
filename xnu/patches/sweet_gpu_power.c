@@ -97,7 +97,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 #define GP_GCC_PA             0x00100000u
 #define GP_GCC_SIZE           0x001f0000u
 /* vendor DT: /soc/rsc@18200000, reg[2] = the apps RSC bank we drive */
-#define GP_RSC_PA             0x01822000u
+#define GP_RSC_PA             0x18220000u
 #define GP_RSC_SIZE           0x00010000u
 /* the RPMh command database locator, same address as sweet_rpmh.c uses */
 #define GP_CMD_DB_LOCATOR_PA  0x0c3f000cu
