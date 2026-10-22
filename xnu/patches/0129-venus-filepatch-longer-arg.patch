@@ -1,0 +1,22 @@
+venus 0129: sweetfilepatch takes more patches and a longer argument (16 patches, 512 chars)
+
+The 7 activation patches already fill 196 of the 255 characters; an 8th patch (the dyld
+shared cache) was silently cut off the argument.  Only the limits change.
+
+diff --git a/bsd/dev/sweet_file_patch.c b/bsd/dev/sweet_file_patch.c
+index 25dbfba..dc96e2f 100644
+--- a/bsd/dev/sweet_file_patch.c
++++ b/bsd/dev/sweet_file_patch.c
+@@ -42,10 +42,10 @@
+ 
+ void sweet_filepatch_init(void);
+ 
+-#define SFP_MAX_PATCH   8
++#define SFP_MAX_PATCH   16
+ #define SFP_MAX_BYTES   16
+ #define SFP_PATHLEN     160
+-#define SFP_ARGLEN      256
++#define SFP_ARGLEN      512
+ #define SFP_DUMPLEN     64
+ 
+ struct sfp_patch {
