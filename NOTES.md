@@ -1,3 +1,10 @@
+## >>> VENUS: SWITCHING TO THE HackiOS STACK (UEFI + loader + kernel), PORT STARTED (2026-10-22 10:15) <<<
+
+- User decision: adopt the donor stack and adapt it (and all its drivers) to venus. State + plan: `logs/research/30-venus-hackios-port.md`. Work copy `~/Documents/hackios-venus/` (not in git).
+- Key fact: the GPU blocks (kgsl 0x3d00000, GMU 0x3d69000, GPU_CC 0x3d90000, GDSCs, kgsl-smmu 0x3da0000), apps RSC/SMMU, SPMI, GCC base, EPSS, GIC are at the SAME addresses on venus and redwood. Differences: qfprom 0x784000, a660 chip id, GCC/GPU_CC offsets to check.
+- Done: venus device profile + `platform_venus` in the loader; `loader.efi` builds on this Mac.
+- Blockers: 2.9 GiB free disk (the 26 GiB repair copy can go), BootManager.c hunk conflicts with the local Mu-Silicium tree, the system image builder wants Linux tools.
+
 ## >>> VENUS: DONOR MAP + STABILITY PATCHES FROM HackiOS (2026-10-22 10:25) <<<
 
 - Full map in `logs/research/29-hackios-donor-map.md` (stability lessons + driver table + port order).
