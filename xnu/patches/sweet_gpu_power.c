@@ -186,20 +186,33 @@ static bool gp_gx_powered;
 /* register access                                                    */
 /* ------------------------------------------------------------------ */
 
-static uint32_t
+/*
+ * The accessors are single noinline load/store instructions chosen by us, not by the
+ * compiler: a constant 0 would otherwise become `str wzr`, and an access the hypervisor
+ * traps must be one the fault handler can decode (HackiOS redwood_adreno.c, same rule).
+ * Every write is a full barrier plus a read of the same register is the caller's job
+ * (gp_write_verify); the barrier below only orders the store itself.
+ */
+static __attribute__((noinline)) uint32_t
 gp_rd(vm_offset_t base, uint32_t off)
 {
-	uint32_t v = *(volatile uint32_t *)(base + off);
+	uint32_t v;
+	volatile uint32_t *a = (volatile uint32_t *)(base + off);
+
+	__asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(a) : "memory");
 	__asm__ volatile("dmb oshld" ::: "memory");
 	return v;
 }
 
-static void
+static __attribute__((noinline)) void
 gp_wr(vm_offset_t base, uint32_t off, uint32_t val)
 {
+	volatile uint32_t *a = (volatile uint32_t *)(base + off);
+
 	__asm__ volatile("dmb oshst" ::: "memory");
-	*(volatile uint32_t *)(base + off) = val;
+	__asm__ volatile("str %w0, [%1]" : : "r"(val), "r"(a) : "memory");
 	__asm__ volatile("dsb osh" ::: "memory");
+	__asm__ volatile("isb" ::: "memory");
 }
 
 /* Remember a register so that the quiesce path can put it back. */
@@ -887,10 +900,33 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_power,
 /* init                                                                */
 /* ------------------------------------------------------------------ */
 
+/*
+ * G0: does the hypervisor's virtual watchdog exist here?  boot-arg sweetwdt=1 asks one
+ * read-only question, VIRT_WDT_STATUS (SMCCC 0x86000006, the call HackiOS's loader uses,
+ * loader_return.c); it arms and pets nothing.  The answer decides whether later GPU write
+ * steps can be made self-recovering.  An unsupported call returns -1 (SMCCC NOT_SUPPORTED).
+ */
+static __attribute__((noinline)) void
+gp_wdt_status(void)
+{
+	register uint64_t x0 __asm__("x0") = 0x86000006ull;
+	register uint64_t x1 __asm__("x1") = 0;
+	register uint64_t x2 __asm__("x2") = 0;
+	register uint64_t x3 __asm__("x3") = 0;
+
+	printf("SWEET WDT: about to call VIRT_WDT_STATUS (0x86000006), read only\n");
+	delay(500 * 1000);              /* let the live log send the line first */
+	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "x4", "x5", "x6", "x7", "memory");
+	printf("SWEET WDT: STATUS returned x0=%#llx x1=%#llx x2=%#llx x3=%#llx%s\n",
+	    (unsigned long long)x0, (unsigned long long)x1, (unsigned long long)x2,
+	    (unsigned long long)x3, (int64_t)x0 == -1 ? "  (NOT SUPPORTED: no virtual watchdog)" : "");
+}
+
 void
 sweet_gpu_power_init(void)
 {
 	int value;
+	int wdt = 0;
 	bool probe = false, power = false, gx = false, reset = false;
 
 	if (PE_parse_boot_argn("sweetgpuprobe", &value, sizeof(value)) &&
@@ -908,6 +944,9 @@ sweet_gpu_power_init(void)
 	if (PE_parse_boot_argn("sweetgpureset", &value, sizeof(value)) &&
 	    value != 0) {
 		reset = true;
+	}
+	if (PE_parse_boot_argn("sweetwdt", &wdt, sizeof(wdt)) && wdt != 0) {
+		gp_wdt_status();
 	}
 	printf("SWEET GPU POWER: init probe=%d power=%d gx=%d reset=%d\n",
 	    probe ? 1 : 0, power ? 1 : 0, gx ? 1 : 0, reset ? 1 : 0);
