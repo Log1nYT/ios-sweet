@@ -29,7 +29,7 @@ stream 4 reset the phone at CM3 reset release).
 |---|---|---|
 | Mi 10 `umi` fork (A650, same GMU/HFI generation as A660) | full chain on hardware: clocks/CX, SMMU, GMU init returns 0x100, HFI version 0x20000001, GMU powers the core, TrustZone authenticates the zap shader, CP leaves secure mode, three-colour picture, then CoreAnimation through Mesa FD650 (>1000 frames) | `~/Documents/umi-ref/.../docs/umi-gpu.md` (read via API; code in `hk_adreno.c`) |
 | umi pitfalls | do NOT skip SCM/PAS stages 10-12 (stalls at stage 19); GMU clock wake/sleep fields 0xf; RSCC sleep/wake + AOP-managed PDC prepared before GMU start; A650: primitive FIFO threshold, highest bank bit 16 (venus DTS also says 16); fixed 587 MHz operating point | same doc |
-| Adreno 618 `ios-sweet` fork (same patch architecture as ours) | the ladder as boot-arg levels: 1 probe, 2 CX power + GMU clocks, 3 SMMU + TCM test, 4 GMU cold boot (0xBABEFACE), 5 SMMU+HFI, 6 GX via GMU OOB, 7 signed zap PAS, 8 CP buffers, 9 CP config (no commands yet there) | `~/Documents/a618-ref/patches/0078..0098` (21 patches, SHA of the files by `ls`) |
+| Adreno 618 `ios-sweet` fork (same patch architecture as ours; LEGACY raw GMU image, so a structure reference only for SMMU/PAS/SCM, NOT for the firmware load) | the ladder as boot-arg levels: 1 probe, 2 CX power + GMU clocks, 3 SMMU + TCM test, 4 GMU cold boot (0xBABEFACE), 5 SMMU+HFI, 6 GX via GMU OOB, 7 signed zap PAS, 8 CP buffers, 9 CP config (no commands yet there) | `~/Documents/a618-ref/patches/0078..0098` (21 patches, SHA of the files by `ls`) |
 | a618 pitfall | exact SMRs: with no valid SMR the SoC resets; flush the console log before each step; ATOS disabled by the DT; 64-bit `pmap_sync_page_attributes_phys` (our 0131 is the same fix) | 0083, 0084, 0085 |
 | HackiOS redwood | 22 staged steps, reads before writes, "say what you touch before you touch it" | report 31 |
 
@@ -83,3 +83,15 @@ Parallel track S (does not need the GPU): `sweetfb_hz=30`, cpufreq (EPSS reads t
 1. Phone in fastboot for each cycle (and the sudo password for the USB network keeper after a Mac restart).
 2. OK for each new write class: P1 (CX power), P5 (GX), P6 (TrustZone zap), P7 (CP start).
 3. A cool, uncharged phone for P5-P8 (thermal rail events).
+
+## 6. Correction after reading the firmware (2026-10-23, OBS)
+
+- `a660_gmu.bin` (55256 B) is the NEW block format, not the legacy raw ITCM image the Adreno 618 series loads
+  (`MAX_GMUFW_SIZE 0x8000`): its first words are records `{addr, size, ...}` for the blocks at 0x0 (0x1dc bytes),
+  0x4000 (0xd4cc), 0x200 (0x3a64), 0x100000 (0x85b4), 0x200000 (0x12a80), 0x300000 (0x7060) (xxd of the file;
+  `a6xx_gmu_fw_load`). The HackiOS Redwood driver (`redwood_adreno.c` steps 13-16, `GMU_DTCM_ADDRESS 0x10004000`,
+  loads `fw/a660_gmu.bin`, `a660_sqe.fw`, `a660_zap.*`) and the Mi 10 fork use exactly this firmware family.
+- Therefore the sources to port are: P3/P4 (GMU load, RSCC/PDC, HFI) from `redwood_adreno.c` + umi `hk_adreno.c`;
+  P2 (SMMU context/SMRs), P6 (PAS/SCM) from both donors and the a618 `0080/0085/0088-0092` as a cross-check.
+- The reconstructed cumulative a618 sources (21 patches applied cleanly) are in `~/Documents/a618-ref/final/`
+  (`sweet_gpu.c` 2029 lines, `sweet_scm.c` 356 lines) for reference.
