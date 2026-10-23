@@ -1,0 +1,26 @@
+venus 0132: io_submap 8 MiB -> 64 MiB (ml_io_map windows exhausted)
+
+IO_MAP_SIZE (osfmk/arm/io_map.c) is the virtual window every late ml_io_map() is taken from, with
+KMA_NOFAIL.  With sweetgpuprobe=1 (GCC 2 MiB + AHB + GPU_CC + RSC) the touch thread then blocks
+for ever inside ml_io_map(TLMM, 3 MiB) (v90 log: "delay over, mapping TLMM", no "TLMM mapped"),
+and earlier kernels panicked with kmem_alloc(..., 3145728, 0x100021): failed with 3 (NOTES.md).
+
+diff --git a/osfmk/arm/io_map.c b/osfmk/arm/io_map.c
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,14 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++/*
++ * SWEET: every ml_io_map() after VM start is carved out of this window with
++ * kmem_alloc(KMA_NOFAIL).  8 MiB is used up by the device drivers (UFS, USB, SPMI, RPMh, GIC,
++ * the GPU probe's GCC/GPU_CC/AHB/RSC maps ...), and the next map (the 3 MiB TLMM map of the touch
++ * driver, 0x100021 = KMA_NOFAIL) then either panics ("kmem_alloc(..., 3145728, 0x100021): failed
++ * with 3") or waits for ever.  The window is only virtual address space: 64 MiB costs nothing.
++ */
++#define IO_MAP_SIZE            (64ul << 20)
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
