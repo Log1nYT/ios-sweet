@@ -492,10 +492,12 @@ venus_touch_thread(void *arg, wait_result_t result)
 	if (delay_s) {
 		vt_wait_ms(delay_s * 1000u);
 	}
+	printf("SWEET VENUS TOUCH: delay over (dead=%d), mapping TLMM\n", vt.dead ? 1 : 0);
 	if (vt.dead) {
 		goto out;
 	}
 	vt.tlmm = ml_io_map(VENUS_TLMM_PA, VENUS_TLMM_SIZE);
+	printf("SWEET VENUS TOUCH: TLMM mapped at %p\n", (void *)vt.tlmm);
 	if (!vt.tlmm) {
 		printf("SWEET VENUS TOUCH: TLMM map failed\n");
 		goto out;

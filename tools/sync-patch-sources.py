@@ -24,6 +24,7 @@ EMBEDDED = [
     ("0088-venus-camera.patch", "iokit/Kernel/arm/SweetCamera.cpp"),
     ("0112-venus-gpu-probe.patch", "bsd/dev/sweet_gpu.c"),
     ("0113-venus-gpu-power.patch", "bsd/dev/sweet_gpu_power.c"),
+    ("0085-venus-fts-spi-touch.patch", "bsd/dev/sweet_venus_touch.c"),
     ("0114-venus-gpu-iokit-service.patch", "iokit/Kernel/arm/SweetGPU.cpp"),
     ("0115-venus-gic-smmu-probe.patch", "bsd/dev/sweet_gic.c"),
     ("0116-venus-key-events.patch", "bsd/dev/sweet_keyevents.c"),

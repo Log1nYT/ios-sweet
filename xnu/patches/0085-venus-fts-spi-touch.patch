@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/sweet_venus_touch.c
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,589 @@
 +/*
 + * Venus (Xiaomi Mi 11, SM8350) ST FTS SPI touch bring-up.
 + *
@@ -495,10 +495,12 @@
 +	if (delay_s) {
 +		vt_wait_ms(delay_s * 1000u);
 +	}
++	printf("SWEET VENUS TOUCH: delay over (dead=%d), mapping TLMM\n", vt.dead ? 1 : 0);
 +	if (vt.dead) {
 +		goto out;
 +	}
 +	vt.tlmm = ml_io_map(VENUS_TLMM_PA, VENUS_TLMM_SIZE);
++	printf("SWEET VENUS TOUCH: TLMM mapped at %p\n", (void *)vt.tlmm);
 +	if (!vt.tlmm) {
 +		printf("SWEET VENUS TOUCH: TLMM map failed\n");
 +		goto out;
@@ -588,7 +590,6 @@
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
-
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -108,6 +108,7 @@

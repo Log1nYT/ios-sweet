@@ -182,6 +182,7 @@ static vm_offset_t gp_gpucc, gp_gcc, gp_ahb, gp_rsc;
 static bool gp_mapped;
 static bool gp_powered;
 static bool gp_gx_powered;
+static int gp_probe_level;       /* sweetgpuprobe=1 registers only, =2 also the cmd-db mapping */
 
 /* ------------------------------------------------------------------ */
 /* register access                                                    */
@@ -473,7 +474,11 @@ gp_probe(void)
 	printf("SWEET GPU POWER: probe: gpu_cc_hub_clk_src RCG=%#010x "
 	    "(not programmed by this driver)\n", (unsigned)v);
 
-	gp_cmd_db_dump();
+	if (gp_probe_level >= 2) {
+		gp_cmd_db_dump();
+	} else {
+		printf("SWEET GPU POWER: probe: cmd-db dump skipped (sweetgpuprobe=2 maps and reads it)\n");
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -1000,6 +1005,7 @@ sweet_gpu_power_init(void)
 	if (PE_parse_boot_argn("sweetgpuprobe", &value, sizeof(value)) &&
 	    value != 0) {
 		probe = true;
+		gp_probe_level = value;
 	}
 	if (PE_parse_boot_argn("sweetgpupower", &value, sizeof(value)) &&
 	    value != 0) {
