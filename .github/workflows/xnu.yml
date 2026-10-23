@@ -118,6 +118,8 @@ jobs:
         run: |
           mkdir -p out
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          # for local relinks (tools/research/relink.sh): the static lib the link line asks for (-lfirehose_kernel)
+          cp dxb/fakeroot/usr/local/lib/kernel/libfirehose_kernel.a out/ 2>/dev/null || true
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
