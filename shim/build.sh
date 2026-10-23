@@ -4,13 +4,15 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-TC=${TC:-/Users/matviy/Documents/Mu-Silicium/toolchain/mac-clangpdb/bin}
+# The Mu-Silicium toolchain was removed to free disk space; Homebrew llvm + lld do the same job
+# (brew install llvm lld).  TC may still point at the old directory.
+TC=${TC:-/opt/homebrew/opt/llvm/bin}
 CC=${CC:-$TC/clang}
-LD=${LD:-$TC/ld.lld}
+LD=${LD:-/opt/homebrew/bin/ld.lld}
 OBJCOPY=${OBJCOPY:-$TC/llvm-objcopy}
 NM=${NM:-$TC/llvm-nm}
 MKBOOTIMG=${MKBOOTIMG:-../tools/mkbootimg.py}
-DTB=${DTB:-/Users/matviy/Documents/Mu-Silicium/Resources/DTBs/venus.dtb}
+DTB=${DTB:-$(pwd)/venus.dtb}   # the phone's device tree (extracted from the known-good kernel blob)
 
 TARGET=aarch64-none-elf
 CFLAGS="--target=$TARGET -O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
