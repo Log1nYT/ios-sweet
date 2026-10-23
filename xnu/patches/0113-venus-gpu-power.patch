@@ -7,7 +7,7 @@
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_power.c
-@@ -0,0 +1,999 @@
+@@ -0,0 +1,1067 @@
 +/*
 + * sweet: the Adreno 660 (venus = Xiaomi Mi 11, SM8350) power and clock path.
 + *
@@ -86,6 +86,7 @@ new file mode 100644
 +#include <sys/sysctl.h>
 +#include <kern/clock.h>
 +#include <kern/thread.h>
++#include <kern/thread_call.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +
@@ -911,25 +912,92 @@ new file mode 100644
 +/* ------------------------------------------------------------------ */
 +
 +/*
-+ * G0: does the hypervisor's virtual watchdog exist here?  boot-arg sweetwdt=1 asks one
-+ * read-only question, VIRT_WDT_STATUS (SMCCC 0x86000006, the call HackiOS's loader uses,
-+ * loader_return.c); it arms and pets nothing.  The answer decides whether later GPU write
-+ * steps can be made self-recovering.  An unsupported call returns -1 (SMCCC NOT_SUPPORTED).
++ * G0/G0b: the hypervisor's virtual watchdog (Qualcomm "Haven", SMCCC 0x8600000x, the
++ * interface HackiOS's loader uses: loader.c wdt_arm, loader_return.c hv_wdt_pet).
++ *   sweetwdt=1  one read-only question, VIRT_WDT_STATUS: x0 = result, x1 = control
++ *               (0 = not armed), x2 = ms since the last pet.  Seen on venus:
++ *               x0=0 x1=0 x2=0xdef1.
++ *   sweetwdt=2  also arm it: SET_TIME 30 s (the hypervisor takes 16 bits of ms), CONTROL 3,
++ *               PET, and a thread_call pets it every 5 s.  A hang of the kernel (a GPU
++ *               write the hypervisor dislikes) then ends in a reset without a human; the
++ *               phone restarts normally (the fastboot cookie cannot be written on this
++ *               hardware), so the user holds Vol- + Power again.
 + */
-+static __attribute__((noinline)) void
-+gp_wdt_status(void)
++#define GP_WDT_CONTROL  0x86000005ull
++#define GP_WDT_STATUS   0x86000006ull
++#define GP_WDT_PET      0x86000007ull
++#define GP_WDT_SET_TIME 0x86000008ull
++#define GP_WDT_BITE_MS  30000ull
++#define GP_WDT_PET_SECS 5
++
++static thread_call_t gp_wdt_call;
++static bool gp_wdt_armed;
++static unsigned gp_wdt_pets;
++
++static __attribute__((noinline)) uint64_t
++gp_smc(uint64_t id, uint64_t a1, uint64_t a2, uint64_t *r1, uint64_t *r2)
 +{
-+	register uint64_t x0 __asm__("x0") = 0x86000006ull;
-+	register uint64_t x1 __asm__("x1") = 0;
-+	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x0 __asm__("x0") = id;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
 +	register uint64_t x3 __asm__("x3") = 0;
++
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "x4", "x5", "x6", "x7", "memory");
++	if (r1 != NULL) {
++		*r1 = x1;
++	}
++	if (r2 != NULL) {
++		*r2 = x2;
++	}
++	return x0;
++}
++
++static void
++gp_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	uint64_t deadline;
++
++	if (gp_smc(GP_WDT_PET, 0, 0, NULL, NULL) == 0) {
++		gp_wdt_pets++;
++	}
++	if ((gp_wdt_pets % 12) == 1) {
++		printf("SWEET WDT: pet %u, still alive\n", gp_wdt_pets);
++	}
++	clock_interval_to_deadline(GP_WDT_PET_SECS, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(gp_wdt_call, deadline);
++}
++
++static __attribute__((noinline)) void
++gp_wdt_status(bool arm)
++{
++	uint64_t st, ctl = 0, since = 0;
 +
 +	printf("SWEET WDT: about to call VIRT_WDT_STATUS (0x86000006), read only\n");
 +	delay(500 * 1000);              /* let the live log send the line first */
-+	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "x4", "x5", "x6", "x7", "memory");
-+	printf("SWEET WDT: STATUS returned x0=%#llx x1=%#llx x2=%#llx x3=%#llx%s\n",
-+	    (unsigned long long)x0, (unsigned long long)x1, (unsigned long long)x2,
-+	    (unsigned long long)x3, (int64_t)x0 == -1 ? "  (NOT SUPPORTED: no virtual watchdog)" : "");
++	st = gp_smc(GP_WDT_STATUS, 0, 0, &ctl, &since);
++	printf("SWEET WDT: STATUS returned x0=%#llx control=%#llx since_pet_ms=%#llx%s\n",
++	    (unsigned long long)st, (unsigned long long)ctl, (unsigned long long)since,
++	    (int64_t)st == -1 ? "  (NOT SUPPORTED: no virtual watchdog)" : "");
++	if (!arm || st != 0) {
++		return;
++	}
++	printf("SWEET WDT: arming: set_time %llu ms, control 3, pet; pet thread every %d s\n",
++	    (unsigned long long)GP_WDT_BITE_MS, GP_WDT_PET_SECS);
++	delay(500 * 1000);
++	st = gp_smc(GP_WDT_SET_TIME, GP_WDT_BITE_MS, GP_WDT_BITE_MS, NULL, NULL);
++	printf("SWEET WDT: SET_TIME returned %#llx\n", (unsigned long long)st);
++	if (st != 0) {
++		return;
++	}
++	st = gp_smc(GP_WDT_CONTROL, 3, 0, NULL, NULL);
++	printf("SWEET WDT: CONTROL returned %#llx\n", (unsigned long long)st);
++	if (st != 0) {
++		return;
++	}
++	gp_wdt_call = thread_call_allocate(gp_wdt_pet, NULL);
++	gp_wdt_armed = true;
++	gp_wdt_pet(NULL, NULL);         /* the first pet, and the thread that repeats it */
++	printf("SWEET WDT: armed, bite in %llu ms without a pet\n", (unsigned long long)GP_WDT_BITE_MS);
 +}
 +
 +void
@@ -956,7 +1024,7 @@ new file mode 100644
 +		reset = true;
 +	}
 +	if (PE_parse_boot_argn("sweetwdt", &wdt, sizeof(wdt)) && wdt != 0) {
-+		gp_wdt_status();
++		gp_wdt_status(wdt >= 2);
 +	}
 +	printf("SWEET GPU POWER: init probe=%d power=%d gx=%d reset=%d\n",
 +	    probe ? 1 : 0, power ? 1 : 0, gx ? 1 : 0, reset ? 1 : 0);
