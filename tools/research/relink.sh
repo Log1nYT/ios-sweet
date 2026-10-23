@@ -32,7 +32,20 @@ trap 'rm -rf "$WORK"' EXIT
 cp "$L/kernel.development.sweet.a" "$WORK/k.a"
 mkdir -p "$WORK/obj"
 
+# headers first (a header that a patch creates is only copied into the tree for the compile, then removed)
 for spec in "$@"; do
+	case "$spec" in
+	*.h=*)
+		rel=${spec%%=*}; src=${spec#*=}
+		case "$src" in /*) ;; *) src="$ROOT/$src" ;; esac
+		mkdir -p "$(dirname "$BT/xnu/$rel")"; cp "$src" "$BT/xnu/$rel"; HDRS="${HDRS:-} $BT/xnu/$rel"
+		;;
+	esac
+done
+trap 'rm -rf "$WORK"; for h in ${HDRS:-}; do rm -f "$h"; done' EXIT
+
+for spec in "$@"; do
+	case "$spec" in *.h=*) continue ;; esac
 	rel=${spec%%=*}
 	src=${spec#*=}
 	[ "$rel" != "$spec" ] || src="$ROOT/$rel"
@@ -42,7 +55,7 @@ for spec in "$@"; do
 	if [ -f "$dst" ]; then bak="$WORK/bak.$(echo "$rel" | tr / _)"; cp "$dst" "$bak"; fi
 	mkdir -p "$(dirname "$dst")"
 	cp "$src" "$dst"
-	OUTDIR="$WORK/obj" "$ROOT/tools/research/compile-one.sh" -q -o "$rel" || { [ -n "$bak" ] && cp "$bak" "$dst"; exit 1; }
+	XNU_OBJDIR="$WORK/obj" "$ROOT/tools/research/compile-one.sh" -q -o "$rel" || { [ -n "$bak" ] && cp "$bak" "$dst"; exit 1; }
 	if [ -n "$bak" ]; then cp "$bak" "$dst"; else rm -f "$dst"; fi
 	member=$(basename "${rel%.*}").o
 	cp "$WORK/obj/$(echo "$rel" | tr / _).o" "$WORK/$member"
