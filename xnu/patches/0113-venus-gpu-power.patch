@@ -7,7 +7,7 @@
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_power.c
-@@ -0,0 +1,1105 @@
+@@ -0,0 +1,1168 @@
 +/*
 + * sweet: the Adreno 660 (venus = Xiaomi Mi 11, SM8350) power and clock path.
 + *
@@ -948,6 +948,66 @@ new file mode 100644
 +/* init                                                                */
 +/* ------------------------------------------------------------------ */
 +
++/* ------------------------------------------------------------------ */
++/* P3 step A: the GMU's first words, read only (sweetgpugmu=1)         */
++/* ------------------------------------------------------------------ */
++
++/*
++ * The GMU register window (live DTS: kgsl_gmu_reg 0x3d6a000, 0x34000).  Offsets are the byte offsets
++ * of the donors' word registers (logs/research/38-gpu-p2-p4-spec.md section P3.1).  Everything here is
++ * a read; the sequence is announced and the log given 150 ms to leave before each access, because an
++ * access the hypervisor dislikes ends the run without a word.  The always-on counter is a 19.2 MHz
++ * crystal counter: it must advance by about 192000 in 10 ms, which proves that the block is clocked.
++ */
++#define GP_GMU_PA   0x03d6a000u
++#define GP_GMU_SIZE 0x00034000u
++
++static const struct {
++	const char *name;
++	uint32_t    off;
++} gp_gmu_regs[] = {
++	{ "CM3_SYSRESET", 0x14000 }, { "CM3_BOOT_CONFIG", 0x14004 },
++	{ "CM3_FW_INIT_RESULT", 0x14070 }, { "CM3_CFG", 0x140b4 },
++	{ "HFI_CTRL_STATUS", 0x14600 }, { "HFI_VERSION_INFO", 0x14604 },
++	{ "GENERAL_7", 0x14730 }, { "RPMH_POWER_STATE", 0x143b0 },
++	{ "SPTPRAC_PWR_CLK_STATUS", 0x14340 }, { "AO_HOST_INTERRUPT_STATUS", 0x24c14 },
++	{ "AO_GPU_CX_BUSY_STATUS", 0x24c30 }, { "AO_AHB_FENCE_STATUS", 0x24c4c },
++};
++
++#define GP_GMU_AO_CNT_L 0x14220u
++#define GP_GMU_AO_CNT_H 0x14224u
++
++static __attribute__((noinline)) void
++gp_gmu_probe(void)
++{
++	vm_offset_t gm = ml_io_map(GP_GMU_PA, GP_GMU_SIZE);
++	unsigned i;
++	uint32_t l0, l1, h0, h1;
++
++	if (!gm) {
++		printf("SWEET GPU GMU: mapping %#x failed\n", (unsigned)GP_GMU_PA);
++		return;
++	}
++	printf("SWEET GPU GMU: P3 step A, read only, window %#x -> %p\n", (unsigned)GP_GMU_PA, (void *)gm);
++	for (i = 0; i < sizeof(gp_gmu_regs) / sizeof(gp_gmu_regs[0]); ++i) {
++		printf("SWEET GPU GMU: about to read %s at %#x\n", gp_gmu_regs[i].name,
++		    (unsigned)(GP_GMU_PA + gp_gmu_regs[i].off));
++		delay(150 * 1000);
++		printf("SWEET GPU GMU: %-26s = %#010x\n", gp_gmu_regs[i].name,
++		    (unsigned)gp_rd(gm, gp_gmu_regs[i].off));
++	}
++	printf("SWEET GPU GMU: about to read the always-on counter (%#x, %#x)\n",
++	    (unsigned)(GP_GMU_PA + GP_GMU_AO_CNT_L), (unsigned)(GP_GMU_PA + GP_GMU_AO_CNT_H));
++	delay(150 * 1000);
++	l0 = gp_rd(gm, GP_GMU_AO_CNT_L);
++	h0 = gp_rd(gm, GP_GMU_AO_CNT_H);
++	delay(10 * 1000);
++	l1 = gp_rd(gm, GP_GMU_AO_CNT_L);
++	h1 = gp_rd(gm, GP_GMU_AO_CNT_H);
++	printf("SWEET GPU GMU: AO counter %#x:%#x -> %#x:%#x after 10 ms, delta %u (alive if about 192000)\n",
++	    (unsigned)h0, (unsigned)l0, (unsigned)h1, (unsigned)l1, (unsigned)(l1 - l0));
++}
++
 +/*
 + * G0/G0b: the hypervisor's virtual watchdog (Qualcomm "Haven", SMCCC 0x8600000x, the
 + * interface HackiOS's loader uses: loader.c wdt_arm, loader_return.c hv_wdt_pet).
@@ -1110,6 +1170,9 @@ new file mode 100644
 +	}
 +	if (reset) {
 +		gp_reset_path();
++	}
++	if (PE_parse_boot_argn("sweetgpugmu", &value, sizeof(value)) && value != 0) {
++		gp_gmu_probe();
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
