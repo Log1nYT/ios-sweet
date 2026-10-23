@@ -7,7 +7,7 @@
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_power.c
-@@ -0,0 +1,1073 @@
+@@ -0,0 +1,1105 @@
 +/*
 + * sweet: the Adreno 660 (venus = Xiaomi Mi 11, SM8350) power and clock path.
 + *
@@ -531,6 +531,37 @@ new file mode 100644
 +	return ok;
 +}
 +
++/*
++ * A clock root (RCG): the AHB branch of the GPU block is halted while its root is off.  Linux turns
++ * the root on (clk_rcg2_enable: CMD_RCGR.ROOT_EN, bit 1, then wait for ROOT_OFF, bit 31, to
++ * clear) when a child is enabled.  The source stays what the register already selects (CFG 0:
++ * XO, 19.2 MHz): no PLL, no frequency change.  Boot logs of 2026-10-23: gpu_cc_hub_clk_src
++ * CMD=0, gpu_cc_ahb_clk could not be enabled.
++ */
++#define GP_RCG_ROOT_EN  0x00000002u
++#define GP_RCG_ROOT_OFF 0x80000000u
++
++static bool
++gp_rcg_root_on(const char *name, vm_offset_t base, uint32_t cmd_off)
++{
++	uint32_t v = gp_rd(base, cmd_off);
++	unsigned i;
++
++	printf("SWEET GPU POWER: rcg %-24s CMD=%#010x CFG=%#010x\n", name, (unsigned)v,
++	    (unsigned)gp_rd(base, cmd_off + 4u));
++	gp_save(base, cmd_off, name);
++	if (!(v & GP_RCG_ROOT_EN)) {
++		v = gp_write_verify(base, cmd_off, v | GP_RCG_ROOT_EN, name);
++	}
++	for (i = 0; i < 100u && (v & GP_RCG_ROOT_OFF); ++i) {
++		delay(1);
++		v = gp_rd(base, cmd_off);
++	}
++	printf("SWEET GPU POWER: rcg %-24s root %s (CMD=%#010x after %u polls)\n", name,
++	    (v & GP_RCG_ROOT_OFF) ? "STILL OFF" : "on", (unsigned)v, i);
++	return !(v & GP_RCG_ROOT_OFF);
++}
++
 +/* ------------------------------------------------------------------ */
 +/* the CX domain                                                      */
 +/* ------------------------------------------------------------------ */
@@ -773,6 +804,7 @@ new file mode 100644
 +	}
 +	gp_powered = true;
 +
++	ok &= gp_rcg_root_on("gpu_cc_hub_clk_src", gp_gpucc, GP_HUB_CLK_SRC);
 +	ok &= gp_clock_on("gpu_cc_ahb_clk", gp_gpucc, GP_AHB_CLK);
 +	ok &= gp_clock_on("gpu_cc_cx_gmu_clk", gp_gpucc, GP_CX_GMU_CLK);
 +	ok &= gp_clock_on("gpu_cc_hub_aon_clk", gp_gpucc, GP_HUB_AON_CLK);
